@@ -822,7 +822,7 @@ impl TpWorkerPrepared {
         let decode_buffers = model.create_batch_decode_buffers_with_capacity(max_batch)?;
         let sample_scratch = openinfer_sample::SampleScratch::new(
             model.device_ctx(),
-            model.config().vocab_size,
+            model.config().selection_vocab,
             max_batch,
         )?;
         Ok((
