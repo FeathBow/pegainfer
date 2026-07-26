@@ -30,9 +30,21 @@ Consequences to keep in mind:
 - The graceful ctrl-c handler is installed only **after** the engine load resolves (`cancel_token_on_ctrl_c`). The blocking load can't be cancelled, so during load SIGINT keeps its default kill behavior — same as before the change. (When testing this: background jobs of non-interactive shells inherit SIGINT=SIG_IGN; use a spawner that restores default dispositions.)
 - LoRA mode stays sequential: the LoRA routes need the handle when the router is built.
 
-## Pinned-staging H2D upload (rejected 2026-06, adopted 2026-07)
+## Pinned-staging H2D upload (rejected 2026-06, adopted 2026-07, retuned 2026-07)
 
 The 2026-06 rejection reasoned from the numbers above: upload ran at ~7GB/s pageable, and with the engine path (~1.35s) barely above the concurrent frontend path (~1.25s), a faster upload stood to gain ≲0.1s of HTTP-ready. By 2026-07 the engine path had grown far past that floor (warm HTTP-ready ~5.2s on sm_89), so the frontend overlap no longer hides the upload: the pinned double-buffer pipeline (`WeightStager` in openinfer-core) cuts the warm Qwen3-4B load phase ~1.26s → ~0.69s and HTTP-ready 5.22s → 4.66s — the phase saving passes through in full. (The timed load phase ends at the `GPU model loaded` log, before the mmap teardown; HTTP-ready includes everything.) Cold ready stays storage-bound (5.39s → 5.33s on local NVMe). On dual-GH200 Qwen3-14B TP2 the picture is platform-dependent: pageable copies over NVLink-C2C are already fast, so the pipeline wins there only once the strided column-shard gather lands with it (warm rank-0 load 1.19s → 0.69s vs main; the intermediate gather-only state regresses to 1.33s), validated by the TP2 golden gate with the page cache warm and cold.
+
+### Staging geometry and the fill team
+
+The first rollout shipped 64 MiB slots filled by four threads spawned per chunk; both numbers amortized the per-chunk event sync rather than being measured against the fill rate. A ten-arm sweep (two-GPU GH200, Qwen3-32B, TP2, 144 cores, five interleaved repetitions) moved the shipping point to 32 MiB slots filled by a resident rayon team of eight, halving pinned memory to 64 MiB across both buffers.
+
+Neither half is worth shipping alone: spawning at 8/32 MiB reaches 8272 ms to ready at 28.84 s of CPU, while pooling at the old 4/64 MiB reaches 8262 ms at 24.25 s — better on both axes with no constant touched. The resident team is what gives smaller chunks something to save. CPU is bought by the worker count, not the chunk size: at fixed chunk, four workers to eight costs 12.6–14.8% more CPU on the pooled arms; at fixed workers, 64→32 MiB costs 0.3–2.2%.
+
+Host-level fill concurrency knees at 16 host threads (4/8/16/24 → 5482/3583/2720/2701 ms, the last for 23% more CPU); GLM5.2's stager reached the same 16 independently as four ranks times four workers. **`FILL_THREADS` is per rank**, so eight is 16 host threads at TP2, 32 at TP4, 64 at TP8 — only TP1 and TP2 are measured, and the extrapolation crosses the knee. Treat the constant as valid for those two widths until a host budget divided by `world_size` replaces it.
+
+On the post-#752 base, where uploads run back to back from `finish()`, the change is worth 1113→843 ms in phase and 7682→7010 ms to ready at 15.06→20.22 s CPU — about half the ready gain of the earlier base, since #752 made the baseline faster while the CPU cost held, raising the price from 4.3 to 7.7 CPU-seconds per second saved. On a single sm_89 GPU it is flat to ready: that host is already transfer-bound at 23.3 GiB/s against 24.6 GiB/s of fill.
+
+Halving the buffer also halves the column-shard ceiling `upload_cols` enforces, from 33.5 M to 16.7 M columns per shard; no published checkpoint approaches it.
 
 ## Next
 

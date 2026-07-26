@@ -1,3 +1,4 @@
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -10,15 +11,111 @@ use cudarc::driver::result::memcpy_htod_async;
 use cudarc::driver::sys::CUevent_flags;
 use half::bf16;
 use log::error;
+use rayon::ThreadPool;
+use rayon::ThreadPoolBuilder;
 
 use crate::tensor::DeviceContext;
 
 const BF16_SIZE: usize = std::mem::size_of::<bf16>();
-/// Bytes per pinned staging buffer: 64 MiB amortizes the per-chunk event sync
-/// while capping pinned memory at 128 MiB across both buffers.
-const STAGE_BYTES: usize = 64 << 20;
-/// A single memcpy thread cannot keep up with the pinned H2D copy rate.
-const FILL_THREADS: usize = 4;
+/// Per-buffer staging chunk. The measured 32 MiB geometry improves overlap and
+/// limits the two pinned buffers to 64 MiB.
+const STAGE_BYTES: usize = 32 << 20;
+/// Empirical upper bound for the fill team; wider teams were slower.
+const FILL_THREADS: usize = 8;
+/// Small tails do not amortize dispatching work across the fill team.
+const PARALLEL_FILL_MIN_BYTES: usize = 1 << 20;
+
+fn fill_threads() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        let width = std::thread::available_parallelism()
+            .expect("query available CPU parallelism")
+            .get()
+            .min(FILL_THREADS);
+        if width < FILL_THREADS {
+            log::info!("weight fill: {width} threads, capped by the core count");
+        }
+        width
+    })
+}
+
+fn as_uninit(src: &[u8]) -> &[MaybeUninit<u8>] {
+    // SAFETY: MaybeUninit<u8> shares u8's layout and adds no validity
+    // requirement, so widening an initialized slice is sound.
+    unsafe { std::slice::from_raw_parts(src.as_ptr().cast(), src.len()) }
+}
+
+struct FillPool {
+    pool: ThreadPool,
+    workers: usize,
+}
+
+impl FillPool {
+    fn new() -> Result<Self> {
+        Self::with_workers(fill_threads())
+    }
+
+    fn with_workers(workers: usize) -> Result<Self> {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|worker| format!("weight-fill-{worker}"))
+            .build()
+            .map_err(|e| anyhow::anyhow!("build weight-fill pool failed: {e}"))?;
+        Ok(Self { pool, workers })
+    }
+
+    fn copy(&self, src: &[u8], dst: &mut [MaybeUninit<u8>]) {
+        debug_assert_eq!(src.len(), dst.len());
+        if src.len() < PARALLEL_FILL_MIN_BYTES || self.workers == 1 {
+            dst.copy_from_slice(as_uninit(src));
+            return;
+        }
+        let per = src.len().div_ceil(self.workers);
+        self.pool.scope(|scope| {
+            for (src_part, dst_part) in src.chunks(per).zip(dst.chunks_mut(per)) {
+                scope.spawn(move |_| dst_part.copy_from_slice(as_uninit(src_part)));
+            }
+        });
+    }
+
+    fn gather_cols(
+        &self,
+        src: &[u8],
+        stride_b: usize,
+        off_b: usize,
+        take_b: usize,
+        rows: usize,
+        dst: &mut [MaybeUninit<u8>],
+    ) {
+        debug_assert!(off_b + take_b <= stride_b);
+        debug_assert!(rows * stride_b <= src.len());
+        debug_assert_eq!(rows * take_b, dst.len());
+        if dst.len() < PARALLEL_FILL_MIN_BYTES || self.workers == 1 {
+            for (src_row, dst_row) in src[..rows * stride_b]
+                .chunks(stride_b)
+                .zip(dst.chunks_mut(take_b))
+            {
+                dst_row.copy_from_slice(as_uninit(&src_row[off_b..off_b + take_b]));
+            }
+            return;
+        }
+        let rows_per = rows.div_ceil(self.workers);
+        self.pool.scope(|scope| {
+            for (src_rows, dst_rows) in src[..rows * stride_b]
+                .chunks(rows_per * stride_b)
+                .zip(dst.chunks_mut(rows_per * take_b))
+            {
+                scope.spawn(move |_| {
+                    for (src_row, dst_row) in
+                        src_rows.chunks(stride_b).zip(dst_rows.chunks_mut(take_b))
+                    {
+                        dst_row.copy_from_slice(as_uninit(&src_row[off_b..off_b + take_b]));
+                    }
+                });
+            }
+        });
+    }
+}
 
 struct StagingBuf {
     pinned: PinnedHostSlice<bf16>,
@@ -39,6 +136,7 @@ pub(crate) struct ColShardPlan {
 pub(crate) struct WeightStager {
     stream: Arc<CudaStream>,
     bufs: [StagingBuf; 2],
+    fill: FillPool,
     next: usize,
 }
 
@@ -58,6 +156,7 @@ impl WeightStager {
         Ok(Self {
             stream: ctx.stream.clone(),
             bufs: [make()?, make()?],
+            fill: FillPool::new()?,
             next: 0,
         })
     }
@@ -68,11 +167,7 @@ impl WeightStager {
     pub(crate) unsafe fn upload_at(&mut self, src: &[u8], dst_at: u64) -> Result<()> {
         for (i, chunk) in src.chunks(STAGE_BYTES).enumerate() {
             let chunk_at = dst_at + (i * STAGE_BYTES) as u64;
-            let fill = |stage: *mut u8| {
-                // SAFETY: `chunk.len() <= STAGE_BYTES`, and the privately
-                // owned buffer cannot overlap `chunk`.
-                unsafe { fill_pinned(chunk, stage) };
-            };
+            let fill = |pool: &FillPool, stage: &mut [MaybeUninit<u8>]| pool.copy(chunk, stage);
             // SAFETY: the chunks partition `src`, so `chunk_at` stays inside
             // the validated destination range, with `chunk.len() <= STAGE_BYTES`.
             unsafe { self.stage_chunk(chunk.len(), chunk_at, fill) }?;
@@ -89,20 +184,15 @@ impl WeightStager {
         while row < plan.rows {
             let chunk_rows = rows_per_chunk.min(plan.rows - row);
             let dst_at = plan.dst_at + (row * plan.take_b) as u64;
-            let fill = |stage: *mut u8| {
-                // SAFETY: the privately owned buffer cannot overlap `src`,
-                // and the subslice covers `chunk_rows` full rows since
-                // `off_b + take_b <= stride_b`.
-                unsafe {
-                    fill_pinned_strided(
-                        &src[row * plan.stride_b..],
-                        plan.stride_b,
-                        plan.off_b,
-                        plan.take_b,
-                        chunk_rows,
-                        stage,
-                    );
-                }
+            let fill = |pool: &FillPool, stage: &mut [MaybeUninit<u8>]| {
+                pool.gather_cols(
+                    &src[row * plan.stride_b..],
+                    plan.stride_b,
+                    plan.off_b,
+                    plan.take_b,
+                    chunk_rows,
+                    stage,
+                );
             };
             // SAFETY: the destination rows lie inside the validated range per
             // the rows x take bound, with `chunk_rows * take_b <= STAGE_BYTES`.
@@ -119,7 +209,7 @@ impl WeightStager {
         &mut self,
         bytes: usize,
         dst_at: u64,
-        fill: impl FnOnce(*mut u8),
+        fill: impl FnOnce(&FillPool, &mut [MaybeUninit<u8>]),
     ) -> Result<()> {
         let idx = self.next;
         self.next = (self.next + 1) % self.bufs.len();
@@ -132,7 +222,11 @@ impl WeightStager {
             .as_mut_ptr()
             .map_err(|e| anyhow::anyhow!("staging pointer failed: {e}"))?
             .cast::<u8>();
-        fill(stage);
+        // SAFETY: the pinned allocation contains STAGE_BYTES bytes and this
+        // function requires bytes <= STAGE_BYTES.
+        let staged =
+            unsafe { std::slice::from_raw_parts_mut(stage.cast::<MaybeUninit<u8>>(), bytes) };
+        fill(&self.fill, staged);
         // SAFETY: `fill` initialized `bytes` at `stage` and `dst_at` is valid
         // per the contract; the buffer outlives the copy (`dma_done` or the
         // drain-or-abort branches), and the event synchronize above bound the
@@ -278,82 +372,22 @@ pub(super) fn drain_or_abort(stream: &CudaStream, context: &str) {
     }
 }
 
-/// # Safety
-/// `dst` must hold `src.len()` writable bytes without overlapping `src`.
-unsafe fn fill_pinned(src: &[u8], dst: *mut u8) {
-    if src.is_empty() {
-        return;
-    }
-    let per = src.len().div_ceil(FILL_THREADS);
-    let dst_addr = dst as usize;
-    std::thread::scope(|scope| {
-        for (i, part) in src.chunks(per).enumerate() {
-            scope.spawn(move || {
-                // SAFETY: disjoint per-thread ranges within `dst`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        part.as_ptr(),
-                        (dst_addr as *mut u8).add(i * per),
-                        part.len(),
-                    );
-                }
-            });
-        }
-    });
-}
-
-/// # Safety
-/// `dst` must hold `rows * take_b` writable bytes without overlapping `src`;
-/// every requested source row slice must exist.
-unsafe fn fill_pinned_strided(
-    src: &[u8],
-    stride_b: usize,
-    off_b: usize,
-    take_b: usize,
-    rows: usize,
-    dst: *mut u8,
-) {
-    if rows == 0 {
-        return;
-    }
-    let rows_per = rows.div_ceil(FILL_THREADS);
-    let dst_addr = dst as usize;
-    std::thread::scope(|scope| {
-        for t in 0..FILL_THREADS.min(rows) {
-            let start = t * rows_per;
-            let end = rows.min(start + rows_per);
-            if start >= end {
-                break;
-            }
-            scope.spawn(move || {
-                for row in start..end {
-                    // SAFETY: disjoint per-thread row ranges; source rows
-                    // exist per the contract.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * stride_b + off_b),
-                            (dst_addr as *mut u8).add(row * take_b),
-                            take_b,
-                        );
-                    }
-                }
-            });
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn fill_pinned_strided_matches_scalar_gather() {
+    fn fill_pool_strided_matches_scalar_gather() {
+        // Fixed width: `FillPool::new()` would collapse to the serial path on a
+        // single-CPU runner, so the parallel case below would not be exercised.
+        let pool = FillPool::with_workers(2).expect("build fill pool");
         for &(rows, total_cols, col_offset, take) in &[
             (1usize, 7usize, 0usize, 7usize),
             (3, 8, 2, 5),
             (4, 5, 1, 4),
             (9, 6, 3, 3),
-            (17, 4, 0, 1),
+            // Past the parallel threshold, with rows that do not divide evenly.
+            (601, 2560, 640, 1280),
         ] {
             let (stride_b, off_b, take_b) = (
                 total_cols * BF16_SIZE,
@@ -365,14 +399,10 @@ mod tests {
                 *b = (i % 251) as u8;
             }
             let src = &buf[..];
-            let mut dst = vec![0u8; rows * take_b];
-            // SAFETY: `dst` holds `rows * take_b` bytes and does not overlap
-            // `src`; `src` holds `rows * stride_b` bytes, covering
-            // `(rows - 1) * stride_b + off_b + take_b` since
-            // `off_b + take_b <= stride_b`.
-            unsafe {
-                fill_pinned_strided(src, stride_b, off_b, take_b, rows, dst.as_mut_ptr());
-            }
+            let mut dst = vec![MaybeUninit::uninit(); rows * take_b];
+            pool.gather_cols(src, stride_b, off_b, take_b, rows, &mut dst);
+            // SAFETY: gather_cols wrote every byte of `dst`.
+            let dst = unsafe { std::slice::from_raw_parts(dst.as_ptr().cast::<u8>(), dst.len()) };
             let mut expect = Vec::with_capacity(rows * take_b);
             for r in 0..rows {
                 for c in 0..take_b {
