@@ -25,6 +25,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use anyhow::anyhow;
+pub use config::probe_config_json;
 use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::EngineLoadOptions;
 use openinfer_core::engine::EpBackend;

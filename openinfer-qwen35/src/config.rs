@@ -2,8 +2,11 @@ use std::collections::HashSet;
 use std::fs;
 
 use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use log::warn;
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TensorParallelConfig {
@@ -542,6 +545,33 @@ pub(crate) fn tokenizer_effective_vocab(model_path: &str) -> Result<usize> {
          a row-range selection bound cannot mask holes"
     );
     Ok(width)
+}
+
+/// Identity check that `json` is a Qwen3.5 config; size and shape validation belong to the config loader.
+pub fn probe_config_json(json: &Value) -> Result<()> {
+    let model_type = json.get("model_type").and_then(Value::as_str).unwrap_or("");
+    if model_type != "qwen3_5" {
+        bail!("not a Qwen3.5 config: model_type={model_type}");
+    }
+    let architectures: Vec<&str> = json
+        .get("architectures")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    ensure!(
+        architectures.contains(&"Qwen3_5ForConditionalGeneration"),
+        "Qwen3.5 architectures must contain Qwen3_5ForConditionalGeneration"
+    );
+    let text_model_type = json
+        .get("text_config")
+        .and_then(|tc| tc.get("model_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    ensure!(
+        text_model_type == "qwen3_5_text",
+        "Qwen3.5 text_config.model_type must be qwen3_5_text, got {text_model_type}"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

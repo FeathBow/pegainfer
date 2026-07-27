@@ -2,7 +2,10 @@ use std::fs;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use serde::Deserialize;
+use serde_json::Value;
 
 pub(crate) const PREFILL_ATTENTION_CTA_TILE_Q: i32 = 64;
 
@@ -503,4 +506,22 @@ impl TensorParallelConfig {
     pub(crate) fn is_sharded(self) -> bool {
         self.world_size > 1
     }
+}
+
+/// Identity check that `json` is a Qwen3 config; size and shape validation belong to the config loader.
+pub fn probe_config_json(json: &Value) -> Result<()> {
+    let model_type = json.get("model_type").and_then(Value::as_str).unwrap_or("");
+    if model_type != "qwen3" {
+        bail!("not a Qwen3 config: model_type={model_type}");
+    }
+    let architectures: Vec<&str> = json
+        .get("architectures")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    ensure!(
+        architectures.contains(&"Qwen3ForCausalLM"),
+        "Qwen3 architectures must contain Qwen3ForCausalLM"
+    );
+    Ok(())
 }

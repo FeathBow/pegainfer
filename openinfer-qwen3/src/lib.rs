@@ -24,6 +24,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
+pub use config::probe_config_json;
 use log::info;
 use log::warn;
 use openinfer_core::engine::EngineHandle;

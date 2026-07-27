@@ -62,3 +62,6 @@ qwen35 = ["dep:openinfer-qwen35", "openinfer-qwen35/qwen35"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
