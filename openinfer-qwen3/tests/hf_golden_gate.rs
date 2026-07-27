@@ -146,6 +146,8 @@ fn fixture_size_name(model_path: &str) -> Option<&'static str> {
         panic!("{model_path}/config.json has no hidden_size/num_hidden_layers");
     };
     match (hidden, layers) {
+        (1024, 28) => Some("0.6b"),
+        (2048, 28) => Some("1.7b"),
         (2560, 36) => Some("4b"),
         (4096, 36) => Some("8b"),
         (5120, 40) => Some("14b"),
@@ -154,7 +156,7 @@ fn fixture_size_name(model_path: &str) -> Option<&'static str> {
     }
 }
 
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["4b", "14b"];
+const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.6b", "1.7b", "4b", "14b"];
 
 fn default_fixture_path(size: &str) -> String {
     format!(

@@ -62,6 +62,8 @@ TOP_K = 64
 # (hidden_size, num_hidden_layers) -> fixture size token. Keep in sync with
 # `fixture_size_name` in openinfer-qwen3/tests/hf_golden_gate.rs.
 SIZE_NAMES = {
+    (1024, 28): "0.6b",
+    (2048, 28): "1.7b",
     (2560, 36): "4b",
     (4096, 36): "8b",
     (5120, 40): "14b",
