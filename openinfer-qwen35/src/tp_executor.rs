@@ -579,6 +579,7 @@ fn spawn_nccl_startup_watchdog() -> Result<(mpsc::SyncSender<()>, JoinHandle<()>
     Ok((done_tx, watchdog))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn disarm_nccl_startup_watchdog(
     done_tx: mpsc::SyncSender<()>,
     watchdog: JoinHandle<()>,
@@ -641,6 +642,7 @@ impl TpStartupGate {
 }
 
 impl TpWorker {
+    #[allow(clippy::type_complexity)]
     fn spawn(
         rank: usize,
         world_size: usize,
@@ -903,6 +905,7 @@ fn effective_recurrent_capacity(
 }
 
 impl TpWorkerState {
+    #[allow(clippy::needless_pass_by_value)]
     fn run(&mut self, rx: mpsc::Receiver<TpWorkerCommand>) {
         while let Ok(command) = rx.recv() {
             let fatal = match command {
@@ -947,6 +950,7 @@ impl TpWorkerState {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn respond(
         &self,
         resp: mpsc::Sender<TpWorkerResponse>,
@@ -1236,6 +1240,7 @@ impl From<DecodeStepItem> for TpDecodeStepItem {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn wait_for_acks(
     responses: mpsc::Receiver<TpWorkerResponse>,
     expected: usize,
@@ -1257,6 +1262,7 @@ fn wait_for_acks(
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn wait_for_prefill(
     responses: mpsc::Receiver<TpWorkerResponse>,
     expected: usize,
@@ -1287,6 +1293,7 @@ fn wait_for_prefill(
     result.ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP prefill returned no primary result"))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn wait_for_decode(
     responses: mpsc::Receiver<TpWorkerResponse>,
     expected: usize,

@@ -108,6 +108,7 @@ impl Qwen35LaunchOptions {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub fn launch_with_options_and_policy(
     model_path: &Path,
     options: Qwen35LaunchOptions,

@@ -9,9 +9,8 @@ pub(crate) fn load_tokenizer(model_path: &str) -> DynTokenizer {
 #[allow(dead_code)]
 pub(crate) fn tp2_device_ordinals() -> Vec<usize> {
     const ENV: &str = "OPENINFER_TEST_TP_DEVICES";
-    let value = match std::env::var(ENV) {
-        Ok(value) => value,
-        Err(_) => return vec![0, 1],
+    let Ok(value) = std::env::var(ENV) else {
+        return vec![0, 1];
     };
 
     let devices: Vec<usize> = value

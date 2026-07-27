@@ -9,6 +9,7 @@ use super::*;
 fn send_rejection_reports_kv_lifetime_request_tokens() {
     let (token_tx, mut token_rx) = TokenSink::standalone();
     let req = SchedulerRequest {
+        trace_parent: None,
         request_id: Some("too-large".to_string()),
         queued_at_unix_s: None,
         data_parallel_rank: None,
@@ -90,6 +91,7 @@ fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
 
     handle
         .submit(SchedulerRequest {
+            trace_parent: None,
             request_id: Some("tp2-scheduler-smoke".to_string()),
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -142,6 +144,7 @@ fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
 fn send_rejection_reports_context_window_limit() {
     let (token_tx, mut token_rx) = TokenSink::standalone();
     let req = SchedulerRequest {
+        trace_parent: None,
         request_id: Some("too-long".to_string()),
         queued_at_unix_s: None,
         data_parallel_rank: None,

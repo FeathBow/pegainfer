@@ -550,8 +550,7 @@ fn run_full_scheduler_e2e(
 fn context_limit_for(handle: &EngineHandle, model_path: &str) -> usize {
     handle
         .servable_len()
-        .map(|len| len as usize)
-        .unwrap_or_else(|| max_position_embeddings(model_path))
+        .map_or_else(|| max_position_embeddings(model_path), |len| len as usize)
 }
 
 #[test]

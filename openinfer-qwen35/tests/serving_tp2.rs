@@ -183,7 +183,7 @@ async fn assert_concurrent_completions(client: &Client, base_url: &str) -> Resul
 }
 
 fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
-    let error = match openinfer_qwen35::start_engine_with_capacity(
+    let Err(error) = openinfer_qwen35::start_engine_with_capacity(
         Path::new(model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
@@ -193,9 +193,8 @@ fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
         },
         8,
         1,
-    ) {
-        Ok(_) => bail!("TP2 + CUDA Graph must fail before serving requests"),
-        Err(error) => error,
+    ) else {
+        bail!("TP2 + CUDA Graph must fail before serving requests");
     };
     let message = error.to_string();
     if !message.contains("eager execution only") {
@@ -231,7 +230,7 @@ async fn post_completion_stream(client: &Client, base_url: &str, body: Value) ->
 fn completion_body(stream: bool, max_tokens: usize, logprobs: usize) -> Value {
     let mut body = json!({
         "model": MODEL_NAME,
-        "prompt": [151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198],
+        "prompt": [151_644, 872, 198, 9707, 151_645, 198, 151_644, 77091, 198],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "ignore_eos": true,
@@ -246,7 +245,7 @@ fn completion_body(stream: bool, max_tokens: usize, logprobs: usize) -> Value {
 fn alternate_completion_body(stream: bool, max_tokens: usize, logprobs: usize) -> Value {
     let mut body = json!({
         "model": MODEL_NAME,
-        "prompt": [151644, 872, 198, 3838, 374, 220, 17, 489, 220, 17, 30, 151645, 198, 151644, 77091, 198],
+        "prompt": [151_644, 872, 198, 3838, 374, 220, 17, 489, 220, 17, 30, 151_645, 198, 151_644, 77091, 198],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "ignore_eos": true,
