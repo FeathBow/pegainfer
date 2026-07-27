@@ -14,7 +14,7 @@
 
 - Reusable debugging method now lives in [../../playbooks/accuracy-parity-playbook.md](../../playbooks/accuracy-parity-playbook.md).
 - `openinfer-qwen35/tests/hf_golden_gate.rs` checks openinfer logits against pinned HF bf16 `past_key_values` oracles, a short + long pair per committed size (`0.8b`, `2b`, `4b`, `9b`, `27b`):
-  - `test_data/qwen35-0.8b-hf-golden.safetensors` / `qwen35-0.8b-hf-long-golden.safetensors` — 0.8B short + long; first GDN expansion-factor-1 checkpoint (16/16 linear heads vs the 2× of every larger size); GH200 sm_90 floors mean 0.027–0.030 / p99 ≤ 0.115 across all five graph passes.
+  - `test_data/qwen35-0.8b-hf-golden.safetensors` / `qwen35-0.8b-hf-long-golden.safetensors` — 0.8B short + long; first GDN expansion-factor-1 checkpoint (16/16 linear heads vs the 2× of 4B/9B/27B); GH200 sm_90 floors mean 0.027–0.030 / p99 ≤ 0.115 across all five graph passes.
   - `test_data/qwen35-2b-hf-golden.safetensors` / `qwen35-2b-hf-long-golden.safetensors` — 2B short + long, same expansion-factor-1 path; GH200 sm_90 floors mean 0.023–0.029 / p99 ≤ 0.110.
   - `test_data/qwen35-4b-hf-golden.safetensors` / `qwen35-4b-hf-long-golden.safetensors` — 4B short mixed-shape + long 4097/8192-token replay surfaces.
   - `test_data/qwen35-9b-hf-golden.safetensors` / `qwen35-9b-hf-long-golden.safetensors` — 9B (untied lm_head, #516) short + long, within the 4B tolerances.
