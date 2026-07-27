@@ -39,6 +39,8 @@ TOP_K = 64
 # Keep in sync with `fixture_size_name` in
 # openinfer-qwen35/tests/hf_golden_gate.rs (the size-key geometry table).
 SIZE_NAMES = {
+    (1024, 24): "Qwen3.5-0.8B",
+    (2048, 24): "Qwen3.5-2B",
     (2560, 32): "Qwen3.5-4B",
     (4096, 32): "Qwen3.5-9B",
     (5120, 64): "Qwen3.5-27B",

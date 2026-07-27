@@ -65,6 +65,8 @@ fn fixture_size_name(model_path: &str) -> Option<&'static str> {
         );
     };
     match (hidden, layers) {
+        (1024, 24) => Some("0.8b"),
+        (2048, 24) => Some("2b"),
         (2560, 32) => Some("4b"),
         (4096, 32) => Some("9b"),
         (5120, 64) => Some("27b"),
@@ -74,7 +76,7 @@ fn fixture_size_name(model_path: &str) -> Option<&'static str> {
 
 /// Sizes whose fixtures are committed in `test_data/`; a missing file for
 /// these is a broken checkout, not an ungenerated fixture.
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["4b", "9b", "27b"];
+const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.8b", "2b", "4b", "9b", "27b"];
 
 fn default_fixture_path(size: &str, long: bool) -> String {
     let kind = if long {
