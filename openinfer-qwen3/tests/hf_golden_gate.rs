@@ -156,7 +156,7 @@ fn fixture_size_name(model_path: &str) -> Option<&'static str> {
     }
 }
 
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.6b", "1.7b", "4b", "14b"];
+const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.6b", "1.7b", "4b", "8b", "14b", "32b"];
 
 fn default_fixture_path(size: &str) -> String {
     format!(
