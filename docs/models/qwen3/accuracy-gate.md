@@ -1,6 +1,6 @@
 # Qwen3 accuracy gate
 
-**TL;DR**: Qwen3's logits are guarded (per committed size — 0.6B, 1.7B, 4B, and 14B, keyed from config geometry; 8B is mapped but has no committed golden yet) by `tests/hf_golden_gate.rs` — a tolerance check against stored HuggingFace bf16 goldens, *not* an exact-text or hash baseline. It teacher-forces 48 fixed sequences and asserts openinfer's logprobs stay at the bf16 noise floor of HF across bs=1 / batched eager, and through CUDA-graph when the model's GQA group is compiled (0.6B/1.7B are group-2, compiled — their graph passes run for real; 14B is group-5, uncompiled — it reroutes decode eager and skips the graph passes). Strict guards: a structural **regret** check on the argmax + **mean** delta ≤ 0.06 nat + **p99** delta ≤ 0.20 nat; the absolute max is printed but not asserted (it is coverage-unstable). This is the reference implementation of the pattern in `subsystems/correctness/logits-golden-gate.md` — read that for the *why*; this doc is the Qwen3 *specifics*.
+**TL;DR**: Qwen3's logits are guarded (per committed size — 0.6B, 1.7B, 4B, and 14B, keyed from config geometry; 8B and 32B are mapped but have no committed goldens yet) by `tests/hf_golden_gate.rs` — a tolerance check against stored HuggingFace bf16 goldens, *not* an exact-text or hash baseline. It teacher-forces 48 fixed sequences and asserts openinfer's logprobs stay at the bf16 noise floor of HF across bs=1 / batched eager, and through CUDA-graph when the model's GQA group is compiled (0.6B/1.7B are group-2, compiled — their graph passes run for real; 14B is group-5, uncompiled — it reroutes decode eager and skips the graph passes). Strict guards: a structural **regret** check on the argmax + **mean** delta ≤ 0.06 nat + **p99** delta ≤ 0.20 nat; the absolute max is printed but not asserted (it is coverage-unstable). This is the reference implementation of the pattern in `subsystems/correctness/logits-golden-gate.md` — read that for the *why*; this doc is the Qwen3 *specifics*.
 
 Last touched: 2026-07
 
@@ -77,9 +77,10 @@ The gate prints the full delta distribution and the worst position (`seq`, `pos`
 | 0.6B | (1024, 28) | 2 (compiled) | yes | GH200 sm_90: six passes green incl. both cuda-graph passes, mean 0.0387 / p99 0.136 |
 | 1.7B | (2048, 28) | 2 (compiled) | yes | GH200 sm_90: six passes green, mean 0.0332 / p99 0.123 |
 | 4B | (2560, 36) | 4 (compiled) | yes | RTX 5070 Ti sm_120 floor above; default `OPENINFER_TEST_MODEL_PATH` size |
-| 8B | (4096, 36) | 4 (compiled) | **no — gate skips** | mapped in `fixture_size_name` but absent from `COMMITTED_FIXTURE_SIZES`; the only mapped size without a golden |
+| 8B | (4096, 36) | 4 (compiled) | **no — gate skips** | mapped in `fixture_size_name` but absent from `COMMITTED_FIXTURE_SIZES` |
 | 14B | (5120, 40) | 5 (uncompiled, reroutes eager) | yes | GH200 sm_90 (#562): mean 0.029 / p99 0.102; graph passes skipped by reroute |
+| 32B | (5120, 64) | 8 (compiled) | **no — gate skips** | mapped but no golden; #509 covered 32B behaviorally (HF greedy, serving) — the logits gate has never run on it |
 
 ## Next step
 
-Open follow-ups: (1) an 8B golden to close the matrix hole above; (2) port qwen35's **long** golden (4097/8192) to the qwen3 sizes — qwen3 has no long-context logits coverage at any size yet, and qwen35's long fixture is what caught the #250 RoPE-boundary drift. See `subsystems/correctness/logits-golden-gate.md` for the portable pattern; `models/qwen35/accuracy.md` for the long-replay shape.
+Open follow-ups: (1) 8B and 32B goldens to close the matrix holes above; (2) port qwen35's **long** golden (4097/8192) to the qwen3 sizes — qwen3 has no long-context logits coverage at any size yet, and qwen35's long fixture is what caught the #250 RoPE-boundary drift. See `subsystems/correctness/logits-golden-gate.md` for the portable pattern; `models/qwen35/accuracy.md` for the long-replay shape.
