@@ -3206,6 +3206,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-gemma4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "openinfer-engine",
+ "serde_json",
+]
+
+[[package]]
 name = "openinfer-glm52"
 version = "0.1.0"
 dependencies = [
@@ -3377,6 +3386,7 @@ dependencies = [
  "log",
  "openinfer-core",
  "openinfer-deepseek-v2-lite",
+ "openinfer-gemma4",
  "openinfer-glm52",
  "openinfer-kimi-k2",
  "openinfer-qwen3",

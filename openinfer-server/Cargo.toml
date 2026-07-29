@@ -31,6 +31,7 @@ cudarc = { workspace = true }
 log = { workspace = true }
 openinfer-core = { workspace = true }
 openinfer-deepseek-v2-lite = { workspace = true, optional = true }
+openinfer-gemma4 = { workspace = true, optional = true }
 openinfer-glm52 = { workspace = true, optional = true }
 openinfer-kimi-k2 = { workspace = true, optional = true }
 openinfer-qwen3 = { workspace = true, optional = true }
@@ -56,6 +57,7 @@ deepseek-v2-lite = [
   "dep:openinfer-deepseek-v2-lite",
   "openinfer-deepseek-v2-lite/deepseek-v2-lite",
 ]
+gemma4 = ["dep:openinfer-gemma4", "openinfer-gemma4/gemma4"]
 glm52 = ["dep:openinfer-glm52"]
 kimi-k2 = ["dep:openinfer-kimi-k2", "openinfer-kimi-k2/kimi-k2"]
 qwen35 = ["dep:openinfer-qwen35", "openinfer-qwen35/qwen35"]

@@ -12,6 +12,7 @@ members = [
   "openinfer-bench",
   "openinfer-build",
   "openinfer-deepseek-v2-lite",
+  "openinfer-gemma4",
   "openinfer-glm52",
   "openinfer-kimi-k2",
   "openinfer-qwen3",
@@ -126,6 +127,7 @@ openinfer-core = { path = "openinfer-core" }
 openinfer-cupti = { path = "openinfer-cupti" }
 openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }
 openinfer-engine = { path = "openinfer-engine" }
+openinfer-gemma4 = { path = "openinfer-gemma4" }
 openinfer-glm52 = { path = "openinfer-glm52" }
 openinfer-kernels = { path = "openinfer-kernels" }
 openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }

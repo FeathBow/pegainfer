@@ -14,7 +14,8 @@
         feature = "deepseek-v2-lite",
         feature = "kimi-k2",
         feature = "qwen3",
-        feature = "qwen35"
+        feature = "qwen35",
+        feature = "gemma4",
     )),
     allow(unused_imports, unused_variables, dead_code)
 )]
@@ -192,6 +193,20 @@ fn main() -> Result<()> {
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = DeepSeekV2LiteBenchModel { generator };
             dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
+        }
+        #[cfg(feature = "gemma4")]
+        ModelType::Gemma4 => {
+            let handle = openinfer_gemma4::start_engine(
+                Path::new(&cli.model_path),
+                EngineLoadOptions {
+                    enable_cuda_graph: cli.cuda_graph,
+                    device_ordinals: vec![0],
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
+                    seed: command_seed(&cli),
+                },
+            )?;
+            finish(handle, cli.cuda_graph)
         }
         #[cfg(feature = "glm52")]
         ModelType::Glm52 => {

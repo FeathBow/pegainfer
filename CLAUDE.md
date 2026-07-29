@@ -13,6 +13,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Qwen3-4B / 8B | `openinfer-qwen3` | `qwen3` (default) | Full attention, TP support |
 | Qwen3.5-4B / 9B / 27B | `openinfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
 | DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
+| Gemma 4 | `openinfer-gemma4` | `--features gemma4` | Registration only — engine not yet available |
 | Kimi-K2 | `openinfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
 | GLM5.2 | `openinfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
 

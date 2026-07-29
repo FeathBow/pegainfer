@@ -355,6 +355,8 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
     match model_type {
         #[cfg(feature = "deepseek-v2-lite")]
         ModelType::DeepSeekV2Lite => &["cuda_graph"],
+        #[cfg(feature = "gemma4")]
+        ModelType::Gemma4 => &["cuda_graph"],
         #[cfg(feature = "glm52")]
         ModelType::Glm52 => &[
             "tp_size",
@@ -764,6 +766,8 @@ mod tests {
         [
             #[cfg(feature = "deepseek-v2-lite")]
             ModelType::DeepSeekV2Lite,
+            #[cfg(feature = "gemma4")]
+            ModelType::Gemma4,
             #[cfg(feature = "glm52")]
             ModelType::Glm52,
             #[cfg(feature = "kimi-k2")]

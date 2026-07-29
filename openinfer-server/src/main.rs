@@ -11,6 +11,8 @@ use openinfer::logging;
 use openinfer::server_engine::ModelType;
 use openinfer::server_engine::detect_model_type;
 use openinfer_core::engine::EngineHandle;
+#[cfg(feature = "gemma4")]
+use openinfer_core::engine::EngineLoadOptions;
 #[cfg(feature = "qwen3")]
 use openinfer_qwen3::Qwen3LaunchOptions;
 #[cfg(feature = "qwen3")]
@@ -169,6 +171,11 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
         ModelType::DeepSeekV2Lite => {
             openinfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)
                 .context("failed to start DeepSeek V2 Lite engine")?
+        }
+        #[cfg(feature = "gemma4")]
+        ModelType::Gemma4 => {
+            openinfer_gemma4::start_engine(&args.model_path, EngineLoadOptions::default())
+                .context("failed to start Gemma 4 engine")?
         }
         #[cfg(feature = "glm52")]
         ModelType::Glm52 => {

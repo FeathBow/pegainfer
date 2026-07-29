@@ -12,6 +12,8 @@ pub use openinfer_core::engine::TokenLogprob;
 pub enum ModelType {
     #[cfg(feature = "deepseek-v2-lite")]
     DeepSeekV2Lite,
+    #[cfg(feature = "gemma4")]
+    Gemma4,
     #[cfg(feature = "glm52")]
     Glm52,
     #[cfg(feature = "kimi-k2")]
@@ -29,6 +31,8 @@ impl fmt::Display for ModelType {
         match *self {
             #[cfg(feature = "deepseek-v2-lite")]
             Self::DeepSeekV2Lite => write!(f, "DeepSeek-V2-Lite"),
+            #[cfg(feature = "gemma4")]
+            Self::Gemma4 => write!(f, "Gemma 4"),
             #[cfg(feature = "glm52")]
             Self::Glm52 => write!(f, "GLM5.2"),
             #[cfg(feature = "kimi-k2")]
@@ -59,6 +63,7 @@ fn seen_config_field(json: &serde_json::Value, key: &str) -> String {
 fn unrecognized_config_error(json: &serde_json::Value) -> anyhow::Error {
     let families = [
         ("DeepSeek-V2-Lite", cfg!(feature = "deepseek-v2-lite")),
+        ("Gemma 4", cfg!(feature = "gemma4")),
         ("GLM5.2", cfg!(feature = "glm52")),
         ("Kimi-K2.6", cfg!(feature = "kimi-k2")),
         ("Qwen3", cfg!(feature = "qwen3")),
@@ -124,6 +129,23 @@ pub fn detect_model_type(model_path: impl AsRef<Path>) -> Result<ModelType> {
         );
     }
 
+    if matches!(config_model_type(&json), Some("gemma4" | "gemma4_unified"))
+        || matches!(
+            text_config_model_type(&json),
+            Some("gemma4_text" | "gemma4_unified_text")
+        )
+    {
+        #[cfg(feature = "gemma4")]
+        {
+            openinfer_gemma4::probe_config_json(&json)?;
+            return Ok(ModelType::Gemma4);
+        }
+        #[cfg(not(feature = "gemma4"))]
+        anyhow::bail!(
+            "Gemma 4 support is feature-gated; rebuild openinfer-server with --features gemma4"
+        );
+    }
+
     if config_model_type(&json) == Some("qwen3_5")
         || text_config_model_type(&json) == Some("qwen3_5_text")
     {
@@ -178,17 +200,33 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_12b_rejected() {
+    #[cfg(not(feature = "gemma4"))]
+    fn gemma4_12b_feature_gated() {
         let json = r#"{"model_type":"gemma4_unified","architectures":["Gemma4UnifiedForConditionalGeneration"],"text_config":{"model_type":"gemma4_unified_text"}}"#;
         let err = detect(json).unwrap_err().to_string();
-        assert!(err.contains("gemma4_unified"));
+        assert!(err.contains("feature-gated"));
+        assert!(err.contains("--features gemma4"));
     }
 
     #[test]
-    fn gemma4_26b_rejected() {
-        let json = r#"{"model_type":"gemma4","architectures":["Gemma4ForConditionalGeneration"],"text_config":{"model_type":"gemma4_text"}}"#;
+    #[cfg(feature = "gemma4")]
+    fn gemma4_12b_identity_routes_to_gemma4() {
+        let json = r#"{"model_type":"gemma4_unified","architectures":["Gemma4UnifiedForConditionalGeneration"],"text_config":{"model_type":"gemma4_unified_text","head_dim":256,"global_head_dim":512,"sliding_window":1024,"attention_k_eq_v":true,"num_kv_shared_layers":0,"hidden_activation":"gelu_pytorch_tanh","enable_moe_block":false,"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention"]}}"#;
+        assert_eq!(detect(json).unwrap(), ModelType::Gemma4);
+    }
+
+    #[test]
+    #[cfg(feature = "gemma4")]
+    fn gemma4_26b_identity_routes_to_gemma4() {
+        let json = r#"{"model_type":"gemma4","architectures":["Gemma4ForConditionalGeneration"],"text_config":{"model_type":"gemma4_text","head_dim":256,"global_head_dim":512,"sliding_window":1024,"attention_k_eq_v":true,"num_kv_shared_layers":0,"hidden_activation":"gelu_pytorch_tanh","enable_moe_block":true,"num_experts":128,"top_k_experts":8,"moe_intermediate_size":704,"intermediate_size":2112,"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention"]}}"#;
+        assert_eq!(detect(json).unwrap(), ModelType::Gemma4);
+    }
+
+    #[test]
+    fn gemma3_previous_generation_rejected() {
+        let json = r#"{"model_type":"gemma3","architectures":["Gemma3ForConditionalGeneration"],"text_config":{"model_type":"gemma3_text"}}"#;
         let err = detect(json).unwrap_err().to_string();
-        assert!(err.contains("gemma4"));
+        assert!(err.contains("gemma3"), "{err}");
     }
 
     #[test]
