@@ -228,7 +228,7 @@ fn nvcc_job_count() -> usize {
 fn nvcc_task_priority(cu_file: &Path) -> usize {
     match cu_file.file_stem().and_then(|stem| stem.to_str()) {
         Some("paged_attention") => 0,
-        Some("flashinfer_sampling") => 1,
+        Some("paged_attention_hd512" | "flashinfer_sampling") => 1,
         Some("flashinfer_top1") => 2,
         Some("flashinfer_norm") => 3,
         _ => 10,
@@ -1585,6 +1585,7 @@ fn main() {
 
         // Files that include FlashInfer headers (C++17, header-only)
         if stem == "paged_attention"
+            || stem == "paged_attention_hd512"
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"

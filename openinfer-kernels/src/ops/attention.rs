@@ -38,6 +38,9 @@ pub struct PrefillPagedPlan {
     batch_size: i32,
     total_tokens: usize,
     cta_tile_q: i32,
+    head_dim: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
 }
 
 impl PrefillPagedPlan {
@@ -159,6 +162,9 @@ impl PrefillPagedPlan {
             batch_size: 1,
             total_tokens: seq_len,
             cta_tile_q,
+            head_dim,
+            num_qo_heads: num_q_heads,
+            num_kv_heads,
         })
     }
 
@@ -202,13 +208,16 @@ impl PrefillPagedPlan {
             batch_size: host.batch_size as i32,
             total_tokens: host.total_tokens,
             cta_tile_q: host.cta_tile_q as i32,
+            head_dim,
+            num_qo_heads: num_q_heads,
+            num_kv_heads,
         })
     }
 
     /// Allocate a worst-case-sized plan once, to be refilled in place by
     /// [`Self::update_batch_with_cta_tile_q`]. Buffer pointers stay fixed across
     /// updates so a CUDA Graph captured against them remains valid on replay.
-    /// Scalar fields start at 0; an unfilled plan must not be used for a forward.
+    /// Geometry starts unset; update before forward.
     pub fn new_preallocated(
         ctx: &DeviceContext,
         max_total_tokens: usize,
@@ -232,6 +241,9 @@ impl PrefillPagedPlan {
             batch_size: 0,
             total_tokens: 0,
             cta_tile_q: 0,
+            head_dim: 0,
+            num_qo_heads: 0,
+            num_kv_heads: 0,
         })
     }
 
@@ -342,6 +354,9 @@ impl PrefillPagedPlan {
         self.batch_size = host.batch_size as i32;
         self.total_tokens = host.total_tokens;
         self.cta_tile_q = host.cta_tile_q as i32;
+        self.head_dim = head_dim;
+        self.num_qo_heads = num_q_heads;
+        self.num_kv_heads = num_kv_heads;
         Ok(())
     }
 }
@@ -1637,5 +1652,624 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
         );
     }
 
+    Ok(())
+}
+
+// ============================================================================
+// hd512 (Gemma 4 global layers)
+// ============================================================================
+
+/// Decode-metadata aggregate for the hd512 direct-decode path, validated at
+/// use: the wrapper calls [`Self::validate`] with the batch size it derives.
+///
+/// `page_indptr` needs at least `batch_size + 1` elements, the other per-request
+/// slices at least `batch_size`; `page_indices` must be non-empty (its
+/// per-request reach is device-side data and cannot be verified here).
+///
+/// The pages referenced by `page_indices` must lie within `kv_buffer`; the
+/// wrapper cannot verify device-side contents — caller contract.
+pub struct Hd512DecodeMetadata<'a> {
+    page_indices: &'a CudaSlice<i32>,
+    page_indptr: &'a CudaSlice<i32>,
+    last_page_len: &'a CudaSlice<i32>,
+    positions: &'a CudaSlice<i32>,
+    request_indices: &'a CudaSlice<i32>,
+    kv_tile_indices: &'a CudaSlice<i32>,
+    kv_chunk_size: &'a CudaSlice<i32>,
+}
+
+impl<'a> Hd512DecodeMetadata<'a> {
+    pub fn new(
+        page_indices: &'a CudaSlice<i32>,
+        page_indptr: &'a CudaSlice<i32>,
+        last_page_len: &'a CudaSlice<i32>,
+        positions: &'a CudaSlice<i32>,
+        request_indices: &'a CudaSlice<i32>,
+        kv_tile_indices: &'a CudaSlice<i32>,
+        kv_chunk_size: &'a CudaSlice<i32>,
+    ) -> Self {
+        Self {
+            page_indices,
+            page_indptr,
+            last_page_len,
+            positions,
+            request_indices,
+            kv_tile_indices,
+            kv_chunk_size,
+        }
+    }
+
+    pub fn validate(&self, batch_size: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.page_indices.is_empty(),
+            "Hd512DecodeMetadata: page_indices must be non-empty"
+        );
+        anyhow::ensure!(
+            self.page_indptr.len() > batch_size,
+            "Hd512DecodeMetadata: page_indptr length {} must be >= batch_size + 1 = {}",
+            self.page_indptr.len(),
+            batch_size + 1
+        );
+        for (name, len) in [
+            ("last_page_len", self.last_page_len.len()),
+            ("positions", self.positions.len()),
+            ("request_indices", self.request_indices.len()),
+            ("kv_tile_indices", self.kv_tile_indices.len()),
+            ("kv_chunk_size", self.kv_chunk_size.len()),
+        ] {
+            anyhow::ensure!(
+                len >= batch_size,
+                "Hd512DecodeMetadata: {name} length {len} must be >= batch_size {batch_size}",
+            );
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_hd512_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    meta: &Hd512DecodeMetadata,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    anyhow::ensure!(
+        head_dim == 512,
+        "hd512 decode expects head_dim 512, got {}",
+        head_dim
+    );
+    let batch_size = q.seq_len;
+    meta.validate(batch_size)?;
+    anyhow::ensure!(
+        output.seq_len == batch_size,
+        "hd512 decode output.seq_len {} != q.seq_len {batch_size}",
+        output.seq_len
+    );
+    anyhow::ensure!(
+        k.seq_len == batch_size,
+        "hd512 decode k.seq_len {} != q.seq_len {batch_size}",
+        k.seq_len
+    );
+    anyhow::ensure!(
+        v.seq_len == batch_size,
+        "hd512 decode v.seq_len {} != q.seq_len {batch_size}",
+        v.seq_len
+    );
+    anyhow::ensure!(
+        q.hidden_dim == num_qo_heads * 512,
+        "hd512 decode q.hidden_dim {} != num_qo_heads {} * 512",
+        q.hidden_dim,
+        num_qo_heads
+    );
+    anyhow::ensure!(
+        output.hidden_dim == num_qo_heads * 512,
+        "hd512 decode output.hidden_dim {} != num_qo_heads {} * 512",
+        output.hidden_dim,
+        num_qo_heads
+    );
+    anyhow::ensure!(
+        k.hidden_dim == num_kv_heads * 512,
+        "hd512 decode k.hidden_dim {} != num_kv_heads {} * 512",
+        k.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        v.hidden_dim == num_kv_heads * 512,
+        "hd512 decode v.hidden_dim {} != num_kv_heads {} * 512",
+        v.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        layer < layout.num_layers,
+        "hd512 decode layer {layer} >= layout.num_layers {}",
+        layout.num_layers
+    );
+    ensure_hidden_capacity(q, "batch_decode_hd512 q")?;
+    ensure_hidden_capacity(output, "batch_decode_hd512 output")?;
+    ensure_hidden_capacity(k, "batch_decode_hd512 k")?;
+    ensure_hidden_capacity(v, "batch_decode_hd512 v")?;
+    let page_size = layout.page_size;
+
+    let k_offset = (layer * layout.layer_stride) as i64;
+    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
+    let stride_page = layout.page_stride as i64;
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = meta.page_indices.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = meta.page_indptr.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = meta.last_page_len.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = meta.request_indices.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = meta.kv_tile_indices.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = meta.kv_chunk_size.device_ptr(&ctx.stream);
+
+    let stream = crate::tensor::active_cu_stream(ctx);
+
+    scatter_decode_kv_into_paged(
+        ctx,
+        k,
+        v,
+        kv_buffer,
+        layout,
+        layer,
+        meta.page_indices,
+        meta.page_indptr,
+        meta.last_page_len,
+        meta.positions,
+        meta.request_indices,
+        batch_size,
+        "batch hd512 decode",
+    )?;
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let result = unsafe {
+        ffi::paged_attention_decode_cuda_hd512(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            ri_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            batch_size as i32,
+            stride_page,
+            sm_scale,
+            stream,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "paged_attention_decode_cuda_hd512 (batch) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_via_prefill_hd512_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    positions_d: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    anyhow::ensure!(
+        head_dim == 512,
+        "hd512 decode expects head_dim 512, got {}",
+        head_dim
+    );
+    anyhow::ensure!(
+        q.hidden_dim == num_qo_heads * 512,
+        "hd512 decode-via-prefill q.hidden_dim {} != num_qo_heads {} * 512",
+        q.hidden_dim,
+        num_qo_heads
+    );
+    anyhow::ensure!(
+        output.hidden_dim == num_qo_heads * 512,
+        "hd512 decode-via-prefill output.hidden_dim {} != num_qo_heads {} * 512",
+        output.hidden_dim,
+        num_qo_heads
+    );
+    anyhow::ensure!(
+        q.seq_len >= plan.total_tokens,
+        "hd512 decode-via-prefill q.seq_len {} < plan.total_tokens {}",
+        q.seq_len,
+        plan.total_tokens
+    );
+    anyhow::ensure!(
+        output.seq_len >= plan.total_tokens,
+        "hd512 decode-via-prefill output.seq_len {} < plan.total_tokens {}",
+        output.seq_len,
+        plan.total_tokens
+    );
+    anyhow::ensure!(
+        layer < layout.num_layers,
+        "hd512 decode-via-prefill layer {layer} >= layout.num_layers {}",
+        layout.num_layers
+    );
+    ensure_hidden_capacity(q, "decode_via_prefill_hd512 q")?;
+    ensure_hidden_capacity(output, "decode_via_prefill_hd512 output")?;
+    anyhow::ensure!(
+        positions_d.len() >= plan.batch_size() as usize,
+        "hd512 decode-via-prefill positions_d length {} must be >= plan.batch_size {}",
+        positions_d.len(),
+        plan.batch_size(),
+    );
+    let batch_size = plan.batch_size() as usize;
+    anyhow::ensure!(
+        k.hidden_dim == num_kv_heads * 512,
+        "hd512 decode-via-prefill k.hidden_dim {} != num_kv_heads {} * 512",
+        k.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        v.hidden_dim == num_kv_heads * 512,
+        "hd512 decode-via-prefill v.hidden_dim {} != num_kv_heads {} * 512",
+        v.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        k.seq_len >= batch_size,
+        "hd512 decode-via-prefill k.seq_len {} < batch_size {}",
+        k.seq_len,
+        batch_size
+    );
+    anyhow::ensure!(
+        v.seq_len >= batch_size,
+        "hd512 decode-via-prefill v.seq_len {} < batch_size {}",
+        v.seq_len,
+        batch_size
+    );
+    ensure_hidden_capacity(k, "decode_via_prefill_hd512 k")?;
+    ensure_hidden_capacity(v, "decode_via_prefill_hd512 v")?;
+    anyhow::ensure!(
+        plan.head_dim == 512,
+        "plan built for head_dim {}, expected 512",
+        plan.head_dim
+    );
+    anyhow::ensure!(
+        plan.num_kv_heads == num_kv_heads,
+        "plan built for num_kv_heads {}, expected {}",
+        plan.num_kv_heads,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        plan.num_qo_heads == num_qo_heads,
+        "plan built for num_qo_heads {}, expected {}",
+        plan.num_qo_heads,
+        num_qo_heads
+    );
+    anyhow::ensure!(
+        plan.total_tokens == plan.batch_size() as usize,
+        "decode-via-prefill plan shape mismatch: total_tokens={}, plan_batch={}",
+        plan.total_tokens,
+        plan.batch_size()
+    );
+
+    // Plan tiles laid out for a cta_tile_q override would be misread by the
+    // kernel's own 16|32 derivation.
+    let kernel_cta_tile_q = unsafe {
+        ffi::batch_prefill_cta_tile_q_with_override(
+            plan.total_tokens as i32,
+            plan.num_qo_heads as i32,
+            plan.num_kv_heads as i32,
+            plan.head_dim as i32,
+            0, // auto-detect, matching the hd512 kernel
+        )
+    };
+    anyhow::ensure!(
+        kernel_cta_tile_q == plan.cta_tile_q(),
+        "hd512 decode-via-prefill cta_tile_q: plan recorded {}, kernel derives {}; \
+         overridden plans are not supported at hd512",
+        plan.cta_tile_q(),
+        kernel_cta_tile_q
+    );
+
+    scatter_decode_kv_into_paged(
+        ctx,
+        k,
+        v,
+        kv_buffer,
+        layout,
+        layer,
+        &plan.page_indices_d,
+        &plan.page_indptr_d,
+        &plan.last_page_len_d,
+        positions_d,
+        &plan.batch_indices_d,
+        plan.batch_size() as usize,
+        "batch hd512 decode via prefill",
+    )?;
+
+    let k_offset = (layer * layout.layer_stride) as i64;
+    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
+    let stride_page = layout.page_stride as i64;
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = plan.page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = plan.page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = plan.last_page_len_d.device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = plan.q_indptr_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = plan.request_indices_d.device_ptr(&ctx.stream);
+    let (qti_ptr, _gqti) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::batch_prefill_paged_cuda_hd512(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            qi_ptr as *const i32,
+            ri_ptr as *const i32,
+            qti_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            tnr_ptr as *const u32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            layout.page_size as i32,
+            plan.total_tokens as i32,
+            plan.batch_size,
+            plan.num_tiles,
+            stride_page,
+            sm_scale,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "batch_prefill_paged_cuda_hd512 (decode via prefill) failed for layer {layer}, \
+             bs={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}: {result}{}",
+            plan.batch_size,
+            plan.num_tiles,
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The pages referenced by `plan.page_indices_d()` must lie within
+/// `kv_buffer`; the wrapper cannot verify device-side contents — caller
+/// contract.
+pub fn batch_prefill_paged_hd512_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    anyhow::ensure!(
+        head_dim == 512,
+        "hd512 prefill expects head_dim 512, got {}",
+        head_dim
+    );
+    anyhow::ensure!(
+        q.hidden_dim == num_qo_heads * 512,
+        "hd512 prefill q.hidden_dim {} != num_qo_heads {} * 512",
+        q.hidden_dim,
+        num_qo_heads
+    );
+    anyhow::ensure!(
+        output.hidden_dim == num_qo_heads * 512,
+        "hd512 prefill output.hidden_dim {} != num_qo_heads {} * 512",
+        output.hidden_dim,
+        num_qo_heads
+    );
+    anyhow::ensure!(
+        q.seq_len >= plan.total_tokens,
+        "hd512 prefill q.seq_len {} < plan.total_tokens {}",
+        q.seq_len,
+        plan.total_tokens
+    );
+    anyhow::ensure!(
+        output.seq_len >= plan.total_tokens,
+        "hd512 prefill output.seq_len {} < plan.total_tokens {}",
+        output.seq_len,
+        plan.total_tokens
+    );
+    anyhow::ensure!(
+        layer < layout.num_layers,
+        "hd512 prefill layer {layer} >= layout.num_layers {}",
+        layout.num_layers
+    );
+    ensure_hidden_capacity(q, "batch_prefill_paged_hd512 q")?;
+    ensure_hidden_capacity(output, "batch_prefill_paged_hd512 output")?;
+    anyhow::ensure!(
+        plan.head_dim == 512,
+        "plan built for head_dim {}, expected 512",
+        plan.head_dim
+    );
+    anyhow::ensure!(
+        plan.num_kv_heads == num_kv_heads,
+        "plan built for num_kv_heads {}, expected {}",
+        plan.num_kv_heads,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        plan.num_qo_heads == num_qo_heads,
+        "plan built for num_qo_heads {}, expected {}",
+        plan.num_qo_heads,
+        num_qo_heads
+    );
+
+    // Plan tiles laid out for a cta_tile_q override would be misread by the
+    // kernel's own 16|32 derivation.
+    let kernel_cta_tile_q = unsafe {
+        ffi::batch_prefill_cta_tile_q_with_override(
+            plan.total_tokens as i32,
+            plan.num_qo_heads as i32,
+            plan.num_kv_heads as i32,
+            plan.head_dim as i32,
+            0, // auto-detect, matching the hd512 kernel
+        )
+    };
+    anyhow::ensure!(
+        kernel_cta_tile_q == plan.cta_tile_q(),
+        "hd512 prefill cta_tile_q: plan recorded {}, kernel derives {}; \
+         overridden plans are not supported at hd512",
+        plan.cta_tile_q(),
+        kernel_cta_tile_q
+    );
+
+    let k_offset = (layer * layout.layer_stride) as i64;
+    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
+    let stride_page = layout.page_stride as i64;
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = plan.page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = plan.page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = plan.last_page_len_d.device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = plan.q_indptr_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = plan.request_indices_d.device_ptr(&ctx.stream);
+    let (qti_ptr, _gqti) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::batch_prefill_paged_cuda_hd512(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            qi_ptr as *const i32,
+            ri_ptr as *const i32,
+            qti_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            tnr_ptr as *const u32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            layout.page_size as i32,
+            plan.total_tokens as i32,
+            plan.batch_size(),
+            plan.num_tiles,
+            stride_page,
+            sm_scale,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "batch_prefill_paged_cuda_hd512 (prefill) failed for layer {layer}, \
+             bs={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}: {result}{}",
+            plan.batch_size(),
+            plan.num_tiles,
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+
+    Ok(())
+}
+
+/// `q` rows are NHD `[seq, heads, 512]`; `k_cache`/`v_cache` are HND
+/// `[heads, max_seq_len, 512]` — the head axis is strided by `max_seq_len`.
+pub fn single_prefill_hd512_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    row_offset: usize,
+    q_seq_len: usize,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * 512);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, q.seq_len);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * 512);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+    assert!(
+        q_seq_len <= kv_len,
+        "causal prefill q_seq_len {q_seq_len} exceeds kv_len {kv_len}"
+    );
+    let byte_offset = checked_row_offset(q, row_offset, q_seq_len, "single_prefill_hd512 q")?;
+    ensure_hidden_capacity(output, "single_prefill_hd512 output")?;
+    ensure_hidden_capacity(k_cache, "single_prefill_hd512 k_cache")?;
+    ensure_hidden_capacity(v_cache, "single_prefill_hd512 v_cache")?;
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + byte_offset;
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + byte_offset;
+    let result = unsafe {
+        ffi::single_prefill_cuda_hd512(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            q_seq_len as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (512.0f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "single_prefill_cuda_hd512 failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
     Ok(())
 }

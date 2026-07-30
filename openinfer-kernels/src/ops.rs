@@ -16,18 +16,23 @@ mod lora;
 mod norm;
 mod sampling;
 
+pub use attention::Hd512DecodeMetadata;
 pub use attention::PrefillPagedPlan;
 pub use attention::SUPPORTED_GQA_GROUP_SIZES;
+pub use attention::batch_prefill_paged_hd512_into;
 pub use attention::dflash_qk_norm_rope_into;
 pub use attention::eagle3_rope_into;
 pub use attention::paged_attention_batch_decode_hd256_into;
+pub use attention::paged_attention_batch_decode_hd512_into;
 pub use attention::paged_attention_batch_decode_into;
 pub use attention::paged_attention_batch_decode_split_kv_into;
 pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
+pub use attention::paged_attention_batch_decode_via_prefill_hd512_into;
 pub use attention::prefill_attention_paged_into;
 pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
 pub use attention::qk_norm_rope_batch_decode_into;
 pub use attention::single_decode_nhd_into;
+pub use attention::single_prefill_hd512_into;
 pub use attention::single_prefill_nhd_causal_into;
 pub use attention::single_prefill_nhd_noncausal_into;
 #[cfg(feature = "moe")]
