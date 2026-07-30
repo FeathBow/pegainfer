@@ -20,7 +20,7 @@ const BF16_SIZE: usize = std::mem::size_of::<bf16>();
 /// Per-buffer staging chunk. The measured 32 MiB geometry improves overlap and
 /// limits the two pinned buffers to 64 MiB.
 const STAGE_BYTES: usize = 32 << 20;
-/// Empirical upper bound for the fill team; wider teams were slower.
+/// Widest fill team per rank, before the core-count cap.
 const FILL_THREADS: usize = 8;
 /// Small tails do not amortize dispatching work across the fill team.
 const PARALLEL_FILL_MIN_BYTES: usize = 1 << 20;
