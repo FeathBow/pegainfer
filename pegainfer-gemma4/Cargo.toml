@@ -1,7 +1,6 @@
 [package]
 autobenches = false
 autobins = false
-autotests = false
 edition = "2024"
 license = "Apache-2.0"
 name = "pegainfer-gemma4"
@@ -15,6 +14,12 @@ default = []
 anyhow = { workspace = true }
 pegainfer-engine = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+vllm-chat = { workspace = true }
+vllm-text = { workspace = true }
 
 [lints]
 workspace = true

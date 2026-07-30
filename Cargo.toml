@@ -185,6 +185,7 @@ url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 validator = { version = "0.20.0", features = ["derive"] }
 velo = "0.1.0"
+vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
 vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
 vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
 vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }

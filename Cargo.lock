@@ -3531,6 +3531,10 @@ dependencies = [
  "anyhow",
  "pegainfer-engine",
  "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "vllm-chat",
+ "vllm-text",
 ]
 
 [[package]]

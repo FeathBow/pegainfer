@@ -58,6 +58,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/mixed-load-itl-470.md` | Issue #470: full cold `--max-batch 8/bg=4` matrix on RTX 4090 (24/24 valid) + starvation negative control. Qwen3.5 is not immune; chunking bounds max/per-step stall but raises p99 at low QPS (~14→~80–92ms) and pulls p99/max back from the prefill wall to the chunk wall at high load; `qps·prefill_s≳1` is a throughput wall (chunking can't fix it, and ON's +15% TTFT can trip it earlier). The old "p99 immunity" was a slot-starvation artifact. |
 | `models/qwen35/adaptive-scheduler-policy.md` | Issue #727 adaptive scheduler policy record: default `off`, opt-in `auto`, hard `--max-prefill-tokens` cap, TP `auto` rejection, and pre-review whole-prefill benchmark tradeoff retained as non-default evidence. |
 
+## models / gemma4
+
+| Path | TL;DR |
+| --- | --- |
+| `models/gemma4/tokenizer.md` | Gemma 4 tokenizer/chat-template contracts, gated against a Hugging Face reference (token ids plus all five chat renders, content flattened to strings): BOS comes only from the standalone `chat_template.jinja` (which opens a thought channel and accepts a native system role), EOS is declared three times with three values, the published defaults are sampled rather than greedy, image/audio tokens encode straight from user text so text-only serving must reject them at admission, and one divergence stays open — the server's default content format adds a trailing space to system turns. |
+
 ## models / glm52
 
 | Path | TL;DR |
