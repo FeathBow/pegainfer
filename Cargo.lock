@@ -3529,9 +3529,14 @@ name = "pegainfer-gemma4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cudarc",
+ "log",
+ "pegainfer-core",
  "pegainfer-engine",
+ "safetensors",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "vllm-chat",
  "vllm-text",

@@ -1,11 +1,20 @@
+// The config and the manifest are CUDA-free so they test without a device, but
+// only the loader consumes them, so a gate-off library does not carry them.
+#[cfg(any(feature = "gemma4", test))]
 mod config;
+#[cfg(any(feature = "gemma4", test))]
+mod manifest;
+mod probe;
+#[cfg(feature = "gemma4")]
+#[expect(dead_code, reason = "no consumer until the executor lands")]
+mod weights;
 
 use std::path::Path;
 
 use anyhow::Result;
-pub use config::probe_config_json;
 use pegainfer_engine::engine::EngineHandle;
 use pegainfer_engine::engine::EngineLoadOptions;
+pub use probe::probe_config_json;
 
 #[cfg(feature = "gemma4")]
 pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
