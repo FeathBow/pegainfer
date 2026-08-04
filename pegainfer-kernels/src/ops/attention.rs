@@ -41,6 +41,42 @@ pub struct PrefillPagedPlan {
     head_dim: usize,
     num_qo_heads: usize,
     num_kv_heads: usize,
+    max_page_index: i32,
+    max_last_page_len: i32,
+}
+
+/// GQA group size is an integer division by `num_kv_heads`, guarded by neither
+/// the plan's tile arithmetic nor the C tile queries.
+fn checked_head_relation(num_q_heads: usize, num_kv_heads: usize) -> Result<()> {
+    anyhow::ensure!(
+        num_kv_heads > 0 && num_q_heads > 0 && num_q_heads.is_multiple_of(num_kv_heads),
+        "prefill plan num_q_heads {num_q_heads} must be a positive multiple of \
+         num_kv_heads {num_kv_heads}"
+    );
+    Ok(())
+}
+
+/// Largest page id and last-page length in the host inputs; the hd256 windowed
+/// wrapper checks both against the pool geometry, which the kernels index with
+/// no device-side bounds check.
+fn checked_page_metadata(page_indices: &[i32], last_page_lens: &[i32]) -> Result<(i32, i32)> {
+    let max_page_index = *page_indices
+        .iter()
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("prefill plan needs at least one page"))?;
+    anyhow::ensure!(
+        page_indices.iter().all(|&p| p >= 0),
+        "prefill plan page indices must be non-negative"
+    );
+    let max_last_page_len = *last_page_lens
+        .iter()
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("prefill plan needs a last-page length"))?;
+    anyhow::ensure!(
+        last_page_lens.iter().all(|&l| l >= 1),
+        "prefill plan last-page lengths must be at least 1"
+    );
+    Ok((max_page_index, max_last_page_len))
 }
 
 impl PrefillPagedPlan {
@@ -99,24 +135,36 @@ impl PrefillPagedPlan {
         head_dim: usize,
         cta_tile_q_override: i32,
     ) -> Result<Self> {
+        checked_head_relation(num_q_heads, num_kv_heads)?;
         let kv_len = start_pos + seq_len;
 
+        let last_page_len_i32 =
+            crate::ops::checked_i32(last_page_len, "prefill plan last_page_len")?;
+        let (max_page_index, max_last_page_len) =
+            checked_page_metadata(page_indices_i32, &[last_page_len_i32])?;
+        let num_pages_i32 =
+            crate::ops::checked_i32(page_indices_i32.len(), "prefill plan page count")?;
+        let seq_len_i32 = crate::ops::checked_i32(seq_len, "prefill plan seq_len")?;
+        let start_pos_i32 = crate::ops::checked_i32(start_pos, "prefill plan start_pos")?;
+        let kv_len_i32 = crate::ops::checked_i32(kv_len, "prefill plan kv length")?;
+        let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "prefill plan num_q_heads")?;
+        let num_kv_heads_i32 = crate::ops::checked_i32(num_kv_heads, "prefill plan num_kv_heads")?;
+        let head_dim_i32 = crate::ops::checked_i32(head_dim, "prefill plan head_dim")?;
+        let total_rows_u32 = crate::ops::checked_u32(seq_len, "prefill plan seq_len")?;
         let page_indices_d = ctx.stream.clone_htod(page_indices_i32)?;
-        let page_indptr_d = ctx
-            .stream
-            .clone_htod(&[0i32, page_indices_i32.len() as i32])?;
-        let last_page_len_d = ctx.stream.clone_htod(&[last_page_len as i32])?;
+        let page_indptr_d = ctx.stream.clone_htod(&[0i32, num_pages_i32])?;
+        let last_page_len_d = ctx.stream.clone_htod(&[last_page_len_i32])?;
 
         let batch_indices_d = ctx.stream.clone_htod(&vec![0i32; seq_len])?;
-        let positions: Vec<i32> = (start_pos as i32..(start_pos + seq_len) as i32).collect();
+        let positions: Vec<i32> = (start_pos_i32..kv_len_i32).collect();
         let positions_d = ctx.stream.clone_htod(&positions)?;
 
         let num_tiles = unsafe {
             ffi::batch_prefill_paged_num_tiles_with_cta_tile_q(
-                seq_len as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
+                seq_len_i32,
+                num_q_heads_i32,
+                num_kv_heads_i32,
+                head_dim_i32,
                 cta_tile_q_override,
             )
         };
@@ -126,10 +174,10 @@ impl PrefillPagedPlan {
         );
         let cta_tile_q = unsafe {
             ffi::batch_prefill_cta_tile_q_with_override(
-                seq_len as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
+                seq_len_i32,
+                num_q_heads_i32,
+                num_kv_heads_i32,
+                head_dim_i32,
                 cta_tile_q_override,
             )
         };
@@ -138,13 +186,13 @@ impl PrefillPagedPlan {
             "invalid prefill CTA tile override {cta_tile_q_override}"
         );
 
-        let q_indptr_d = ctx.stream.clone_htod(&[0i32, seq_len as i32])?;
+        let q_indptr_d = ctx.stream.clone_htod(&[0i32, seq_len_i32])?;
         let request_indices_d = ctx.stream.clone_htod(&vec![0i32; num_tiles as usize])?;
         let qo_tile_indices: Vec<i32> = (0..num_tiles).collect();
         let qo_tile_indices_d = ctx.stream.clone_htod(&qo_tile_indices)?;
         let kv_tile_indices_d = ctx.stream.clone_htod(&vec![0i32; num_tiles as usize])?;
-        let kv_chunk_size_d = ctx.stream.clone_htod(&[kv_len as i32])?;
-        let total_num_rows_d = ctx.stream.clone_htod(&[seq_len as u32])?;
+        let kv_chunk_size_d = ctx.stream.clone_htod(&[kv_len_i32])?;
+        let total_num_rows_d = ctx.stream.clone_htod(&[total_rows_u32])?;
 
         Ok(Self {
             page_indices_d,
@@ -165,6 +213,8 @@ impl PrefillPagedPlan {
             head_dim,
             num_qo_heads: num_q_heads,
             num_kv_heads,
+            max_page_index,
+            max_last_page_len,
         })
     }
 
@@ -191,6 +241,13 @@ impl PrefillPagedPlan {
             cta_tile_q_override,
         )?;
 
+        let (max_page_index, max_last_page_len) =
+            checked_page_metadata(&host.all_page_indices, &host.last_page_lens_i32)?;
+        let batch_size_i32 = crate::ops::checked_i32(host.batch_size, "prefill plan batch_size")?;
+        let cta_tile_q_i32 = crate::ops::checked_i32(host.cta_tile_q, "prefill plan cta_tile_q")?;
+        let total_rows_u32 =
+            crate::ops::checked_u32(host.total_tokens, "prefill plan total_tokens")?;
+
         // Upload all to GPU
         Ok(Self {
             page_indices_d: ctx.stream.clone_htod(&host.all_page_indices)?,
@@ -203,14 +260,16 @@ impl PrefillPagedPlan {
             qo_tile_indices_d: ctx.stream.clone_htod(&host.qo_tile_indices_v)?,
             kv_tile_indices_d: ctx.stream.clone_htod(&host.kv_tile_indices_v)?,
             kv_chunk_size_d: ctx.stream.clone_htod(&host.kv_chunk_sizes)?,
-            total_num_rows_d: ctx.stream.clone_htod(&[host.total_tokens as u32])?,
+            total_num_rows_d: ctx.stream.clone_htod(&[total_rows_u32])?,
             num_tiles: host.num_tiles,
-            batch_size: host.batch_size as i32,
+            batch_size: batch_size_i32,
             total_tokens: host.total_tokens,
-            cta_tile_q: host.cta_tile_q as i32,
+            cta_tile_q: cta_tile_q_i32,
             head_dim,
             num_qo_heads: num_q_heads,
             num_kv_heads,
+            max_page_index,
+            max_last_page_len,
         })
     }
 
@@ -244,6 +303,8 @@ impl PrefillPagedPlan {
             head_dim: 0,
             num_qo_heads: 0,
             num_kv_heads: 0,
+            max_page_index: -1,
+            max_last_page_len: 0,
         })
     }
 
@@ -278,6 +339,12 @@ impl PrefillPagedPlan {
             cta_tile_q_override,
         )?;
 
+        let (max_page_index, max_last_page_len) =
+            checked_page_metadata(&host.all_page_indices, &host.last_page_lens_i32)?;
+        let batch_size_i32 = crate::ops::checked_i32(host.batch_size, "prefill plan batch_size")?;
+        let cta_tile_q_i32 = crate::ops::checked_i32(host.cta_tile_q, "prefill plan cta_tile_q")?;
+        let total_rows_u32 =
+            crate::ops::checked_u32(host.total_tokens, "prefill plan total_tokens")?;
         anyhow::ensure!(
             host.all_page_indices.len() <= self.page_indices_d.len(),
             "verify plan page_indices ({}) exceeds preallocated capacity ({})",
@@ -348,15 +415,17 @@ impl PrefillPagedPlan {
         ctx.stream
             .memcpy_htod(&host.kv_chunk_sizes, &mut self.kv_chunk_size_d)?;
         ctx.stream
-            .memcpy_htod(&[host.total_tokens as u32], &mut self.total_num_rows_d)?;
+            .memcpy_htod(&[total_rows_u32], &mut self.total_num_rows_d)?;
 
         self.num_tiles = host.num_tiles;
-        self.batch_size = host.batch_size as i32;
+        self.batch_size = batch_size_i32;
         self.total_tokens = host.total_tokens;
-        self.cta_tile_q = host.cta_tile_q as i32;
+        self.cta_tile_q = cta_tile_q_i32;
         self.head_dim = head_dim;
         self.num_qo_heads = num_q_heads;
         self.num_kv_heads = num_kv_heads;
+        self.max_page_index = max_page_index;
+        self.max_last_page_len = max_last_page_len;
         Ok(())
     }
 }
@@ -393,11 +462,16 @@ impl BatchPlanHost {
         head_dim: usize,
         cta_tile_q_override: i32,
     ) -> Result<Self> {
+        checked_head_relation(num_q_heads, num_kv_heads)?;
         let batch_size = page_indices.len();
         assert_eq!(batch_size, last_page_lens.len());
         assert_eq!(batch_size, start_positions.len());
         assert_eq!(batch_size, seq_lens.len());
         let total_tokens: usize = seq_lens.iter().sum();
+        let total_tokens_i32 = crate::ops::checked_i32(total_tokens, "prefill plan total_tokens")?;
+        let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "prefill plan num_q_heads")?;
+        let num_kv_heads_i32 = crate::ops::checked_i32(num_kv_heads, "prefill plan num_kv_heads")?;
+        let head_dim_i32 = crate::ops::checked_i32(head_dim, "prefill plan head_dim")?;
         let group_size = num_q_heads / num_kv_heads;
 
         // Page metadata (concatenated across requests, CSR format)
@@ -407,10 +481,24 @@ impl BatchPlanHost {
         let mut kv_chunk_sizes = Vec::with_capacity(batch_size);
 
         for (i, pages) in page_indices.iter().enumerate() {
+            anyhow::ensure!(
+                !pages.is_empty(),
+                "prefill plan request {i} has no pages; the attention kernels derive its KV \
+                 length from its own page count and would give it none"
+            );
             all_page_indices.extend_from_slice(pages);
-            page_indptr.push(all_page_indices.len() as i32);
-            last_page_lens_i32.push(last_page_lens[i] as i32);
-            kv_chunk_sizes.push((start_positions[i] + seq_lens[i]) as i32);
+            page_indptr.push(crate::ops::checked_i32(
+                all_page_indices.len(),
+                "prefill plan page-indptr entry",
+            )?);
+            last_page_lens_i32.push(crate::ops::checked_i32(
+                last_page_lens[i],
+                "prefill plan last_page_len",
+            )?);
+            kv_chunk_sizes.push(crate::ops::checked_i32(
+                start_positions[i] + seq_lens[i],
+                "prefill plan kv length",
+            )?);
         }
 
         // Per-token metadata
@@ -418,31 +506,35 @@ impl BatchPlanHost {
         let mut positions = Vec::with_capacity(total_tokens);
         for (i, &seq_len) in seq_lens.iter().enumerate() {
             let start = start_positions[i];
-            batch_indices.extend(std::iter::repeat_n(i as i32, seq_len));
-            positions.extend((start..start + seq_len).map(|p| p as i32));
+            let request_i32 = crate::ops::checked_i32(i, "prefill plan request index")?;
+            let start_i32 = crate::ops::checked_i32(start, "prefill plan start position")?;
+            let end_i32 = crate::ops::checked_i32(start + seq_len, "prefill plan kv length")?;
+            batch_indices.extend(std::iter::repeat_n(request_i32, seq_len));
+            positions.extend(start_i32..end_i32);
         }
 
         // Q token boundaries (CSR)
         let mut q_indptr = vec![0i32];
         for &seq_len in seq_lens {
             let prev = *q_indptr.last().unwrap();
-            q_indptr.push(prev + seq_len as i32);
+            q_indptr.push(prev + crate::ops::checked_i32(seq_len, "prefill plan seq_len")?);
         }
 
         // Tile plan: use global cta_tile_q for consistent tiling
-        let cta_tile_q = unsafe {
+        let cta_tile_q_i32 = unsafe {
             ffi::batch_prefill_cta_tile_q_with_override(
-                total_tokens as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
+                total_tokens_i32,
+                num_q_heads_i32,
+                num_kv_heads_i32,
+                head_dim_i32,
                 cta_tile_q_override,
             )
-        } as usize;
+        };
         anyhow::ensure!(
-            cta_tile_q > 0,
+            cta_tile_q_i32 > 0,
             "invalid prefill CTA tile override {cta_tile_q_override}"
         );
+        let cta_tile_q = cta_tile_q_i32 as usize;
 
         let mut request_indices_v = Vec::new();
         let mut qo_tile_indices_v = Vec::new();
@@ -450,13 +542,17 @@ impl BatchPlanHost {
         for (req_idx, &seq_len) in seq_lens.iter().enumerate() {
             let packed_qo_len = seq_len * group_size;
             let num_tiles_req = packed_qo_len.div_ceil(cta_tile_q);
-            for tile in 0..num_tiles_req {
-                request_indices_v.push(req_idx as i32);
-                qo_tile_indices_v.push(tile as i32);
+            let req_idx_i32 = crate::ops::checked_i32(req_idx, "prefill plan request index")?;
+            let num_tiles_req_i32 =
+                crate::ops::checked_i32(num_tiles_req, "prefill plan request tile count")?;
+            for tile in 0..num_tiles_req_i32 {
+                request_indices_v.push(req_idx_i32);
+                qo_tile_indices_v.push(tile);
                 kv_tile_indices_v.push(0i32);
             }
         }
-        let num_tiles = request_indices_v.len() as i32;
+        let num_tiles =
+            crate::ops::checked_i32(request_indices_v.len(), "prefill plan tile count")?;
 
         Ok(Self {
             all_page_indices,
@@ -1974,7 +2070,7 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
     );
 
     // Plan tiles laid out for a cta_tile_q override would be misread by the
-    // kernel's own 16|32 derivation.
+    // kernel's automatic derivation.
     let kernel_cta_tile_q = unsafe {
         ffi::batch_prefill_cta_tile_q_with_override(
             plan.total_tokens as i32,
@@ -2142,7 +2238,7 @@ pub fn batch_prefill_paged_hd512_into(
     );
 
     // Plan tiles laid out for a cta_tile_q override would be misread by the
-    // kernel's own 16|32 derivation.
+    // kernel's automatic derivation.
     let kernel_cta_tile_q = unsafe {
         ffi::batch_prefill_cta_tile_q_with_override(
             plan.total_tokens as i32,
@@ -2209,6 +2305,183 @@ pub fn batch_prefill_paged_hd512_into(
         anyhow::bail!(
             "batch_prefill_paged_cuda_hd512 (prefill) failed for layer {layer}, \
              bs={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}: {result}{}",
+            plan.batch_size(),
+            plan.num_tiles,
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+
+    Ok(())
+}
+
+/// Windowed batch prefill over paged KV at head_dim 256 (Gemma 4 local
+/// layers): attention read only — the prep kernel has already written K/V
+/// into the pool. `window_left` is an inclusive distance: an N-token window
+/// passes N - 1, and -1 degrades to full attention. `sm_scale` is the
+/// caller's; Gemma 4 runs unscaled attention (1.0).
+#[allow(clippy::too_many_arguments)]
+pub fn batch_prefill_paged_window_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    sm_scale: f32,
+    window_left: i32,
+) -> Result<()> {
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "batch_prefill_paged_window_hd256 sm_scale {sm_scale} must be finite"
+    );
+    anyhow::ensure!(
+        window_left >= -1,
+        "batch_prefill_paged_window_hd256 window_left {window_left} must be >= -1"
+    );
+    let num_kv_heads = layout.num_kv_heads;
+    let geometry = checked_paged_geometry(
+        "hd256 window prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        256,
+        num_kv_heads,
+    )?;
+    anyhow::ensure!(
+        plan.max_page_index < geometry.num_pages,
+        "hd256 window prefill plan references page {} but the pool holds {} pages; the attention \
+         kernel computes addresses from page ids with no device-side bounds check",
+        plan.max_page_index,
+        geometry.num_pages
+    );
+    anyhow::ensure!(
+        plan.max_last_page_len <= geometry.page_size,
+        "hd256 window prefill plan last-page length {} exceeds page_size {}; the kernel would \
+         read a page-table entry that does not exist",
+        plan.max_last_page_len,
+        geometry.page_size
+    );
+    let qo_dim = num_qo_heads.checked_mul(256).ok_or_else(|| {
+        anyhow::anyhow!("hd256 window prefill num_qo_heads {num_qo_heads} * 256 overflows")
+    })?;
+    anyhow::ensure!(
+        q.hidden_dim == qo_dim,
+        "hd256 window prefill q.hidden_dim {} != num_qo_heads {num_qo_heads} * 256",
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        output.hidden_dim == qo_dim,
+        "hd256 window prefill output.hidden_dim {} != num_qo_heads {num_qo_heads} * 256",
+        output.hidden_dim
+    );
+    anyhow::ensure!(
+        q.seq_len >= plan.total_tokens,
+        "hd256 window prefill q.seq_len {} < plan.total_tokens {}",
+        q.seq_len,
+        plan.total_tokens
+    );
+    anyhow::ensure!(
+        output.seq_len >= plan.total_tokens,
+        "hd256 window prefill output.seq_len {} < plan.total_tokens {}",
+        output.seq_len,
+        plan.total_tokens
+    );
+    let q_elems = q.checked_extent("batch_prefill_paged_window_hd256 q")?;
+    let out_elems = output.checked_extent("batch_prefill_paged_window_hd256 output")?;
+    crate::ops::checked_i32(q_elems, "hd256 window prefill q extent")?;
+    crate::ops::checked_i32(out_elems, "hd256 window prefill output extent")?;
+    anyhow::ensure!(
+        plan.head_dim == 256,
+        "plan built for head_dim {}, expected 256",
+        plan.head_dim
+    );
+    anyhow::ensure!(
+        plan.num_kv_heads == num_kv_heads,
+        "plan built for num_kv_heads {}, expected {}",
+        plan.num_kv_heads,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        plan.num_qo_heads == num_qo_heads,
+        "plan built for num_qo_heads {}, expected {}",
+        plan.num_qo_heads,
+        num_qo_heads
+    );
+
+    // Plan tiles laid out for a cta_tile_q override would be misread by the
+    // kernel's automatic derivation.
+    let num_qo_heads_i32 =
+        crate::ops::checked_i32(num_qo_heads, "hd256 window prefill num_qo_heads")?;
+    let num_kv_heads_i32 =
+        crate::ops::checked_i32(num_kv_heads, "hd256 window prefill num_kv_heads")?;
+    let total_tokens_i32 =
+        crate::ops::checked_i32(plan.total_tokens, "hd256 window prefill total_tokens")?;
+    let kernel_cta_tile_q = unsafe {
+        ffi::batch_prefill_cta_tile_q_with_override(
+            total_tokens_i32,
+            num_qo_heads_i32,
+            num_kv_heads_i32,
+            256,
+            0, // auto-detect, matching the hd256 kernel
+        )
+    };
+    anyhow::ensure!(
+        kernel_cta_tile_q == plan.cta_tile_q(),
+        "hd256 window prefill cta_tile_q: plan recorded {}, kernel derives {}; \
+         overridden plans are not supported here",
+        plan.cta_tile_q(),
+        kernel_cta_tile_q
+    );
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = plan.page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = plan.page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = plan.last_page_len_d.device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = plan.q_indptr_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = plan.request_indices_d.device_ptr(&ctx.stream);
+    let (qti_ptr, _gqti) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::batch_prefill_paged_window_cuda_hd256(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            geometry.k_offset_elems,
+            geometry.v_offset_elems,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            qi_ptr as *const i32,
+            ri_ptr as *const i32,
+            qti_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            tnr_ptr as *const u32,
+            num_qo_heads_i32,
+            num_kv_heads_i32,
+            256,
+            geometry.page_size,
+            total_tokens_i32,
+            plan.batch_size(),
+            plan.num_tiles,
+            geometry.stride_page,
+            sm_scale,
+            window_left,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "batch_prefill_paged_window_cuda_hd256 failed for layer {layer}, \
+             bs={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}, \
+             window_left={window_left}: {result}{}",
             plan.batch_size(),
             plan.num_tiles,
             crate::ops::ffi_exception_message(result)
@@ -2450,12 +2723,13 @@ pub fn qk_norm_rope_prefill_hd256_plain_into(
     Ok(())
 }
 
-/// Everything a paged-pool prep launch derives from a caller-supplied
-/// `PagedKvLayout`, re-derived with overflow checks and narrowed through
+/// Everything a paged-pool launch (prep write or attention read) derives
+/// from a caller-supplied `PagedKvLayout`, re-derived with overflow checks
+/// and narrowed through
 /// checked conversions: the layout's fields are public, so a contradictory
 /// or wrapping layout must fail here, before anything reaches an unsafe
 /// launch.
-struct PagedPrepGeometry {
+struct PagedGeometry {
     k_offset_elems: i64,
     v_offset_elems: i64,
     page_size: i32,
@@ -2463,14 +2737,14 @@ struct PagedPrepGeometry {
     stride_page: i64,
 }
 
-fn checked_paged_prep_geometry(
+fn checked_paged_geometry(
     what: &str,
     layout: &PagedKvLayout,
     pool_len: usize,
     layer: usize,
     head_dim: usize,
     num_kv_heads: usize,
-) -> Result<PagedPrepGeometry> {
+) -> Result<PagedGeometry> {
     anyhow::ensure!(
         layout.head_dim == head_dim,
         "{what} layout.head_dim {} != {head_dim}",
@@ -2545,7 +2819,7 @@ fn checked_paged_prep_geometry(
     let v_offset = k_offset.checked_add(kv_block_len).ok_or_else(|| {
         anyhow::anyhow!("{what} K offset {k_offset} + kv_block_len {kv_block_len} overflows")
     })?;
-    Ok(PagedPrepGeometry {
+    Ok(PagedGeometry {
         k_offset_elems: i64::try_from(k_offset)
             .map_err(|_| anyhow::anyhow!("{what} K offset {k_offset} does not fit i64"))?,
         v_offset_elems: i64::try_from(v_offset)
@@ -2635,7 +2909,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
         "hd256 paged prep v.seq_len {} != q.seq_len {seq_len}",
         v.seq_len
     );
-    let geometry = checked_paged_prep_geometry(
+    let geometry = checked_paged_geometry(
         "hd256 paged prep",
         layout,
         kv_pool.len(),
@@ -2950,7 +3224,7 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         "hd512 prefill prep k.seq_len {} != q.seq_len {seq_len}",
         k.seq_len
     );
-    let geometry = checked_paged_prep_geometry(
+    let geometry = checked_paged_geometry(
         "hd512 prefill prep",
         layout,
         kv_pool.len(),

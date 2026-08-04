@@ -24,6 +24,7 @@ pub use attention::Hd512DecodeMetadata;
 pub use attention::PrefillPagedPlan;
 pub use attention::SUPPORTED_GQA_GROUP_SIZES;
 pub use attention::batch_prefill_paged_hd512_into;
+pub use attention::batch_prefill_paged_window_hd256_into;
 pub use attention::dflash_qk_norm_rope_into;
 pub use attention::eagle3_rope_into;
 pub use attention::paged_attention_batch_decode_hd256_into;
@@ -178,6 +179,10 @@ pub use sampling::markov_step_argmax_partials_len;
 
 pub(crate) fn checked_i32(value: usize, what: &str) -> anyhow::Result<i32> {
     i32::try_from(value).map_err(|_| anyhow::anyhow!("{what} {value} does not fit i32"))
+}
+
+pub(crate) fn checked_u32(value: usize, what: &str) -> anyhow::Result<u32> {
+    u32::try_from(value).map_err(|_| anyhow::anyhow!("{what} {value} does not fit u32"))
 }
 
 /// Calling thread's last FFI exception message, ready to append to an error;
