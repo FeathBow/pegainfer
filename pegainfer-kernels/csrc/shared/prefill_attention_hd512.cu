@@ -1,13 +1,14 @@
 // QK-norm + partial RoPE prep for head_dim 512 (Gemma 4 global layers).
 // Differs from the hd256 sibling in three ways that are choices, not
-// oversights: plain w rather than the 1+w offset, no gate, no V.
+// oversights: plain w rather than the 1+w offset, no gate, and no separate
+// V input — V is the weightless RMS of the same raw row K reduces, so the
+// kernel reuses inv_rms and writes V = x * inv_rms into the pool's V block
+// alongside K.
 //
 // rotary_dim is a runtime argument, checked at the launcher for positive,
 // even and <= HD512. Evenness is load-bearing: with half_rotary floored, an
 // odd value leaves index rotary_dim - 1 written by neither branch.
-//
-// K is written into the paged pool, which feeds batch_prefill_paged;
-// single_prefill wants a contiguous cache instead.
+
 //
 // Positions and page ids are trapped on device — checking either on the
 // host would require a D2H synchronization.
@@ -63,6 +64,7 @@ __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
     __nv_bfloat16* __restrict__ q_batch_out,        // [q_dim, seq_len]
     __nv_bfloat16* __restrict__ kv_data,            // paged KV pool
     int64_t k_offset_elems,
+    int64_t v_offset_elems,
     const int* __restrict__ page_indices,           // request page list
     int num_q_heads,
     int num_kv_heads,
@@ -123,6 +125,12 @@ __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
     if (!is_q) {
         page_id = page_indices[pos / page_size];
         if (page_id < 0 || page_id >= num_pages) __trap();
+        // V is the K=V fork: the weightless norm of the same raw vector,
+        // sharing inv_rms. No RoPE, no weight.
+        int64_t v_dst = paged_kv_offset_hd512(
+            page_id, v_offset_elems, stride_page, page_size,
+            num_kv_heads, pos, head_local, d);
+        kv_data[v_dst] = __float2bfloat16(__bfloat162float(x) * inv_rms);
     }
     int half_rotary = rotary_dim / 2;
 
@@ -268,6 +276,7 @@ int qk_norm_partial_rope_paged_prefill_hd512_cuda(
     __nv_bfloat16* q_batch_out,
     __nv_bfloat16* kv_data,
     int64_t k_offset_elems,
+    int64_t v_offset_elems,
     const int* page_indices,
     int num_q_heads,
     int num_kv_heads,
@@ -319,6 +328,7 @@ int qk_norm_partial_rope_paged_prefill_hd512_cuda(
         q_batch_out,
         kv_data,
         k_offset_elems,
+        v_offset_elems,
         page_indices,
         num_q_heads,
         num_kv_heads,

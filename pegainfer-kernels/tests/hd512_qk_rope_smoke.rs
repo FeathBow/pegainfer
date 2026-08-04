@@ -116,11 +116,14 @@ fn expected_full(
     full
 }
 
-/// K side only; everything else stays 0.0. The layer offset is derived
-/// from the layout, so oracle and kernel share no hand-picked raw offset.
+/// K and V blocks; everything else stays 0.0. The offsets are derived from
+/// the layout, so oracle and kernel share no hand-picked raw offset. V is
+/// the K=V fork: the same raw vector under the shared inv_rms, weightless
+/// and un-rotated.
 fn expected_pool(x: f32, w: &[bf16], inv: f32, layout: &PagedKvLayout, layer: usize) -> Vec<f32> {
     let mut exp = vec![0.0f32; POOL_LEN];
     let layer_offset = (layer * layout.layer_stride) as i64;
+    let v_val = bf16::from_f32(x * inv).to_f32();
     for t in 0..SEQ_LEN {
         let pos = START_POS + t;
         let page = PAGE_INDICES[pos / PAGE_SIZE] as i64;
@@ -131,6 +134,7 @@ fn expected_pool(x: f32, w: &[bf16], inv: f32, layout: &PagedKvLayout, layer: us
                 + h as i64 * HD as i64;
             for d in 0..HD {
                 exp[(base + d as i64) as usize] = expected_prep(x, w, inv, d, pos);
+                exp[(base + layout.kv_block_len as i64 + d as i64) as usize] = v_val;
             }
         }
     }
@@ -148,8 +152,8 @@ fn assert_close(got: &[f32], expected: &[f32], what: &str) {
 }
 
 /// Exact zero is the assertion, not sloppiness: it marks a slot the kernel
-/// must never have written. That covers the V blocks too, so they get no
-/// separate check.
+/// must never have written — unreferenced pages, the other layer, and the
+/// slots outside the request's positions.
 #[allow(clippy::float_cmp)]
 fn assert_pool(got: &[f32], expected: &[f32]) {
     assert_eq!(got.len(), expected.len());

@@ -2282,15 +2282,16 @@ pub fn single_prefill_hd512_into(
     Ok(())
 }
 
-/// Plain-w QK RMSNorm + RoPE prep at head_dim 256 (Gemma 4 local layers):
-/// Q and K each land in a contiguous token-major output shaped like its
-/// input. No gate, no V, and the plain weight multiply — not the (1+w)
-/// offset of the qwen35 hd256 sibling. `single_prefill` consumes a
-/// contiguous **HND** cache, so these outputs are reassembled per head
-/// before attention, not fed directly. `rotary_dim` must be positive, even
-/// and <= 256 (launcher-enforced, surfaced here as `Err`); Gemma 4 local
-/// layers pass 256, and a smaller even width keeps the hd512 sibling's
-/// partial-RoPE tail semantics.
+/// Plain-w QK RMSNorm + RoPE prep at head_dim 256 (Gemma 4 local layers),
+/// oracle form: Q and K each land in a contiguous token-major output shaped
+/// like its input; the serving form is
+/// `qkv_norm_rope_paged_prefill_hd256_plain_into`. No gate, no V, and the
+/// plain weight multiply — not the (1+w) offset of the qwen35 hd256
+/// sibling. `single_prefill` consumes a contiguous **HND** cache, so these
+/// outputs are reassembled per head before attention, not fed directly.
+/// `rotary_dim` must be positive, even and <= 256 (launcher-enforced,
+/// surfaced here as `Err`); Gemma 4 local layers pass 256, and a smaller
+/// even width keeps the hd512 sibling's partial-RoPE tail semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn qk_norm_rope_prefill_hd256_plain_into(
     ctx: &DeviceContext,
@@ -2449,6 +2450,313 @@ pub fn qk_norm_rope_prefill_hd256_plain_into(
     Ok(())
 }
 
+/// Everything a paged-pool prep launch derives from a caller-supplied
+/// `PagedKvLayout`, re-derived with overflow checks and narrowed through
+/// checked conversions: the layout's fields are public, so a contradictory
+/// or wrapping layout must fail here, before anything reaches an unsafe
+/// launch.
+struct PagedPrepGeometry {
+    k_offset_elems: i64,
+    v_offset_elems: i64,
+    page_size: i32,
+    num_pages: i32,
+    stride_page: i64,
+}
+
+fn checked_paged_prep_geometry(
+    what: &str,
+    layout: &PagedKvLayout,
+    pool_len: usize,
+    layer: usize,
+    head_dim: usize,
+    num_kv_heads: usize,
+) -> Result<PagedPrepGeometry> {
+    anyhow::ensure!(
+        layout.head_dim == head_dim,
+        "{what} layout.head_dim {} != {head_dim}",
+        layout.head_dim
+    );
+    anyhow::ensure!(
+        layout.num_kv_heads == num_kv_heads,
+        "{what} layout.num_kv_heads {} != num_kv_heads {num_kv_heads}",
+        layout.num_kv_heads
+    );
+    anyhow::ensure!(
+        layout.page_size > 0 && layout.num_kv_heads > 0 && layout.num_layers > 0,
+        "{what} layout dims must be positive: page_size {} num_kv_heads {} num_layers {}",
+        layout.page_size,
+        layout.num_kv_heads,
+        layout.num_layers
+    );
+    let kv_block_len = layout
+        .page_size
+        .checked_mul(layout.num_kv_heads)
+        .and_then(|x| x.checked_mul(layout.head_dim))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what} page_size {} * num_kv_heads {} * head_dim {} overflows",
+                layout.page_size,
+                layout.num_kv_heads,
+                layout.head_dim
+            )
+        })?;
+    anyhow::ensure!(
+        layout.kv_block_len == kv_block_len,
+        "{what} layout.kv_block_len {} != page_size * num_kv_heads * head_dim {kv_block_len}",
+        layout.kv_block_len
+    );
+    let layer_stride = kv_block_len
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("{what} 2 * kv_block_len {kv_block_len} overflows"))?;
+    anyhow::ensure!(
+        layout.layer_stride == layer_stride,
+        "{what} layout.layer_stride {} != 2 * kv_block_len {kv_block_len}",
+        layout.layer_stride
+    );
+    let page_stride = layout.num_layers.checked_mul(layer_stride).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{what} num_layers {} * layer_stride {layer_stride} overflows",
+            layout.num_layers
+        )
+    })?;
+    anyhow::ensure!(
+        layout.page_stride == page_stride,
+        "{what} layout.page_stride {} != num_layers {} * layer_stride {layer_stride}",
+        layout.page_stride,
+        layout.num_layers
+    );
+    anyhow::ensure!(
+        layer < layout.num_layers,
+        "{what} layer {layer} >= layout.num_layers {}",
+        layout.num_layers
+    );
+    anyhow::ensure!(
+        pool_len.is_multiple_of(page_stride),
+        "{what} kv_pool.len {pool_len} is not a multiple of layout.page_stride {page_stride}"
+    );
+    let num_pages = pool_len / page_stride;
+    anyhow::ensure!(
+        num_pages >= 1,
+        "{what} kv_pool.len {pool_len} holds no whole page (page_stride {page_stride})"
+    );
+    let k_offset = layer.checked_mul(layer_stride).ok_or_else(|| {
+        anyhow::anyhow!("{what} layer {layer} * layer_stride {layer_stride} overflows")
+    })?;
+    let v_offset = k_offset.checked_add(kv_block_len).ok_or_else(|| {
+        anyhow::anyhow!("{what} K offset {k_offset} + kv_block_len {kv_block_len} overflows")
+    })?;
+    Ok(PagedPrepGeometry {
+        k_offset_elems: i64::try_from(k_offset)
+            .map_err(|_| anyhow::anyhow!("{what} K offset {k_offset} does not fit i64"))?,
+        v_offset_elems: i64::try_from(v_offset)
+            .map_err(|_| anyhow::anyhow!("{what} V offset {v_offset} does not fit i64"))?,
+        page_size: crate::ops::checked_i32(layout.page_size, "paged prep page_size")?,
+        num_pages: crate::ops::checked_i32(num_pages, "paged prep num_pages")?,
+        stride_page: i64::try_from(page_stride)
+            .map_err(|_| anyhow::anyhow!("{what} page_stride {page_stride} does not fit i64"))?,
+    })
+}
+
+/// Plain-w QKV prep at head_dim 256 (Gemma 4 local layers), serving form.
+/// Q is normalised + rotated into a contiguous `q_out`; K is normalised +
+/// rotated straight into the paged KV pool at layer `layer`'s K block, and
+/// V — a separate v_proj head vector, unlike the hd512 K=V fork — is
+/// weightless-normalised (never rotated) into the layer's V block, all in
+/// one kernel with no intermediate scatter.
+///
+/// The kernel `__trap()`s on any out-of-range pos or page id as the second
+/// layer of the host validation's defence. Slot positions derive from
+/// `start_pos + token`: absolute and cache-relative coordinates coincide
+/// below the sliding window, which is this entry's contract —
+/// window-crossing callers need a separate slot mapping first.
+#[allow(clippy::too_many_arguments)]
+pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    q_out: &mut HiddenStates,
+    kv_pool: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    layer: usize,
+    page_indices: &CudaSlice<i32>,
+    start_pos: usize,
+    cos_max_pos: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let seq_len = q.seq_len;
+    let q_dim = num_q_heads.checked_mul(256).ok_or_else(|| {
+        anyhow::anyhow!("hd256 paged prep num_q_heads {num_q_heads} * 256 overflows")
+    })?;
+    let kv_dim = num_kv_heads.checked_mul(256).ok_or_else(|| {
+        anyhow::anyhow!("hd256 paged prep num_kv_heads {num_kv_heads} * 256 overflows")
+    })?;
+    anyhow::ensure!(
+        q.hidden_dim == q_dim,
+        "hd256 paged prep q.hidden_dim {} != num_q_heads {num_q_heads} * 256",
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        q_out.hidden_dim == q.hidden_dim,
+        "hd256 paged prep q_out.hidden_dim {} != q.hidden_dim {}",
+        q_out.hidden_dim,
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        q_out.seq_len == seq_len,
+        "hd256 paged prep q_out.seq_len {} != q.seq_len {seq_len}",
+        q_out.seq_len
+    );
+    anyhow::ensure!(
+        k.hidden_dim == kv_dim,
+        "hd256 paged prep k.hidden_dim {} != num_kv_heads {num_kv_heads} * 256",
+        k.hidden_dim
+    );
+    anyhow::ensure!(
+        v.hidden_dim == k.hidden_dim,
+        "hd256 paged prep v.hidden_dim {} != k.hidden_dim {}",
+        v.hidden_dim,
+        k.hidden_dim
+    );
+    anyhow::ensure!(
+        k.seq_len == seq_len,
+        "hd256 paged prep k.seq_len {} != q.seq_len {seq_len}",
+        k.seq_len
+    );
+    anyhow::ensure!(
+        v.seq_len == seq_len,
+        "hd256 paged prep v.seq_len {} != q.seq_len {seq_len}",
+        v.seq_len
+    );
+    let geometry = checked_paged_prep_geometry(
+        "hd256 paged prep",
+        layout,
+        kv_pool.len(),
+        layer,
+        256,
+        num_kv_heads,
+    )?;
+    ensure_vec_backed(q_norm_weight, "hd256 paged prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd256 paged prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd256 paged prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd256 paged prep sin_cache")?;
+    anyhow::ensure!(
+        q_norm_weight.len == 256,
+        "hd256 paged prep q_norm_weight len {} != 256",
+        q_norm_weight.len
+    );
+    anyhow::ensure!(
+        k_norm_weight.len == 256,
+        "hd256 paged prep k_norm_weight len {} != 256",
+        k_norm_weight.len
+    );
+    let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
+        anyhow::anyhow!("hd256 paged prep start_pos {start_pos} + seq_len {seq_len} overflows")
+    })?;
+    let covered = page_indices
+        .len()
+        .checked_mul(layout.page_size)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "hd256 paged prep page_indices len {} * page_size {} overflows",
+                page_indices.len(),
+                layout.page_size
+            )
+        })?;
+    anyhow::ensure!(
+        covered >= end_pos,
+        "hd256 paged prep pages cover {covered} tokens, need start_pos {start_pos} + seq_len {seq_len}"
+    );
+    anyhow::ensure!(
+        end_pos <= cos_max_pos,
+        "hd256 paged prep start_pos {start_pos} + seq_len {seq_len} > cos_max_pos {cos_max_pos}"
+    );
+    let table_len = cos_max_pos.checked_mul(rotary_dim).ok_or_else(|| {
+        anyhow::anyhow!(
+            "hd256 paged prep cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim} overflows"
+        )
+    })?;
+    anyhow::ensure!(
+        cos_cache.len >= table_len,
+        "hd256 paged prep cos_cache len {} < cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim}",
+        cos_cache.len
+    );
+    anyhow::ensure!(
+        sin_cache.len >= table_len,
+        "hd256 paged prep sin_cache len {} < cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim}",
+        sin_cache.len
+    );
+    let q_elems = q.checked_extent("hd256 paged prep q")?;
+    q_out.checked_extent("hd256 paged prep q_out")?;
+    let k_elems = k.checked_extent("hd256 paged prep k")?;
+    v.checked_extent("hd256 paged prep v")?;
+    crate::ops::checked_i32(q_elems, "hd256 paged prep q extent")?;
+    crate::ops::checked_i32(k_elems, "hd256 paged prep k extent")?;
+    crate::ops::checked_i32(table_len, "hd256 paged prep rope table extent")?;
+
+    let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "hd256 paged prep num_q_heads")?;
+    let num_kv_heads_i32 = crate::ops::checked_i32(num_kv_heads, "hd256 paged prep num_kv_heads")?;
+    let seq_len_i32 = crate::ops::checked_i32(seq_len, "hd256 paged prep seq_len")?;
+    let start_pos_i32 = crate::ops::checked_i32(start_pos, "hd256 paged prep start_pos")?;
+    let cos_max_pos_i32 = crate::ops::checked_i32(cos_max_pos, "hd256 paged prep cos_max_pos")?;
+    let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd256 paged prep rotary_dim")?;
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    // The KV state owns mutation; this call borrows its shared pool handle.
+    let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::qkv_norm_rope_paged_prefill_hd256_plain_cuda(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qo_ptr as *mut ffi::Half,
+            pool_ptr as *mut ffi::Half,
+            geometry.k_offset_elems,
+            geometry.v_offset_elems,
+            pi_ptr as *const i32,
+            num_q_heads_i32,
+            num_kv_heads_i32,
+            seq_len_i32,
+            start_pos_i32,
+            cos_max_pos_i32,
+            rotary_dim_i32,
+            rms_eps,
+            geometry.page_size,
+            geometry.num_pages,
+            geometry.stride_page,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "qkv_norm_rope_paged_prefill_hd256_plain_cuda failed with error \
+             {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
 /// Causal single-sequence prefill at head_dim 256 over a contiguous **HND**
 /// K/V cache — `k[head, pos, dim]` with `k_cache.seq_len` allocated rows per
 /// head — matching `single_prefill_cuda_hd256`'s stride contract. Q and the
@@ -2582,18 +2890,12 @@ pub fn single_prefill_hd256_into(
 /// global layers). Q is normalised + partially rotated into a contiguous
 /// `q_out`; K is normalised + partially rotated straight into the paged KV
 /// pool at layer `layer`'s K block (feeds `batch_prefill_paged`, not
-/// `single_prefill`). No gate, no V; plain-w RMSNorm (not the (1+w) offset
-/// of hd256).
+/// `single_prefill`); V — the K=V fork — is the weightless RMS norm of the
+/// same raw K, written to the layer's V block in the same pass. No gate;
+/// plain-w RMSNorm.
 ///
-/// Validated here: layout geometry consistency (the derived fields are pub
-/// and hand-constructible), `layer < layout.num_layers`, `kv_pool` holding
-/// whole pages (its capacity in pages becomes the kernel's page bound),
-/// `page_indices` covering `[start_pos, start_pos + seq_len)`,
-/// `start_pos + seq_len <= cos_max_pos` (host-side layer of the position
-/// defence; the kernel `__trap()`s on any out-of-range pos or page id as
-/// the second), table lengths, and 512-element norm weights. `rotary_dim`
-/// must be positive, even and <= 512 — enforced by the launcher, which
-/// returns -1; propagated here as `Err`.
+/// The kernel `__trap()`s on any out-of-range pos or page id as the
+/// second layer of the host validation's defence.
 #[allow(clippy::too_many_arguments)]
 pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     ctx: &DeviceContext,
@@ -2616,11 +2918,16 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     rms_eps: f32,
 ) -> Result<()> {
     let seq_len = q.seq_len;
+    let q_dim = num_q_heads.checked_mul(512).ok_or_else(|| {
+        anyhow::anyhow!("hd512 prefill prep num_q_heads {num_q_heads} * 512 overflows")
+    })?;
+    let kv_dim = num_kv_heads.checked_mul(512).ok_or_else(|| {
+        anyhow::anyhow!("hd512 prefill prep num_kv_heads {num_kv_heads} * 512 overflows")
+    })?;
     anyhow::ensure!(
-        q.hidden_dim == num_q_heads * 512,
-        "hd512 prefill prep q.hidden_dim {} != num_q_heads {} * 512",
-        q.hidden_dim,
-        num_q_heads
+        q.hidden_dim == q_dim,
+        "hd512 prefill prep q.hidden_dim {} != num_q_heads {num_q_heads} * 512",
+        q.hidden_dim
     );
     anyhow::ensure!(
         q_out.hidden_dim == q.hidden_dim,
@@ -2634,73 +2941,23 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         q_out.seq_len
     );
     anyhow::ensure!(
-        k.hidden_dim == num_kv_heads * 512,
-        "hd512 prefill prep k.hidden_dim {} != num_kv_heads {} * 512",
-        k.hidden_dim,
-        num_kv_heads
+        k.hidden_dim == kv_dim,
+        "hd512 prefill prep k.hidden_dim {} != num_kv_heads {num_kv_heads} * 512",
+        k.hidden_dim
     );
     anyhow::ensure!(
         k.seq_len == seq_len,
         "hd512 prefill prep k.seq_len {} != q.seq_len {seq_len}",
         k.seq_len
     );
-    anyhow::ensure!(
-        layout.head_dim == 512,
-        "hd512 prefill prep layout.head_dim {} != 512",
-        layout.head_dim
-    );
-    anyhow::ensure!(
-        layout.num_kv_heads == num_kv_heads,
-        "hd512 prefill prep layout.num_kv_heads {} != num_kv_heads {num_kv_heads}",
-        layout.num_kv_heads
-    );
-    // Keep the pool-capacity division below defined for public layouts.
-    anyhow::ensure!(
-        layout.page_size > 0 && layout.num_kv_heads > 0,
-        "hd512 prefill prep layout.page_size {} / num_kv_heads {} must be positive",
-        layout.page_size,
-        layout.num_kv_heads
-    );
-    let kv_block_len = layout.page_size * layout.num_kv_heads * layout.head_dim;
-    anyhow::ensure!(
-        layout.kv_block_len == kv_block_len,
-        "hd512 prefill prep layout.kv_block_len {} != page_size {} * num_kv_heads \
-         {} * head_dim {}",
-        layout.kv_block_len,
-        layout.page_size,
-        layout.num_kv_heads,
-        layout.head_dim
-    );
-    anyhow::ensure!(
-        layout.layer_stride == 2 * kv_block_len,
-        "hd512 prefill prep layout.layer_stride {} != 2 * kv_block_len {kv_block_len}",
-        layout.layer_stride
-    );
-    anyhow::ensure!(
-        layout.page_stride == layout.num_layers * layout.layer_stride,
-        "hd512 prefill prep layout.page_stride {} != num_layers {} * layer_stride {}",
-        layout.page_stride,
-        layout.num_layers,
-        layout.layer_stride
-    );
-    anyhow::ensure!(
-        layer < layout.num_layers,
-        "hd512 prefill prep layer {layer} >= layout.num_layers {}",
-        layout.num_layers
-    );
-    let num_pages = kv_pool.len() / layout.page_stride;
-    anyhow::ensure!(
-        kv_pool.len().is_multiple_of(layout.page_stride),
-        "hd512 prefill prep kv_pool.len {} is not a multiple of layout.page_stride {}",
+    let geometry = checked_paged_prep_geometry(
+        "hd512 prefill prep",
+        layout,
         kv_pool.len(),
-        layout.page_stride
-    );
-    anyhow::ensure!(
-        num_pages >= 1,
-        "hd512 prefill prep kv_pool.len {} holds no whole page (page_stride {})",
-        kv_pool.len(),
-        layout.page_stride
-    );
+        layer,
+        512,
+        num_kv_heads,
+    )?;
     anyhow::ensure!(
         q_norm_weight.len == 512,
         "hd512 prefill prep q_norm_weight len {} != 512",
@@ -2711,43 +2968,60 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         "hd512 prefill prep k_norm_weight len {} != 512",
         k_norm_weight.len
     );
+    let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
+        anyhow::anyhow!("hd512 prefill prep start_pos {start_pos} + seq_len {seq_len} overflows")
+    })?;
+    let covered = page_indices
+        .len()
+        .checked_mul(layout.page_size)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "hd512 prefill prep page_indices len {} * page_size {} overflows",
+                page_indices.len(),
+                layout.page_size
+            )
+        })?;
     anyhow::ensure!(
-        page_indices.len() * layout.page_size >= start_pos + seq_len,
-        "hd512 prefill prep pages cover {} tokens (len {} * page_size {}), need \
-         start_pos {start_pos} + seq_len {seq_len}",
-        page_indices.len() * layout.page_size,
-        page_indices.len(),
-        layout.page_size
+        covered >= end_pos,
+        "hd512 prefill prep pages cover {covered} tokens, need start_pos {start_pos} + seq_len {seq_len}"
     );
     anyhow::ensure!(
-        start_pos + seq_len <= cos_max_pos,
-        "hd512 prefill prep start_pos {start_pos} + seq_len {seq_len} > \
-         cos_max_pos {cos_max_pos}"
+        end_pos <= cos_max_pos,
+        "hd512 prefill prep start_pos {start_pos} + seq_len {seq_len} > cos_max_pos {cos_max_pos}"
     );
+    let table_len = cos_max_pos.checked_mul(rotary_dim).ok_or_else(|| {
+        anyhow::anyhow!(
+            "hd512 prefill prep cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim} overflows"
+        )
+    })?;
     anyhow::ensure!(
-        cos_cache.len >= cos_max_pos * rotary_dim,
-        "hd512 prefill prep cos_cache len {} < cos_max_pos {cos_max_pos} * \
-         rotary_dim {rotary_dim}",
+        cos_cache.len >= table_len,
+        "hd512 prefill prep cos_cache len {} < cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim}",
         cos_cache.len
     );
     anyhow::ensure!(
-        sin_cache.len >= cos_max_pos * rotary_dim,
-        "hd512 prefill prep sin_cache len {} < cos_max_pos {cos_max_pos} * \
-         rotary_dim {rotary_dim}",
+        sin_cache.len >= table_len,
+        "hd512 prefill prep sin_cache len {} < cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim}",
         sin_cache.len
     );
-    q.checked_extent("hd512 prefill prep q")?;
+    let q_elems = q.checked_extent("hd512 prefill prep q")?;
     q_out.checked_extent("hd512 prefill prep q_out")?;
-    k.checked_extent("hd512 prefill prep k")?;
+    let k_elems = k.checked_extent("hd512 prefill prep k")?;
+    crate::ops::checked_i32(q_elems, "hd512 prefill prep q extent")?;
+    crate::ops::checked_i32(k_elems, "hd512 prefill prep k extent")?;
+    crate::ops::checked_i32(table_len, "hd512 prefill prep rope table extent")?;
     ensure_vec_backed(q_norm_weight, "hd512 prefill prep q_norm_weight")?;
     ensure_vec_backed(k_norm_weight, "hd512 prefill prep k_norm_weight")?;
     ensure_vec_backed(cos_cache, "hd512 prefill prep cos_cache")?;
     ensure_vec_backed(sin_cache, "hd512 prefill prep sin_cache")?;
 
-    // Derive raw offsets from the validated layout.
-    let k_offset_elems = (layer * layout.layer_stride) as i64;
-    let page_size = layout.page_size;
-    let stride_page = layout.page_stride as i64;
+    let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "hd512 prefill prep num_q_heads")?;
+    let num_kv_heads_i32 =
+        crate::ops::checked_i32(num_kv_heads, "hd512 prefill prep num_kv_heads")?;
+    let seq_len_i32 = crate::ops::checked_i32(seq_len, "hd512 prefill prep seq_len")?;
+    let start_pos_i32 = crate::ops::checked_i32(start_pos, "hd512 prefill prep start_pos")?;
+    let cos_max_pos_i32 = crate::ops::checked_i32(cos_max_pos, "hd512 prefill prep cos_max_pos")?;
+    let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd512 prefill prep rotary_dim")?;
 
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
@@ -2770,18 +3044,19 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
             sin_ptr as *const ffi::Half,
             qo_ptr as *mut ffi::Half,
             pool_ptr as *mut ffi::Half,
-            k_offset_elems,
+            geometry.k_offset_elems,
+            geometry.v_offset_elems,
             pi_ptr as *const i32,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            seq_len as i32,
-            start_pos as i32,
-            cos_max_pos as i32,
-            rotary_dim as i32,
+            num_q_heads_i32,
+            num_kv_heads_i32,
+            seq_len_i32,
+            start_pos_i32,
+            cos_max_pos_i32,
+            rotary_dim_i32,
             rms_eps,
-            page_size as i32,
-            num_pages as i32,
-            stride_page,
+            geometry.page_size,
+            geometry.num_pages,
+            geometry.stride_page,
             crate::tensor::active_cu_stream(ctx),
         )
     };

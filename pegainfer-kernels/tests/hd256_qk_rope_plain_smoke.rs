@@ -2,15 +2,15 @@
 //!
 //! Manual gate: CI compiles this but never runs it. Run on a GPU box with
 //! PEGAINFER_REQUIRE_GPU=1, which turns a missing device into a failure
-//! rather than a skip. Unlike the hd512 sibling there are no trap binaries:
-//! this entry has no device-resident indices — the only out-of-range axis
-//! (the position window) is host-known and rejected by the wrapper, so the
-//! kernel's position trap is unreachable through the public path.
+//! rather than a skip.
 
 mod common;
 
+use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::qk_norm_rope_prefill_hd256_plain_into;
+use pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into;
+use pegainfer_kernels::paged_kv::PagedKvLayout;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceVec;
 use pegainfer_kernels::tensor::HiddenStates;
@@ -29,6 +29,10 @@ const NUM_KV_HEADS: usize = 8;
 // 8 entries; the pattern is aperiodic under h -> 2h, h % 8 and h ± 1.
 const Q_BASE: f32 = 1.0;
 const K_BASE: f32 = 3.0;
+// The weightless V norm erases magnitude (x * inv_rms(x) is ±1 up to eps),
+// so only signs distinguish V from a mis-read source; the global flip
+// against Q/K makes a V-input mix-up land a wrong sign in every slot.
+const V_BASE: f32 = -5.0;
 const HEAD_SIGNS: [f32; NUM_Q_HEADS] = [
     1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0,
 ];
@@ -186,6 +190,119 @@ fn run_prep(ctx: &DeviceContext, rotary_dim: usize) -> (Vec<f32>, Vec<f32>) {
     let qo = q_out.to_host(ctx).expect("q_out D2H");
     let ko = k_out.to_host(ctx).expect("k_out D2H");
     (qo, ko)
+}
+
+// Pool geometry for the serving-form case. Positions 1..=4 map through
+// PAGE_INDICES to pages 3, 7, 5; page id 9 is an out-of-range sentinel the
+// kernel must never dereference. The 8-page pool leaves in-range pages
+// unreferenced, so stray writes have somewhere visible to land.
+const PAGE_SIZE: usize = 2;
+const NUM_LAYERS: usize = 2;
+const PAGE_INDICES: [i32; 4] = [3, 7, 5, 9];
+const POOL_PAGES: usize = 8;
+
+/// K and V blocks at their layout-derived offsets; everything else stays
+/// 0.0. V is the weightless norm of the v input — never rotated, no weight.
+fn expected_pool(layout: &PagedKvLayout, layer: usize, kw: &[bf16]) -> Vec<f32> {
+    let mut exp = vec![0.0f32; layout.page_stride * POOL_PAGES];
+    let layer_offset = (layer * layout.layer_stride) as i64;
+    for t in 0..SEQ_LEN {
+        let pos = START_POS + t;
+        let page = PAGE_INDICES[pos / PAGE_SIZE] as i64;
+        for h in 0..NUM_KV_HEADS {
+            let k_x = signed(K_BASE, h, t);
+            let k_inv = inv_rms(k_x);
+            let v_x = signed(V_BASE, h, t);
+            let v_val = bf16::from_f32(v_x * inv_rms(v_x)).to_f32();
+            let base = page * layout.page_stride as i64
+                + layer_offset
+                + (pos % PAGE_SIZE) as i64 * KV_DIM as i64
+                + h as i64 * HD as i64;
+            for d in 0..HD {
+                exp[(base + d as i64) as usize] = expected_prep(k_x, kw, k_inv, d, pos, HD);
+                exp[(base + layout.kv_block_len as i64 + d as i64) as usize] = v_val;
+            }
+        }
+    }
+    exp
+}
+
+/// Exact zero is the assertion, not sloppiness: it marks a slot the kernel
+/// must never have written — unreferenced pages, the other layer, and the
+/// slots outside the request's positions.
+#[allow(clippy::float_cmp)]
+fn assert_pool(got: &[f32], expected: &[f32]) {
+    assert_eq!(got.len(), expected.len());
+    for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
+        if e == 0.0 {
+            assert_eq!(g, 0.0, "pool[{i}]: expected untouched, got {g}");
+        } else {
+            assert!(
+                (g - e).abs() < 0.02,
+                "pool[{i}]: got {g}, expected {e} (tolerance 0.02)"
+            );
+        }
+    }
+}
+
+#[test]
+fn pool_write_matches_closed_form_and_touches_nothing_else() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let q = hidden_input(ctx, Q_BASE, NUM_Q_HEADS);
+    let k = hidden_input(ctx, K_BASE, NUM_KV_HEADS);
+    let v = hidden_input(ctx, V_BASE, NUM_KV_HEADS);
+    let mut q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q_out alloc");
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, COS_MAX_POS, HD);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+    let pool: CudaSlice<bf16> = ctx
+        .stream
+        .alloc_zeros(layout.page_stride * POOL_PAGES)
+        .expect("pool alloc");
+    let page_indices: CudaSlice<i32> = ctx
+        .stream
+        .clone_htod(&PAGE_INDICES)
+        .expect("page_indices H2D");
+
+    qkv_norm_rope_paged_prefill_hd256_plain_into(
+        ctx,
+        &q,
+        &k,
+        &v,
+        &mut q_out,
+        &pool,
+        &layout,
+        &qn,
+        &kn,
+        &cos_dev,
+        &sin_dev,
+        layer,
+        &page_indices,
+        START_POS,
+        COS_MAX_POS,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HD,
+        EPS,
+    )
+    .expect("pool prep launch");
+
+    let qo = q_out.to_host(ctx).expect("q_out D2H");
+    assert_close(
+        &qo,
+        &expected_full(Q_BASE, &qw, Q_DIM, HD),
+        "pool-write Q pairing",
+    );
+    let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
+    let pool_f: Vec<f32> = pool_host.iter().map(|x| x.to_f32()).collect();
+    assert_pool(&pool_f, &expected_pool(&layout, layer, &kw));
 }
 
 /// rotary_dim = 256 is the Gemma 4 local-layer case: the full head rotates
