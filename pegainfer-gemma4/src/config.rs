@@ -62,6 +62,10 @@ pub(crate) struct Gemma4Config {
     /// proportional rope tables.
     #[allow(dead_code)]
     pub(crate) global_rotary_dim: usize,
+    /// Applied as `cap * tanh(x / cap)` over the final logits; every
+    /// published size declares one.
+    #[allow(dead_code)]
+    pub(crate) final_logit_softcapping: f32,
 }
 
 #[cfg(feature = "gemma4")]
@@ -138,6 +142,11 @@ impl Gemma4Config {
             sliding_window > 0,
             "Gemma 4: sliding_window must be positive"
         );
+        let final_logit_softcapping = f32_field(tc, "text_config", "final_logit_softcapping")?;
+        anyhow::ensure!(
+            final_logit_softcapping > 0.0,
+            "Gemma 4: final_logit_softcapping {final_logit_softcapping} must be positive"
+        );
         Ok(Self {
             hidden_size: usize_field(tc, "hidden_size")?,
             intermediate_size: usize_field(tc, "intermediate_size")?,
@@ -155,6 +164,7 @@ impl Gemma4Config {
             sliding_window,
             global_rope_theta,
             global_rotary_dim: rotary as usize,
+            final_logit_softcapping,
         })
     }
 }

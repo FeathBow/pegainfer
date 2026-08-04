@@ -133,22 +133,8 @@ fn layers_match_hf_probes() {
     let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0).expect("load 12B weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
 
-    let geom = LayerGeometry {
-        hidden_size: config.hidden_size,
-        intermediate_size: config.intermediate_size,
-        num_q_heads: config.num_attention_heads,
-        num_kv_heads: config.num_key_value_heads,
-        head_dim: config.head_dim,
-        rms_norm_eps: config.rms_norm_eps,
-    };
-    let global_geom = LayerGeometry {
-        hidden_size: config.hidden_size,
-        intermediate_size: config.intermediate_size,
-        num_q_heads: config.num_attention_heads,
-        num_kv_heads: config.num_global_key_value_heads,
-        head_dim: config.global_head_dim,
-        rms_norm_eps: config.rms_norm_eps,
-    };
+    let geom = LayerGeometry::local_of(&config);
+    let global_geom = LayerGeometry::global_of(&config);
     let cos_max_pos = 16;
     let (cos_cache, sin_cache) = pegainfer_core::rope::precompute_rope(
         &ctx,

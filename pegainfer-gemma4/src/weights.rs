@@ -8,9 +8,9 @@ use crate::config::Gemma4Config;
 mod load;
 
 pub(crate) struct Gemma4Weights {
-    config: Gemma4Config,
-    embed_tokens: DeviceMatrix,
-    norm: DeviceVec,
+    pub(crate) config: Gemma4Config,
+    pub(crate) embed_tokens: DeviceMatrix,
+    pub(crate) norm: DeviceVec,
     pub(crate) layers: Vec<Gemma4Layer>,
 }
 

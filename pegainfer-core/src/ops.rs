@@ -88,6 +88,7 @@ pub use pegainfer_kernels::ops::single_prefill_hd256_into;
 pub use pegainfer_kernels::ops::single_prefill_hd512_into;
 pub use pegainfer_kernels::ops::single_prefill_nhd_causal_into;
 pub use pegainfer_kernels::ops::single_prefill_nhd_noncausal_into;
+pub use pegainfer_kernels::ops::softcap_bf16_in_place;
 pub use pegainfer_kernels::ops::write_vec_into;
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::embedding_batch;

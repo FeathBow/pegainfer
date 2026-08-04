@@ -10,8 +10,11 @@ mod probe;
 // `expect(dead_code)` cannot hold in every build.
 #[cfg(feature = "gemma4")]
 #[allow(dead_code)]
+mod forward;
+#[cfg(feature = "gemma4")]
+#[allow(dead_code)]
 mod layer;
-#[cfg(all(feature = "gemma4", test))]
+#[cfg(all(test, feature = "gemma4"))]
 mod testkit;
 #[cfg(feature = "gemma4")]
 #[allow(dead_code)]

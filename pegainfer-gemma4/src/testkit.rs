@@ -74,3 +74,35 @@ pub(crate) fn bf16_tensor(
         .collect();
     (view.shape().to_vec(), host)
 }
+
+pub(crate) fn i32_tensor(
+    fixture: &safetensors::SafeTensors<'_>,
+    name: &str,
+) -> (Vec<usize>, Vec<i32>) {
+    let view = fixture.tensor(name).expect("fixture tensor");
+    assert_eq!(view.dtype(), safetensors::Dtype::I32, "{name} dtype");
+    let host = view
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
+        .collect();
+    (view.shape().to_vec(), host)
+}
+
+pub(crate) fn f32_tensor(
+    fixture: &safetensors::SafeTensors<'_>,
+    name: &str,
+) -> (Vec<usize>, Vec<f32>) {
+    let view = fixture.tensor(name).expect("fixture tensor");
+    assert_eq!(view.dtype(), safetensors::Dtype::F32, "{name} dtype");
+    let host = view
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    (view.shape().to_vec(), host)
+}

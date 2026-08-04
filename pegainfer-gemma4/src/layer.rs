@@ -22,6 +22,7 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
+use crate::config::Gemma4Config;
 use crate::weights::Gemma4Layer;
 
 /// The geometry a layer runs at, read off the validated config — the local
@@ -33,6 +34,30 @@ pub(crate) struct LayerGeometry {
     pub(crate) num_kv_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) rms_norm_eps: f32,
+}
+
+impl LayerGeometry {
+    pub(crate) fn local_of(config: &Gemma4Config) -> Self {
+        Self {
+            hidden_size: config.hidden_size,
+            intermediate_size: config.intermediate_size,
+            num_q_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            rms_norm_eps: config.rms_norm_eps,
+        }
+    }
+
+    pub(crate) fn global_of(config: &Gemma4Config) -> Self {
+        Self {
+            hidden_size: config.hidden_size,
+            intermediate_size: config.intermediate_size,
+            num_q_heads: config.num_attention_heads,
+            num_kv_heads: config.num_global_key_value_heads,
+            head_dim: config.global_head_dim,
+            rms_norm_eps: config.rms_norm_eps,
+        }
+    }
 }
 
 /// Cos/sin tables for the global layers' proportional RoPE, in the same
