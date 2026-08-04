@@ -274,6 +274,8 @@ pub(super) fn sample_config() -> Gemma4Config {
         rms_norm_eps: 1e-6,
         sliding_rope_theta: 10_000.0,
         sliding_window: 1024,
+        global_rope_theta: 1_000_000.0,
+        global_rotary_dim: 128,
     }
 }
 

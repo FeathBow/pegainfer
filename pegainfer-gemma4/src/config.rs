@@ -17,17 +17,15 @@ pub(crate) enum LayerKind {
     Global,
 }
 
-/// First and last sliding layers from the layer map; `None` when the map has
-/// no sliding entry.
-#[cfg(test)]
-pub(crate) fn first_last_sliding(layer_types: &[LayerKind]) -> Option<(usize, usize)> {
-    let mut sliding = layer_types
+#[cfg(all(feature = "gemma4", test))]
+pub(crate) fn first_last(layer_types: &[LayerKind], kind: LayerKind) -> Option<(usize, usize)> {
+    let mut matching = layer_types
         .iter()
         .enumerate()
-        .filter(|(_, kind)| matches!(kind, LayerKind::Sliding))
+        .filter(|(_, k)| **k == kind)
         .map(|(index, _)| index);
-    let first = sliding.next()?;
-    Some((first, sliding.next_back().unwrap_or(first)))
+    let first = matching.next()?;
+    Some((first, matching.next_back().unwrap_or(first)))
 }
 
 /// What the manifest is derived from. Only [`Gemma4Config::from_file`] is
@@ -49,7 +47,7 @@ pub(crate) struct Gemma4Config {
     /// The MoE size keeps its dense MLP and adds experts alongside it.
     pub(crate) moe_enabled: bool,
     // Not manifest inputs: until a serving path lands, only the oracle reads
-    // these three.
+    // these.
     #[allow(dead_code)]
     pub(crate) rms_norm_eps: f32,
     /// The sliding-attention rope theta; the global family reads its own.
@@ -57,6 +55,13 @@ pub(crate) struct Gemma4Config {
     pub(crate) sliding_rope_theta: f32,
     #[allow(dead_code)]
     pub(crate) sliding_window: usize,
+    #[allow(dead_code)]
+    pub(crate) global_rope_theta: f32,
+    /// `partial_rotary_factor * global_head_dim`, validated to land on a
+    /// positive even width within the head — the active band of the
+    /// proportional rope tables.
+    #[allow(dead_code)]
+    pub(crate) global_rotary_dim: usize,
 }
 
 #[cfg(feature = "gemma4")]
@@ -98,6 +103,36 @@ impl Gemma4Config {
         let sliding_rope = rope
             .get("sliding_attention")
             .ok_or_else(|| anyhow::anyhow!("Gemma 4: missing rope_parameters.sliding_attention"))?;
+        let global_rope = rope
+            .get("full_attention")
+            .ok_or_else(|| anyhow::anyhow!("Gemma 4: missing rope_parameters.full_attention"))?;
+        rope_type_field(sliding_rope, "sliding_attention", "default")?;
+        rope_type_field(global_rope, "full_attention", "proportional")?;
+        let sliding_rope_theta = f32_field(sliding_rope, "sliding_attention", "rope_theta")?;
+        let global_rope_theta = f32_field(global_rope, "full_attention", "rope_theta")?;
+        anyhow::ensure!(
+            sliding_rope_theta > 0.0 && global_rope_theta > 0.0,
+            "Gemma 4: rope_theta must be positive (sliding {sliding_rope_theta}, global \
+             {global_rope_theta})"
+        );
+        let global_head_dim = usize_field(tc, "global_head_dim")?;
+        let partial = global_rope
+            .get("partial_rotary_factor")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Gemma 4: full_attention.partial_rotary_factor missing or not a number"
+                )
+            })?;
+        let rotary = partial * global_head_dim as f64;
+        anyhow::ensure!(
+            rotary > 0.0
+                && rotary.fract() == 0.0
+                && rotary as usize <= global_head_dim
+                && (rotary as usize).is_multiple_of(2),
+            "Gemma 4: partial_rotary_factor {partial} of global_head_dim {global_head_dim} must \
+             land on a positive even width within the head, got {rotary}"
+        );
         let sliding_window = usize_field(tc, "sliding_window")?;
         anyhow::ensure!(
             sliding_window > 0,
@@ -111,13 +146,15 @@ impl Gemma4Config {
             num_key_value_heads: usize_field(tc, "num_key_value_heads")?,
             num_global_key_value_heads: usize_field(tc, "num_global_key_value_heads")?,
             head_dim: usize_field(tc, "head_dim")?,
-            global_head_dim: usize_field(tc, "global_head_dim")?,
+            global_head_dim,
             layer_types,
             tie_word_embeddings: bool_field(tc, "tie_word_embeddings")?,
             moe_enabled: bool_field(tc, "enable_moe_block")?,
             rms_norm_eps: f32_field(tc, "text_config", "rms_norm_eps")?,
-            sliding_rope_theta: f32_field(sliding_rope, "sliding_attention", "rope_theta")?,
+            sliding_rope_theta,
             sliding_window,
+            global_rope_theta,
+            global_rotary_dim: rotary as usize,
         })
     }
 }
@@ -159,24 +196,18 @@ fn bool_field(text_config: &serde_json::Value, field: &str) -> Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("Gemma 4: text_config.{field} missing or not a boolean"))
 }
 
-#[cfg(test)]
-mod layer_map_tests {
-    use super::*;
-
-    #[test]
-    fn first_last_sliding_handles_edges() {
-        // The real 12B map is reconciled against the fixture's own parse in
-        // the oracle; here only the iterator logic is under test.
-        assert_eq!(
-            first_last_sliding(&[LayerKind::Sliding, LayerKind::Global, LayerKind::Sliding]),
-            Some((0, 2))
-        );
-        assert_eq!(first_last_sliding(&[LayerKind::Sliding]), Some((0, 0)));
-        assert_eq!(
-            first_last_sliding(&[LayerKind::Global, LayerKind::Sliding]),
-            Some((1, 1))
-        );
-        assert_eq!(first_last_sliding(&[LayerKind::Global]), None);
-        assert_eq!(first_last_sliding(&[]), None);
-    }
+/// `rope_type` selects the table-generation algorithm; a value this engine
+/// has not wired for that family must fail here, not silently get the other
+/// family's tables.
+#[cfg(feature = "gemma4")]
+fn rope_type_field(rope_group: &serde_json::Value, ctx: &str, implemented: &str) -> Result<()> {
+    let value = rope_group
+        .get("rope_type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: {ctx}.rope_type missing or not a string"))?;
+    anyhow::ensure!(
+        value == implemented,
+        "Gemma 4: {ctx}.rope_type {value:?} is not the implemented {implemented:?}"
+    );
+    Ok(())
 }

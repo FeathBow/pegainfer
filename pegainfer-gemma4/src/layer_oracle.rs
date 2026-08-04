@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::Gemma4Config;
-use crate::config::first_last_sliding;
+use crate::config::LayerKind;
+use crate::config::first_last;
 use crate::testkit::GOLDEN_PATH;
 use crate::testkit::METADATA_KEY;
 use crate::testkit::assert_checkpoint_matches;
@@ -62,7 +63,7 @@ fn compare(got: &[f32], expected: &[bf16], hidden_size: usize, what: &str) -> us
 
 #[test]
 #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
-fn local_layer_matches_hf_probes() {
+fn layers_match_hf_probes() {
     let dir = model_path();
     let fixture_bytes = std::fs::read(GOLDEN_PATH).expect("read fixture");
     let (_, meta) =
@@ -83,7 +84,9 @@ fn local_layer_matches_hf_probes() {
     // derivations must agree before anything numeric is asserted.
     let config = Gemma4Config::from_file(&dir).expect("config");
     let (first, last) =
-        first_last_sliding(&config.layer_types).expect("12B carries sliding layers");
+        first_last(&config.layer_types, LayerKind::Sliding).expect("12B carries sliding layers");
+    let (gfirst, glast) =
+        first_last(&config.layer_types, LayerKind::Global).expect("12B carries global layers");
     let probe_layers = &manifest["probe_layers"];
     assert_eq!(
         first as u64,
@@ -96,6 +99,22 @@ fn local_layer_matches_hf_probes() {
         last as u64,
         probe_layers["sliding_last"].as_u64().expect("sliding_last"),
         "last sliding layer disagrees with the fixture's parse"
+    );
+    assert_eq!(
+        gfirst as u64,
+        probe_layers["global_first"].as_u64().expect("global_first"),
+        "first global layer disagrees with the fixture's parse"
+    );
+    assert_eq!(
+        glast as u64,
+        probe_layers["global_last"].as_u64().expect("global_last"),
+        "last global layer disagrees with the fixture's parse"
+    );
+    assert_eq!(
+        glast,
+        last + 1,
+        "global_last must sit directly after sliding_last for the \
+         dedup label below to be its input"
     );
 
     let cut_labels: Vec<String> = manifest["cut_labels"]
@@ -114,12 +133,20 @@ fn local_layer_matches_hf_probes() {
     let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0).expect("load 12B weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
 
-    let geom = LocalLayerGeometry {
+    let geom = LayerGeometry {
         hidden_size: config.hidden_size,
         intermediate_size: config.intermediate_size,
         num_q_heads: config.num_attention_heads,
         num_kv_heads: config.num_key_value_heads,
         head_dim: config.head_dim,
+        rms_norm_eps: config.rms_norm_eps,
+    };
+    let global_geom = LayerGeometry {
+        hidden_size: config.hidden_size,
+        intermediate_size: config.intermediate_size,
+        num_q_heads: config.num_attention_heads,
+        num_kv_heads: config.num_global_key_value_heads,
+        head_dim: config.global_head_dim,
         rms_norm_eps: config.rms_norm_eps,
     };
     let cos_max_pos = 16;
@@ -133,6 +160,14 @@ fn local_layer_matches_hf_probes() {
         },
     )
     .expect("rope tables");
+    let (gcos_cache, gsin_cache) = build_proportional_rope_tables(
+        &ctx,
+        config.global_rope_theta,
+        global_geom.head_dim,
+        config.global_rotary_dim,
+        cos_max_pos,
+    )
+    .expect("proportional rope tables");
 
     let mut over_tolerance: Vec<String> = Vec::new();
     for case in ["single", "short"] {
@@ -161,6 +196,31 @@ fn local_layer_matches_hf_probes() {
                 cos_max_pos,
             )
             .expect("layer forward");
+            let got = out.to_host(&ctx).expect("out D2H");
+            let expected = cut(&format!("{name}_out"));
+            let violations = compare(&got, expected, hidden_size, &format!("{case}/{name}"));
+            if violations > 0 {
+                over_tolerance.push(format!("{case}/{name} (layer {index})"));
+            }
+        }
+
+        for (name, index, in_label) in [
+            ("global_first", gfirst, "global_first_in"),
+            ("global_last", glast, "sliding_last_out"),
+        ] {
+            let x =
+                HiddenStates::from_host(&ctx, cut(in_label), hidden_size, seq_len).expect("x H2D");
+            let out = global_layer_forward(
+                &ctx,
+                &weights.layers[index],
+                &global_geom,
+                &x,
+                0,
+                &gcos_cache,
+                &gsin_cache,
+                cos_max_pos,
+            )
+            .expect("global layer forward");
             let got = out.to_host(&ctx).expect("out D2H");
             let expected = cut(&format!("{name}_out"));
             let violations = compare(&got, expected, hidden_size, &format!("{case}/{name}"));

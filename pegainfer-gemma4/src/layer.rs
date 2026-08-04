@@ -1,17 +1,18 @@
-//! One Gemma 4 local (sliding-attention) decoder layer, prefill form.
+//! Gemma 4 decoder layers, prefill form: the local (sliding-attention) and
+//! global (full-attention) kinds, sharing one attention epilogue.
 //!
 //! The graph is the HF reference's, with the constants a from-the-paper
 //! implementation gets wrong: the four norm sites are all norm-then-add
 //! (sandwich, not the fused add-then-norm shape), attention is unscaled
 //! (`scaling = 1.0` in the reference — not `head_dim**-0.5`), V takes a
-//! weightless RMS norm and no RoPE, RoPE rotates the full 256-wide head,
-//! and `layer_scalar` multiplies the layer output after both residual adds.
+//! weightless RMS norm and no RoPE (on global layers V is `k_proj`'s raw
+//! output, forked before `k_norm`), RoPE rotates the full head width (the
+//! global family's partiality lives in its tables), and `layer_scalar`
+//! multiplies the layer output after both residual adds.
 //!
 //! There is no KV cache: K and V stay contiguous and feed `single_prefill`,
-//! which computes exact sliding attention for any prompt short enough that
-//! the window never truncates (`seq_len <= sliding_window`; the window
-//! first evicts at `sliding_window + 1` tokens). The window boundary
-//! belongs to the SWA kernels and the prefill ladder, not to this layer.
+//! exact from position zero — for the local kind only while the prompt fits
+//! the sliding window. Both forwards reject anything outside that domain.
 
 use anyhow::Context as _;
 use anyhow::Result;
@@ -23,14 +24,78 @@ use pegainfer_core::tensor::HiddenStates;
 
 use crate::weights::Gemma4Layer;
 
-/// The geometry a local layer runs at, read off the validated config.
-pub(crate) struct LocalLayerGeometry {
+/// The geometry a layer runs at, read off the validated config — the local
+/// and global kinds differ only in head width and KV head count.
+pub(crate) struct LayerGeometry {
     pub(crate) hidden_size: usize,
     pub(crate) intermediate_size: usize,
     pub(crate) num_q_heads: usize,
     pub(crate) num_kv_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) rms_norm_eps: f32,
+}
+
+/// Cos/sin tables for the global layers' proportional RoPE, in the same
+/// `[pos * head_dim + d]` layout. The HF reference
+/// (`_compute_proportional_rope_parameters`) is not the qwen35-style
+/// leading-block partial rotation: the first `rotary_dim / 2` inverse
+/// frequencies use the FULL head_dim as the exponent denominator
+/// (`theta^(2i/head_dim)`, not `/rotary_dim`), the remaining band is
+/// zero-padded, and `rotate_half` then pairs `(d, d + head_dim/2)` across
+/// the whole head — zero frequency makes the un-rotated band an exact
+/// identity (cos 1, sin 0). The prep kernel therefore runs at
+/// `rotary_dim = head_dim`; the partiality lives in these tables.
+pub(crate) fn build_proportional_rope_tables(
+    ctx: &DeviceContext,
+    rope_theta: f32,
+    head_dim: usize,
+    rotary_dim: usize,
+    max_pos: usize,
+) -> Result<(DeviceVec, DeviceVec)> {
+    anyhow::ensure!(
+        rope_theta.is_finite() && rope_theta > 0.0,
+        "proportional rope theta {rope_theta} must be positive and finite"
+    );
+    anyhow::ensure!(
+        head_dim > 0
+            && head_dim.is_multiple_of(2)
+            && rotary_dim > 0
+            && rotary_dim.is_multiple_of(2),
+        "proportional rope dims must be positive and even: head_dim {head_dim}, rotary_dim \
+         {rotary_dim}"
+    );
+    anyhow::ensure!(
+        rotary_dim <= head_dim,
+        "proportional rope rotary_dim {rotary_dim} exceeds head_dim {head_dim}"
+    );
+    anyhow::ensure!(max_pos > 0, "proportional rope max_pos must be positive");
+    let table_len = max_pos.checked_mul(head_dim).ok_or_else(|| {
+        anyhow::anyhow!("proportional rope table size {max_pos} x {head_dim} overflows")
+    })?;
+    let rope_angles = rotary_dim / 2;
+    let half_dim = head_dim / 2;
+    let mut cos = vec![bf16::from_f32(0.0); table_len];
+    let mut sin = vec![bf16::from_f32(0.0); table_len];
+    for pos in 0..max_pos {
+        for i in 0..half_dim {
+            let inv_freq = if i < rope_angles {
+                1.0f32 / rope_theta.powf(2.0 * i as f32 / head_dim as f32)
+            } else {
+                0.0
+            };
+            let angle = pos as f32 * inv_freq;
+            let row = pos * head_dim;
+            let (c, s_) = (bf16::from_f32(angle.cos()), bf16::from_f32(angle.sin()));
+            cos[row + i] = c;
+            cos[row + i + half_dim] = c;
+            sin[row + i] = s_;
+            sin[row + i + half_dim] = s_;
+        }
+    }
+    Ok((
+        DeviceVec::from_host(ctx, &cos)?,
+        DeviceVec::from_host(ctx, &sin)?,
+    ))
 }
 
 /// Token-major `[num_heads * head_dim, seq_len]` rows into a contiguous HND
@@ -73,6 +138,113 @@ fn nhd_to_hnd(
     Ok(hnd)
 }
 
+/// v_norm is weightless (`with_scale=False`): a plain-w RMS norm with a ones
+/// weight is the same arithmetic. The `[kv_dim, seq_len]` buffer is
+/// reinterpreted as `[head_dim, seq_len * num_kv_heads]` — heads are
+/// contiguous within each token row, so the narrower row width makes the
+/// reduction per (token, head) — then the shape is restored.
+fn weightless_value_norm(
+    ctx: &DeviceContext,
+    mut v_states: HiddenStates,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rms_norm_eps: f32,
+) -> Result<HiddenStates> {
+    let seq_len = v_states.seq_len;
+    let kv_dim = v_states.hidden_dim;
+    anyhow::ensure!(
+        kv_dim == num_kv_heads * head_dim,
+        "weightless_value_norm v.hidden_dim {kv_dim} != num_kv_heads {num_kv_heads} * head_dim \
+         {head_dim}"
+    );
+    let ones = DeviceVec::from_host(ctx, &vec![bf16::from_f32(1.0); head_dim])?;
+    v_states.hidden_dim = head_dim;
+    v_states.seq_len = seq_len * num_kv_heads;
+    let mut v_normed = HiddenStates::zeros(ctx, head_dim, seq_len * num_kv_heads)?;
+    ops::rms_norm_batch_into(ctx, &v_states, &ones, rms_norm_eps, &mut v_normed);
+    v_normed.hidden_dim = kv_dim;
+    v_normed.seq_len = seq_len;
+    Ok(v_normed)
+}
+
+/// Everything downstream of attention — o_proj through the `layer_scalar`
+/// multiply (applied after both residual adds, not either branch) — is
+/// identical for both layer kinds; one implementation keeps the two
+/// forwards' numerics from drifting apart.
+pub(crate) fn attention_epilogue(
+    ctx: &DeviceContext,
+    layer: &Gemma4Layer,
+    geom: &LayerGeometry,
+    x: &HiddenStates,
+    attn: &HiddenStates,
+) -> Result<HiddenStates> {
+    let seq_len = x.seq_len;
+    let mut attn_proj = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::gemm_rows_into_checked(
+        ctx,
+        &layer.attention.o_proj,
+        0,
+        geom.hidden_size,
+        attn,
+        &mut attn_proj,
+    )?;
+    let mut o_normed = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::rms_norm_batch_into(
+        ctx,
+        &attn_proj,
+        &layer.post_attention_layernorm,
+        geom.rms_norm_eps,
+        &mut o_normed,
+    );
+    let mut h2 = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::add_batch_into(ctx, x, &o_normed, &mut h2)?;
+
+    let mut mlp_in = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::rms_norm_batch_into(
+        ctx,
+        &h2,
+        &layer.pre_feedforward_layernorm,
+        geom.rms_norm_eps,
+        &mut mlp_in,
+    );
+    let mut gate = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
+    let mut up = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
+    ops::gemm_rows_into_checked(
+        ctx,
+        &layer.mlp.gate,
+        0,
+        geom.intermediate_size,
+        &mlp_in,
+        &mut gate,
+    )?;
+    ops::gemm_rows_into_checked(
+        ctx,
+        &layer.mlp.up,
+        0,
+        geom.intermediate_size,
+        &mlp_in,
+        &mut up,
+    )?;
+    let mut act = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
+    ops::gelu_tanh_mul_batch_into(ctx, &gate, &up, &mut act)?;
+    let mut down = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::gemm_rows_into_checked(ctx, &layer.mlp.down, 0, geom.hidden_size, &act, &mut down)?;
+    let mut down_normed = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::rms_norm_batch_into(
+        ctx,
+        &down,
+        &layer.post_feedforward_layernorm,
+        geom.rms_norm_eps,
+        &mut down_normed,
+    );
+
+    let mut out = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::add_batch_into(ctx, &h2, &down_normed, &mut out)?;
+    ops::scale_bf16_in_place(ctx, &mut out, layer.layer_scalar)?;
+
+    Ok(out)
+}
+
 /// Runs one local layer on `x` (`[hidden_size, seq_len]`), tokens at
 /// positions `start_pos..start_pos + seq_len`. Buffers are allocated per
 /// call: this is the correctness building block, and the executor that would
@@ -81,7 +253,7 @@ fn nhd_to_hnd(
 pub(crate) fn local_layer_forward(
     ctx: &DeviceContext,
     layer: &Gemma4Layer,
-    geom: &LocalLayerGeometry,
+    geom: &LayerGeometry,
     x: &HiddenStates,
     start_pos: usize,
     sliding_window: usize,
@@ -173,18 +345,13 @@ pub(crate) fn local_layer_forward(
         geom.rms_norm_eps,
     )?;
 
-    // v_norm is weightless (`with_scale=False`): a plain-w RMS norm with a
-    // ones weight is the same arithmetic. The `[kv_dim, seq_len]` buffer is
-    // reinterpreted as `[head_dim, seq_len * num_kv_heads]` — heads are
-    // contiguous within each token row, so the narrower row width makes the
-    // reduction per (token, head) — then the shape is restored.
-    let ones = DeviceVec::from_host(ctx, &vec![bf16::from_f32(1.0); geom.head_dim])?;
-    v_states.hidden_dim = geom.head_dim;
-    v_states.seq_len = seq_len * geom.num_kv_heads;
-    let mut v_normed = HiddenStates::zeros(ctx, geom.head_dim, seq_len * geom.num_kv_heads)?;
-    ops::rms_norm_batch_into(ctx, &v_states, &ones, geom.rms_norm_eps, &mut v_normed);
-    v_normed.hidden_dim = kv_dim;
-    v_normed.seq_len = seq_len;
+    let v_normed = weightless_value_norm(
+        ctx,
+        v_states,
+        geom.num_kv_heads,
+        geom.head_dim,
+        geom.rms_norm_eps,
+    )?;
 
     // single_prefill's contiguous cache is HND — k[head, pos, dim] — while
     // the prep and the GEMMs emit token-major rows, so K and V are
@@ -210,77 +377,154 @@ pub(crate) fn local_layer_forward(
         1.0,
     )?;
 
-    let mut attn_proj = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::gemm_rows_into_checked(
-        ctx,
-        &layer.attention.o_proj,
-        0,
-        geom.hidden_size,
-        &attn,
-        &mut attn_proj,
-    )?;
-    let mut o_normed = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::rms_norm_batch_into(
-        ctx,
-        &attn_proj,
-        &layer.post_attention_layernorm,
-        geom.rms_norm_eps,
-        &mut o_normed,
-    );
-    let mut h2 = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::add_batch_into(ctx, x, &o_normed, &mut h2)?;
-
-    let mut mlp_in = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::rms_norm_batch_into(
-        ctx,
-        &h2,
-        &layer.pre_feedforward_layernorm,
-        geom.rms_norm_eps,
-        &mut mlp_in,
-    );
-    let mut gate = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
-    let mut up = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
-    ops::gemm_rows_into_checked(
-        ctx,
-        &layer.mlp.gate,
-        0,
-        geom.intermediate_size,
-        &mlp_in,
-        &mut gate,
-    )?;
-    ops::gemm_rows_into_checked(
-        ctx,
-        &layer.mlp.up,
-        0,
-        geom.intermediate_size,
-        &mlp_in,
-        &mut up,
-    )?;
-    let mut act = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
-    ops::gelu_tanh_mul_batch_into(ctx, &gate, &up, &mut act)?;
-    let mut down = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::gemm_rows_into_checked(ctx, &layer.mlp.down, 0, geom.hidden_size, &act, &mut down)?;
-    let mut down_normed = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::rms_norm_batch_into(
-        ctx,
-        &down,
-        &layer.post_feedforward_layernorm,
-        geom.rms_norm_eps,
-        &mut down_normed,
-    );
-
-    let mut out = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::add_batch_into(ctx, &h2, &down_normed, &mut out)?;
-
-    // layer_scalar multiplies the layer output after both residual adds —
-    // not either branch.
-    ops::scale_bf16_in_place(ctx, &mut out, layer.layer_scalar)?;
-
-    Ok(out)
+    attention_epilogue(ctx, layer, geom, x, &attn)
 }
 
-/// The oracle: replay the HF golden fixture's local-layer probes through
-/// this layer implementation on the real checkpoint. See
+/// Runs one global (full-attention) layer on `x`; same per-call-buffer probe
+/// form as [`local_layer_forward`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn global_layer_forward(
+    ctx: &DeviceContext,
+    layer: &Gemma4Layer,
+    geom: &LayerGeometry,
+    x: &HiddenStates,
+    start_pos: usize,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    cos_max_pos: usize,
+) -> Result<HiddenStates> {
+    let seq_len = x.seq_len;
+    anyhow::ensure!(
+        start_pos == 0,
+        "global_layer_forward is prefill-from-zero only; start_pos {start_pos} needs a KV cache"
+    );
+    anyhow::ensure!(
+        start_pos
+            .checked_add(seq_len)
+            .is_some_and(|end| end <= cos_max_pos),
+        "global layer positions {start_pos}..{start_pos}+{seq_len} exceed the rope table's \
+         cos_max_pos {cos_max_pos}; the prep kernel traps on out-of-range positions"
+    );
+    let q_dim = geom.num_q_heads * geom.head_dim;
+    let kv_dim = geom.num_kv_heads * geom.head_dim;
+    anyhow::ensure!(
+        x.hidden_dim == geom.hidden_size,
+        "global layer x.hidden_dim {} != hidden_size {}",
+        x.hidden_dim,
+        geom.hidden_size
+    );
+    anyhow::ensure!(
+        geom.head_dim == 512,
+        "global layer head_dim {} != 512, which the prep kernel is instantiated at",
+        geom.head_dim
+    );
+    anyhow::ensure!(
+        layer.attention.v_proj.is_none(),
+        "global layer must not carry a v_proj; the checkpoint ships its \
+         full_attention layers without one"
+    );
+
+    let mut normed_x = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::rms_norm_batch_into(
+        ctx,
+        x,
+        &layer.input_layernorm,
+        geom.rms_norm_eps,
+        &mut normed_x,
+    );
+
+    let mut q_states = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+    let mut k_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
+    ops::gemm_rows_into_checked(
+        ctx,
+        &layer.attention.q_proj,
+        0,
+        q_dim,
+        &normed_x,
+        &mut q_states,
+    )?;
+    ops::gemm_rows_into_checked(
+        ctx,
+        &layer.attention.k_proj,
+        0,
+        kv_dim,
+        &normed_x,
+        &mut k_states,
+    )?;
+
+    // The K=V fork: value is k_proj's raw output, copied BEFORE k_norm and
+    // RoPE touch K — a runtime fork of the projection, not shared storage;
+    // after the norms the two tensors differ bitwise.
+    let mut v_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
+    ctx.stream
+        .memcpy_dtod(&k_states.data, &mut v_states.data)
+        .map_err(|e| anyhow::anyhow!("global layer V fork copy failed: {e}"))?;
+
+    // Norm + rotate Q and K. The decode-shaped prep entry is the contiguous
+    // one (its prefill sibling writes a paged pool); positions are the
+    // explicit per-token array it expects. rotary_dim is the FULL head — the
+    // proportional tables carry the partiality (see the table builder).
+    let positions: Vec<i32> = (0..seq_len)
+        .map(|t| {
+            i32::try_from(start_pos + t)
+                .map_err(|_| anyhow::anyhow!("position {} does not fit i32", start_pos + t))
+        })
+        .collect::<Result<_>>()?;
+    let positions_d = ctx
+        .stream
+        .clone_htod(&positions)
+        .map_err(|e| anyhow::anyhow!("positions H2D failed: {e}"))?;
+    let mut q_prep = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+    ops::qk_norm_partial_rope_batched_decode_hd512_into(
+        ctx,
+        &q_states,
+        &mut q_prep,
+        &mut k_states,
+        &layer.attention.q_norm,
+        &layer.attention.k_norm,
+        cos_cache,
+        sin_cache,
+        &positions_d,
+        cos_max_pos,
+        geom.num_q_heads,
+        geom.num_kv_heads,
+        geom.head_dim,
+        geom.rms_norm_eps,
+    )?;
+
+    let v_normed = weightless_value_norm(
+        ctx,
+        v_states,
+        geom.num_kv_heads,
+        geom.head_dim,
+        geom.rms_norm_eps,
+    )?;
+
+    // single_prefill_hd512 reads HND; reassemble per head (at one KV head
+    // this is a plain copy, but the layout contract stays explicit).
+    let k_hnd = nhd_to_hnd(ctx, &k_states, geom.num_kv_heads, geom.head_dim)?;
+    let v_hnd = nhd_to_hnd(ctx, &v_normed, geom.num_kv_heads, geom.head_dim)?;
+
+    let mut attn = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+    ops::single_prefill_hd512_into(
+        ctx,
+        &q_prep,
+        0,
+        seq_len,
+        &k_hnd,
+        &v_hnd,
+        &mut attn,
+        geom.num_q_heads,
+        geom.num_kv_heads,
+        seq_len,
+        1.0,
+    )?;
+
+    attention_epilogue(ctx, layer, geom, x, &attn)
+}
+
+/// The oracle: replay the HF golden fixture's layer probes through this
+/// implementation on the real checkpoint. See
 /// `docs/models/gemma4/hf-golden.md` for what the fixture pins.
 #[cfg(test)]
 #[path = "layer_oracle.rs"]
