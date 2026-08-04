@@ -21,12 +21,41 @@ use crate::layer::global_layer_forward;
 use crate::layer::local_layer_forward;
 use crate::weights::Gemma4Weights;
 
+const MULTIMODAL_PLACEHOLDER_IDS: [u32; 6] = [255_999, 256_000, 258_880, 258_881, 258_882, 258_883];
+
 /// The embedding multiplier is the bf16 rounding of `sqrt(hidden_size)` —
 /// the reference casts the scale buffer to the weight dtype before the
 /// multiply, so at hidden 3840 this is exactly 62.0, not 61.9677, and the
 /// 5.2e-4 relative gap is far too large to pass off as accumulation noise.
 pub(crate) fn embed_scale_bf16(hidden_size: usize) -> f32 {
     bf16::from_f32((hidden_size as f32).sqrt()).to_f32()
+}
+
+/// Validate host token ids before the text-only embedding kernel, which has
+/// neither bounds checks nor a multimodal embedder.
+pub(crate) fn validate_tokens(
+    weights: &Gemma4Weights,
+    hidden_size: usize,
+    tokens: &[u32],
+) -> Result<()> {
+    let vocab_size = weights.embed_tokens.rows;
+    anyhow::ensure!(
+        weights.embed_tokens.cols == hidden_size,
+        "embedding width {} != config hidden_size {hidden_size}",
+        weights.embed_tokens.cols
+    );
+    for (position, &token) in tokens.iter().enumerate() {
+        anyhow::ensure!(
+            !MULTIMODAL_PLACEHOLDER_IDS.contains(&token),
+            "text-only Gemma 4 cannot embed multimodal placeholder token {token} \
+             at position {position}"
+        );
+        anyhow::ensure!(
+            (token as usize) < vocab_size,
+            "token {token} at position {position} is outside the embedding's {vocab_size} rows"
+        );
+    }
+    Ok(())
 }
 
 /// Runs the full text tower over `tokens` at positions `0..len`, returning
@@ -48,21 +77,7 @@ pub(crate) fn full_forward(
         seq_len <= cos_max_pos,
         "full forward seq_len {seq_len} exceeds the rope tables' {cos_max_pos} rows"
     );
-    // The embedding kernel writes `embed.cols` per row and reads row
-    // `token`, validating neither.
-    let vocab_size = weights.embed_tokens.rows;
-    anyhow::ensure!(
-        weights.embed_tokens.cols == config.hidden_size,
-        "embedding width {} != config hidden_size {}",
-        weights.embed_tokens.cols,
-        config.hidden_size
-    );
-    for (position, &token) in tokens.iter().enumerate() {
-        anyhow::ensure!(
-            (token as usize) < vocab_size,
-            "token {token} at position {position} is outside the embedding's {vocab_size} rows"
-        );
-    }
+    validate_tokens(weights, config.hidden_size, tokens)?;
 
     let ids = ctx
         .stream
@@ -99,16 +114,30 @@ pub(crate) fn full_forward(
         };
     }
 
-    let mut normed = HiddenStates::zeros(ctx, config.hidden_size, seq_len)?;
-    ops::rms_norm_batch_into(
+    logits_tail(
         ctx,
+        weights,
         &hidden,
-        &weights.norm,
         config.rms_norm_eps,
-        &mut normed,
-    );
+        config.final_logit_softcapping,
+    )
+}
+
+/// Shared with the KV-backed serving path, which runs it over whichever rows
+/// it needs logits for.
+pub(crate) fn logits_tail(
+    ctx: &DeviceContext,
+    weights: &Gemma4Weights,
+    hidden: &HiddenStates,
+    rms_norm_eps: f32,
+    final_logit_softcapping: f32,
+) -> Result<HiddenStates> {
+    let seq_len = hidden.seq_len;
+    let mut normed = HiddenStates::zeros(ctx, hidden.hidden_dim, seq_len)?;
+    ops::rms_norm_batch_into(ctx, hidden, &weights.norm, rms_norm_eps, &mut normed);
 
     // Tied embeddings: the LM head is the embedding matrix itself.
+    let vocab_size = weights.embed_tokens.rows;
     let mut logits = HiddenStates::zeros(ctx, vocab_size, seq_len)?;
     ops::gemm_rows_into_checked(
         ctx,
@@ -118,7 +147,7 @@ pub(crate) fn full_forward(
         &normed,
         &mut logits,
     )?;
-    ops::softcap_bf16_in_place(ctx, &mut logits, config.final_logit_softcapping)?;
+    ops::softcap_bf16_in_place(ctx, &mut logits, final_logit_softcapping)?;
 
     Ok(logits)
 }

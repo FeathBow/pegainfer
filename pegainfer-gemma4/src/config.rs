@@ -31,6 +31,9 @@ pub(crate) fn first_last(layer_types: &[LayerKind], kind: LayerKind) -> Option<(
 /// What the manifest is derived from. Only [`Gemma4Config::from_file`] is
 /// probe-backed; a value built directly is not, so consumers check what they
 /// depend on.
+// The serving path reads every field; a featureless build compiles the config
+// with that consumer cfg'd out.
+#[cfg_attr(not(feature = "gemma4"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct Gemma4Config {
     pub(crate) hidden_size: usize,
@@ -46,25 +49,17 @@ pub(crate) struct Gemma4Config {
     pub(crate) tie_word_embeddings: bool,
     /// The MoE size keeps its dense MLP and adds experts alongside it.
     pub(crate) moe_enabled: bool,
-    // Not manifest inputs: until a serving path lands, only the oracle reads
-    // these.
-    #[allow(dead_code)]
     pub(crate) rms_norm_eps: f32,
     /// The sliding-attention rope theta; the global family reads its own.
-    #[allow(dead_code)]
     pub(crate) sliding_rope_theta: f32,
-    #[allow(dead_code)]
     pub(crate) sliding_window: usize,
-    #[allow(dead_code)]
     pub(crate) global_rope_theta: f32,
     /// `partial_rotary_factor * global_head_dim`, validated to land on a
     /// positive even width within the head — the active band of the
     /// proportional rope tables.
-    #[allow(dead_code)]
     pub(crate) global_rotary_dim: usize,
     /// Applied as `cap * tanh(x / cap)` over the final logits; every
     /// published size declares one.
-    #[allow(dead_code)]
     pub(crate) final_logit_softcapping: f32,
 }
 

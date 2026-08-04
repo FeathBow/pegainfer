@@ -127,6 +127,13 @@ impl KvPool {
         &self.inner.layout
     }
 
+    /// Every state in this pool is a view into this one buffer, so an
+    /// executor can hold the pool and take page metadata from a plan rather
+    /// than from a request's state.
+    pub fn buffer(&self) -> &CudaSlice<bf16> {
+        &self.inner.buffer
+    }
+
     pub fn capacity_pages(&self) -> usize {
         self.inner.pool.capacity_pages()
     }
@@ -139,6 +146,23 @@ impl KvPool {
     pub fn padding_page_id(&self) -> i32 {
         self.inner.padding_permit.pages()[0].index() as i32
     }
+
+    /// The schedule half of an atomic multi-pool admission: reserve from
+    /// every pool first, commit only when all reservations hold, and let a
+    /// failure roll the rest back by drop. Growing a request's own permit
+    /// instead cannot be undone.
+    pub fn try_reserve(&self, pages: usize) -> Option<KvReservation> {
+        self.inner
+            .pool
+            .try_acquire_many(pages)
+            .map(|permit| KvReservation { permit })
+    }
+}
+
+/// Returns its pages on drop unless committed via
+/// [`KvState::commit_reservation`].
+pub struct KvReservation {
+    permit: OwnedPagePermit,
 }
 
 /// Per-request KV state. Parallels `RecurrentState` for linear attention.
@@ -155,22 +179,22 @@ fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
 }
 
+fn last_page_len_for(token_count: usize, page_size: usize) -> usize {
+    if token_count == 0 {
+        0
+    } else {
+        let rem = token_count % page_size;
+        if rem == 0 { page_size } else { rem }
+    }
+}
+
 impl KvState {
     pub fn seq_len(&self) -> usize {
         self.seq_len
     }
 
     pub fn last_page_len(&self) -> usize {
-        if self.seq_len == 0 {
-            0
-        } else {
-            let rem = self.seq_len % self.pool.inner.layout.page_size;
-            if rem == 0 {
-                self.pool.inner.layout.page_size
-            } else {
-                rem
-            }
-        }
+        last_page_len_for(self.seq_len, self.pool.inner.layout.page_size)
     }
 
     /// Page indices as i32 for GPU upload.
@@ -184,6 +208,12 @@ impl KvState {
 
     pub fn buffer(&self) -> &CudaSlice<bf16> {
         &self.pool.inner.buffer
+    }
+
+    /// Page ids only mean something against the pool that issued them, so an
+    /// executor holding a pool must check before indexing its buffer.
+    pub fn belongs_to(&self, pool: &KvPool) -> bool {
+        std::sync::Arc::ptr_eq(&self.pool.inner, &pool.inner)
     }
 
     pub fn layout(&self) -> &KvLayout {
@@ -207,17 +237,38 @@ impl KvState {
         Ok(())
     }
 
-    /// Advance sequence length after writing tokens.
+    pub fn held_pages(&self) -> usize {
+        self.permit.len()
+    }
+
+    /// The apply half of an atomic multi-pool admission. The reservation must
+    /// come from this state's pool, which the permit merge enforces.
+    pub fn commit_reservation(&mut self, reservation: KvReservation) {
+        self.permit.absorb(reservation.permit);
+    }
+
     pub fn advance(&mut self, count: usize) {
         self.seq_len += count;
     }
 
-    /// Build kernel-facing metadata for this request's KV.
     pub fn desc(&self) -> KvDesc<'_> {
         KvDesc {
             pages: self.permit.pages(),
             last_page_len: self.last_page_len(),
         }
+    }
+
+    pub fn desc_for_len(&self, seq_len: usize) -> Result<KvDesc<'_>> {
+        let held = self.permit.len();
+        let needed = pages_needed(seq_len, self.pool.inner.layout.page_size);
+        anyhow::ensure!(
+            held == needed,
+            "KvState holds {held} pages where {seq_len} tokens need exactly {needed}"
+        );
+        Ok(KvDesc {
+            pages: self.permit.pages(),
+            last_page_len: last_page_len_for(seq_len, self.pool.inner.layout.page_size),
+        })
     }
 
     /// Reset for a new request: return all pages, zero seq_len.

@@ -1,0 +1,487 @@
+//! KV-backed serving forward: two KV families, short-context prefill and
+//! decode, and atomic dual-pool admission.
+//!
+//! The layer forwards take a `GemmaStepPlan` and the pools this module owns,
+//! never a request's state. Both coordinate systems (absolute positions for
+//! RoPE, cache-relative slots for the paged scatter) coincide below the
+//! sliding window, and this module asserts it stays there: crossing the
+//! window belongs to the eviction work, not here.
+//!
+//! Decode runs the prefill entries with seq_len 1 — correct, not
+//! decode-optimal. Attention reads are read-only entries (the prep kernels own the
+//! pool writes) with sm_scale 1.0 (Gemma 4 runs unscaled attention) and
+//! window_left already passed through.
+
+use anyhow::Context as AnyhowContext;
+use anyhow::Result;
+use pegainfer_core::kv_pool::KvPool;
+use pegainfer_core::ops;
+use pegainfer_core::ops::PrefillPagedPlan;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::tensor::DeviceContext;
+use pegainfer_core::tensor::DeviceVec;
+use pegainfer_core::tensor::HiddenStates;
+
+use crate::config::LayerKind;
+use crate::forward::embed_scale_bf16;
+use crate::forward::logits_tail;
+use crate::forward::validate_tokens;
+use crate::kv::GemmaKv;
+use crate::kv::PAGE_SIZE;
+use crate::layer::LayerGeometry;
+use crate::layer::attention_epilogue;
+use crate::layer::build_proportional_rope_tables;
+use crate::weights::Gemma4Layer;
+use crate::weights::Gemma4Weights;
+
+/// Which logits the caller wants materialized from a step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogitsSpan {
+    LastRow,
+    All,
+}
+
+/// One step's plan: the layer forwards consume this and nothing
+/// else. Both families' attention plans are built over the same token span.
+pub(crate) struct GemmaStepPlan {
+    pub(crate) start_pos: usize,
+    pub(crate) seq_len: usize,
+    local_plan: PrefillPagedPlan,
+    global_plan: PrefillPagedPlan,
+}
+
+/// Everything a serving step needs that outlives requests.
+pub(crate) struct GemmaServe {
+    /// The weights these pools, rope tables and layer numbering were built
+    /// for. Holding them is what makes a step's model identity structural:
+    /// KV pages written under one checkpoint are meaningless under another.
+    weights: Gemma4Weights,
+    pub(crate) local_pool: KvPool,
+    pub(crate) global_pool: KvPool,
+    local_geom: LayerGeometry,
+    global_geom: LayerGeometry,
+    sliding_window: usize,
+    final_logit_softcapping: f32,
+    sliding_cos: DeviceVec,
+    sliding_sin: DeviceVec,
+    global_cos: DeviceVec,
+    global_sin: DeviceVec,
+    cos_max_pos: usize,
+    /// Model layer index -> index within its family's pool layer axis.
+    family_index: Vec<usize>,
+}
+
+impl GemmaServe {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        weights: Gemma4Weights,
+        max_context: usize,
+        local_pages: usize,
+        global_pages: usize,
+    ) -> Result<Self> {
+        // One source of truth for geometry, rope tables and layer numbering.
+        let config = &weights.config;
+        let device_ordinal = ctx.device_ordinal;
+        // One tensor answers for the set: the loader materializes every
+        // weight through a single context.
+        let weights_ordinal = weights.embed_tokens.data.ordinal();
+        anyhow::ensure!(
+            weights_ordinal == device_ordinal,
+            "weights live on device {weights_ordinal} but this context \
+             allocates on device {device_ordinal}"
+        );
+        let (mut locals, mut globals) = (0usize, 0usize);
+        let family_index = config
+            .layer_types
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Sliding => {
+                    locals += 1;
+                    locals - 1
+                }
+                LayerKind::Global => {
+                    globals += 1;
+                    globals - 1
+                }
+            })
+            .collect();
+        let local_pool = KvPool::new(
+            ctx,
+            locals,
+            config.num_key_value_heads,
+            config.head_dim,
+            PAGE_SIZE,
+            local_pages,
+        )?;
+        let global_pool = KvPool::new(
+            ctx,
+            globals,
+            config.num_global_key_value_heads,
+            config.global_head_dim,
+            PAGE_SIZE,
+            global_pages,
+        )?;
+        let local_geom = LayerGeometry::local_of(config);
+        let global_geom = LayerGeometry::global_of(config);
+        let (sliding_cos, sliding_sin) = pegainfer_core::rope::precompute_rope(
+            ctx,
+            &RopeTableSpec {
+                rotary_dim: local_geom.head_dim,
+                frequency_dim: local_geom.head_dim,
+                max_seq_len: max_context,
+                theta: config.sliding_rope_theta,
+            },
+        )?;
+        let (global_cos, global_sin) = build_proportional_rope_tables(
+            ctx,
+            config.global_rope_theta,
+            global_geom.head_dim,
+            config.global_rotary_dim,
+            max_context,
+        )?;
+        let (sliding_window, final_logit_softcapping) =
+            (config.sliding_window, config.final_logit_softcapping);
+        Ok(Self {
+            weights,
+            local_pool,
+            global_pool,
+            local_geom,
+            global_geom,
+            sliding_window,
+            final_logit_softcapping,
+            sliding_cos,
+            sliding_sin,
+            global_cos,
+            global_sin,
+            cos_max_pos: max_context,
+            family_index,
+        })
+    }
+
+    pub(crate) fn alloc_kv(&self) -> GemmaKv {
+        GemmaKv {
+            local: self.local_pool.alloc(),
+            global: self.global_pool.alloc(),
+            local_resident_origin: 0,
+        }
+    }
+
+    fn check_step_bounds(&self, kv: &GemmaKv, kv_len: usize) -> Result<()> {
+        anyhow::ensure!(
+            kv.local.seq_len() == kv.global.seq_len(),
+            "the two families' frontiers diverged: local {} global {}",
+            kv.local.seq_len(),
+            kv.global.seq_len()
+        );
+        for (family, state, pool) in [
+            ("local", &kv.local, &self.local_pool),
+            ("global", &kv.global, &self.global_pool),
+        ] {
+            anyhow::ensure!(
+                state.belongs_to(pool),
+                "{family} KV state came from another pool; its page ids do not \
+                 address this one's buffer"
+            );
+        }
+        anyhow::ensure!(
+            kv.local_resident_origin == 0,
+            "this path requires resident_origin 0; a moved window is not supported yet"
+        );
+        anyhow::ensure!(
+            kv_len <= self.sliding_window,
+            "fail-closed at the sliding window: kv_len {kv_len} > {}",
+            self.sliding_window
+        );
+        anyhow::ensure!(
+            kv_len <= self.cos_max_pos,
+            "kv_len {kv_len} exceeds rope tables' {} rows",
+            self.cos_max_pos
+        );
+        Ok(())
+    }
+
+    fn plan_step(
+        &self,
+        ctx: &DeviceContext,
+        kv: &GemmaKv,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<GemmaStepPlan> {
+        let kv_len = start_pos + seq_len;
+        let local_desc = kv.local.desc_for_len(kv_len)?;
+        let global_desc = kv.global.desc_for_len(kv_len)?;
+        let local_plan = PrefillPagedPlan::new(
+            ctx,
+            &local_desc,
+            start_pos,
+            seq_len,
+            self.local_geom.num_q_heads,
+            self.local_geom.num_kv_heads,
+            self.local_geom.head_dim,
+        )?;
+        let global_plan = PrefillPagedPlan::new(
+            ctx,
+            &global_desc,
+            start_pos,
+            seq_len,
+            self.global_geom.num_q_heads,
+            self.global_geom.num_kv_heads,
+            self.global_geom.head_dim,
+        )?;
+        Ok(GemmaStepPlan {
+            start_pos,
+            seq_len,
+            local_plan,
+            global_plan,
+        })
+    }
+
+    fn local_layer_serve(
+        &self,
+        ctx: &DeviceContext,
+        layer: &Gemma4Layer,
+        family_layer: usize,
+        x: &HiddenStates,
+        plan: &GemmaStepPlan,
+    ) -> Result<HiddenStates> {
+        let geom = &self.local_geom;
+        let seq_len = plan.seq_len;
+        let q_dim = geom.num_q_heads * geom.head_dim;
+        let kv_dim = geom.num_kv_heads * geom.head_dim;
+        let v_proj = layer
+            .attention
+            .v_proj
+            .as_ref()
+            .context("local layer requires v_proj")?;
+
+        let mut normed_x = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+        ops::rms_norm_batch_into(
+            ctx,
+            x,
+            &layer.input_layernorm,
+            geom.rms_norm_eps,
+            &mut normed_x,
+        );
+        let mut q_states = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+        let mut k_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
+        let mut v_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
+        ops::gemm_rows_into_checked(
+            ctx,
+            &layer.attention.q_proj,
+            0,
+            q_dim,
+            &normed_x,
+            &mut q_states,
+        )?;
+        ops::gemm_rows_into_checked(
+            ctx,
+            &layer.attention.k_proj,
+            0,
+            kv_dim,
+            &normed_x,
+            &mut k_states,
+        )?;
+        ops::gemm_rows_into_checked(ctx, v_proj, 0, kv_dim, &normed_x, &mut v_states)?;
+
+        let mut q_prep = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+        ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
+            ctx,
+            &q_states,
+            &k_states,
+            &v_states,
+            &mut q_prep,
+            self.local_pool.buffer(),
+            &self.local_pool.layout().kernel_layout(),
+            &layer.attention.q_norm,
+            &layer.attention.k_norm,
+            &self.sliding_cos,
+            &self.sliding_sin,
+            family_layer,
+            plan.local_plan.page_indices_d(),
+            plan.start_pos,
+            self.cos_max_pos,
+            geom.num_q_heads,
+            geom.num_kv_heads,
+            geom.head_dim,
+            geom.rms_norm_eps,
+        )?;
+
+        let mut attn = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+        let window_left = i32::try_from(self.sliding_window - 1).expect("window fits i32");
+        ops::batch_prefill_paged_window_hd256_into(
+            ctx,
+            &q_prep,
+            self.local_pool.buffer(),
+            &self.local_pool.layout().kernel_layout(),
+            family_layer,
+            &plan.local_plan,
+            &mut attn,
+            geom.num_q_heads,
+            1.0,
+            window_left,
+        )?;
+        attention_epilogue(ctx, layer, geom, x, &attn)
+    }
+
+    fn global_layer_serve(
+        &self,
+        ctx: &DeviceContext,
+        layer: &Gemma4Layer,
+        family_layer: usize,
+        x: &HiddenStates,
+        plan: &GemmaStepPlan,
+    ) -> Result<HiddenStates> {
+        let geom = &self.global_geom;
+        let seq_len = plan.seq_len;
+        let q_dim = geom.num_q_heads * geom.head_dim;
+        let kv_dim = geom.num_kv_heads * geom.head_dim;
+        anyhow::ensure!(
+            layer.attention.v_proj.is_none(),
+            "global layer must not carry a v_proj; V is the k_proj fork"
+        );
+
+        let mut normed_x = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+        ops::rms_norm_batch_into(
+            ctx,
+            x,
+            &layer.input_layernorm,
+            geom.rms_norm_eps,
+            &mut normed_x,
+        );
+        let mut q_states = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+        let mut k_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
+        ops::gemm_rows_into_checked(
+            ctx,
+            &layer.attention.q_proj,
+            0,
+            q_dim,
+            &normed_x,
+            &mut q_states,
+        )?;
+        ops::gemm_rows_into_checked(
+            ctx,
+            &layer.attention.k_proj,
+            0,
+            kv_dim,
+            &normed_x,
+            &mut k_states,
+        )?;
+
+        // The prep writes both K and the weightless-normed V fork from the
+        // one raw K read — no D2D fork copy on the serving path.
+        let mut q_prep = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+        ops::qk_norm_partial_rope_paged_prefill_hd512_into(
+            ctx,
+            &q_states,
+            &k_states,
+            &mut q_prep,
+            self.global_pool.buffer(),
+            &self.global_pool.layout().kernel_layout(),
+            &layer.attention.q_norm,
+            &layer.attention.k_norm,
+            &self.global_cos,
+            &self.global_sin,
+            family_layer,
+            plan.global_plan.page_indices_d(),
+            plan.start_pos,
+            self.cos_max_pos,
+            geom.num_q_heads,
+            geom.num_kv_heads,
+            geom.head_dim,
+            geom.rms_norm_eps,
+        )?;
+
+        let mut attn = HiddenStates::zeros(ctx, q_dim, seq_len)?;
+        ops::batch_prefill_paged_hd512_into(
+            ctx,
+            &q_prep,
+            self.global_pool.buffer(),
+            &self.global_pool.layout().kernel_layout(),
+            family_layer,
+            &plan.global_plan,
+            &mut attn,
+            geom.num_q_heads,
+            1.0,
+        )?;
+        attention_epilogue(ctx, layer, geom, x, &attn)
+    }
+
+    /// One tower step over `tokens` at the current frontier: admission must
+    /// already have granted the pages, and both families advance by the end.
+    pub(crate) fn step(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut GemmaKv,
+        tokens: &[u32],
+        span: LogitsSpan,
+    ) -> Result<HiddenStates> {
+        let seq_len = tokens.len();
+        anyhow::ensure!(seq_len > 0, "step needs at least one token");
+        let weights = &self.weights;
+        anyhow::ensure!(
+            std::sync::Arc::ptr_eq(&ctx.stream, self.local_pool.buffer().stream()),
+            "step must use the DeviceContext stream that constructed this GemmaServe"
+        );
+        validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
+        let start_pos = kv.local.seq_len();
+        self.check_step_bounds(kv, start_pos + seq_len)?;
+        let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
+        log::debug!(
+            "gemma4 step: start_pos {} seq_len {seq_len} pages local {} global {}",
+            plan.start_pos,
+            kv.local.held_pages(),
+            kv.global.held_pages()
+        );
+
+        let ids = ctx
+            .stream
+            .clone_htod(tokens)
+            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
+        let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, seq_len)?;
+        ops::embedding_batch(ctx, &weights.embed_tokens, &ids, &mut hidden)?;
+        ops::scale_bf16_in_place(
+            ctx,
+            &mut hidden,
+            embed_scale_bf16(self.local_geom.hidden_size),
+        )?;
+
+        for (index, kind) in weights.config.layer_types.iter().enumerate() {
+            let layer = &weights.layers[index];
+            let family_layer = self.family_index[index];
+            hidden = match kind {
+                LayerKind::Sliding => {
+                    self.local_layer_serve(ctx, layer, family_layer, &hidden, &plan)?
+                }
+                LayerKind::Global => {
+                    self.global_layer_serve(ctx, layer, family_layer, &hidden, &plan)?
+                }
+            };
+        }
+        // Projecting every prompt row through the 262k LM head materializes
+        // half a gigabyte at this path's 1024-token ceiling, so the full span
+        // is for callers that actually read every position.
+        let mut last_row_slot = None;
+        let head_input = match span {
+            LogitsSpan::All => &hidden,
+            LogitsSpan::LastRow => {
+                let mut last = HiddenStates::zeros(ctx, hidden.hidden_dim, 1)?;
+                ops::copy_hidden_token_range_into(ctx, &hidden, seq_len - 1, &mut last, 0, 1)?;
+                &*last_row_slot.insert(last)
+            }
+        };
+        let logits = logits_tail(
+            ctx,
+            weights,
+            head_input,
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+        )?;
+        kv.local.advance(seq_len);
+        kv.global.advance(seq_len);
+        Ok(logits)
+    }
+}
+
+#[path = "serve_oracle.rs"]
+#[cfg(test)]
+mod oracle;

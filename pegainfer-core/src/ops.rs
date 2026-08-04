@@ -22,6 +22,8 @@ pub use pegainfer_kernels::ops::add_batch;
 pub use pegainfer_kernels::ops::add_batch_into;
 pub use pegainfer_kernels::ops::argmax;
 pub use pegainfer_kernels::ops::argmax_batch_bf16_into;
+pub use pegainfer_kernels::ops::batch_prefill_paged_hd512_into;
+pub use pegainfer_kernels::ops::batch_prefill_paged_window_hd256_into;
 pub use pegainfer_kernels::ops::bf16_hidden_to_f32_into;
 pub use pegainfer_kernels::ops::copy_hidden_rows_into;
 pub use pegainfer_kernels::ops::copy_hidden_token_range_into;
