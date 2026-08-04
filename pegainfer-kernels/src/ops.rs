@@ -31,7 +31,9 @@ pub use attention::paged_attention_batch_decode_via_prefill_hd512_into;
 pub use attention::prefill_attention_paged_into;
 pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
 pub use attention::qk_norm_rope_batch_decode_into;
+pub use attention::qk_norm_rope_prefill_hd256_plain_into;
 pub use attention::single_decode_nhd_into;
+pub use attention::single_prefill_hd256_into;
 pub use attention::single_prefill_hd512_into;
 pub use attention::single_prefill_nhd_causal_into;
 pub use attention::single_prefill_nhd_noncausal_into;
@@ -84,8 +86,10 @@ pub use elementwise::extract_vec_ref;
 pub use elementwise::extract_vec_ref_into;
 pub use elementwise::f32_to_bf16_hidden_into;
 pub use elementwise::gather_hidden_tokens_into;
+pub use elementwise::gelu_tanh_mul_batch_into;
 pub use elementwise::mask_position_zero_rows_into;
 pub use elementwise::repeat_f32_for_reduce_scatter_into;
+pub use elementwise::scale_bf16_in_place;
 pub use elementwise::scale_f32_in_place;
 pub use elementwise::scaled_add_batch_into;
 pub use elementwise::scaled_add_rows_indexed_into;
@@ -159,6 +163,10 @@ pub use sampling::gpu_sample_batch_into;
 pub use sampling::logprob_topk_batch_bf16_into;
 pub use sampling::markov_step_argmax_into;
 pub use sampling::markov_step_argmax_partials_len;
+
+pub(crate) fn checked_i32(value: usize, what: &str) -> anyhow::Result<i32> {
+    i32::try_from(value).map_err(|_| anyhow::anyhow!("{what} {value} does not fit i32"))
+}
 
 /// Calling thread's last FFI exception message, ready to append to an error;
 /// empty unless `result` is the -1 sentinel set by the C++ guard. Public for

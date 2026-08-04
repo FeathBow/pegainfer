@@ -475,6 +475,27 @@ impl HiddenStates {
         }
     }
 
+    /// Logical extent `hidden_dim * seq_len`, checked to fit the backing
+    /// allocation (`>=`, not `==`: buffers allocate at a max and rewrite
+    /// `seq_len` to the active size per step). Fields are public, so a safe
+    /// caller can shape a logical size past the backing; launch wrappers
+    /// call this to reject that before it reaches a kernel.
+    pub(crate) fn checked_extent(&self, what: &str) -> Result<usize> {
+        let extent = self
+            .hidden_dim
+            .checked_mul(self.seq_len)
+            .ok_or_else(|| anyhow!("{what} logical extent overflow"))?;
+        if self.data.len() < extent {
+            return Err(anyhow!(
+                "{what} backing len {} < hidden_dim {} * seq_len {}",
+                self.data.len(),
+                self.hidden_dim,
+                self.seq_len
+            ));
+        }
+        Ok(extent)
+    }
+
     /// Create zeroed batch
     pub fn zeros(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize) -> Result<Self> {
         let data: CudaSlice<bf16> = ctx

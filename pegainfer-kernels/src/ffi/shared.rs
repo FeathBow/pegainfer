@@ -124,6 +124,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn gelu_tanh_mul_cuda(
+        gate: *const Half,
+        up: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn scale_bf16_in_place_cuda(
+        buf: *mut Half,
+        scale: f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn embedding_batched_cuda(
         embed: *const Half,
         token_ids: *const u32,
@@ -906,6 +921,25 @@ unsafe extern "C" {
 
 }
 
+// hd256 single prefill (qwen35 full-attention layers, Gemma 4 local layers):
+// csrc/shared/paged_attention.cu. K/V are a contiguous HND cache —
+// k[head, pos, dim] with max_seq_len rows per head — not token-major NHD.
+unsafe extern "C" {
+    pub fn single_prefill_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+}
+
 // hd512 (Gemma 4 global layers): csrc/shared/paged_attention_hd512.cu
 unsafe extern "C" {
     pub fn single_prefill_cuda_hd512(
@@ -968,6 +1002,33 @@ unsafe extern "C" {
         padded_batch_size: i32,
         stride_page: i64,
         sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+}
+
+// hd256 plain-w QK-norm + RoPE prep (Gemma 4 local layers):
+// csrc/shared/prefill_attention_hd256_plain.cu. Contract and validation live
+// on the Rust wrapper in ops::attention; the entry returns 0 on success, -1
+// with a diagnostic on failure.
+unsafe extern "C" {
+    // Q and K both land in contiguous buffers shaped like their inputs; there
+    // is no paged pool because no Gemma 4 KV cache consumer exists yet.
+    pub fn qk_norm_rope_prefill_hd256_plain_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        k_batch_out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
         stream: CUstream,
     ) -> i32;
 }

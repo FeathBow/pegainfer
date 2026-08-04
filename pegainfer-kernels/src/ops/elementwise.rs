@@ -861,6 +861,81 @@ pub fn write_vec_into(
     Ok(())
 }
 
+/// Batched GELU-tanh+mul into a pre-allocated output buffer:
+/// `out = gelu_tanh(gate) * up` (Gemma 4 MLP, `gelu_pytorch_tanh`). The
+/// kernel matches HF's op-sequence rounding: activation in f32, cast to
+/// bf16, then multiplied in f32 and rounded once more.
+pub fn gelu_tanh_mul_batch_into(
+    ctx: &DeviceContext,
+    gate: &HiddenStates,
+    up: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    anyhow::ensure!(
+        gate.hidden_dim == up.hidden_dim && gate.seq_len == up.seq_len,
+        "gelu_tanh_mul gate {}x{} != up {}x{}",
+        gate.hidden_dim,
+        gate.seq_len,
+        up.hidden_dim,
+        up.seq_len
+    );
+    anyhow::ensure!(
+        out.hidden_dim == gate.hidden_dim && out.seq_len == gate.seq_len,
+        "gelu_tanh_mul out {}x{} != gate {}x{}",
+        out.hidden_dim,
+        out.seq_len,
+        gate.hidden_dim,
+        gate.seq_len
+    );
+    let n = gate.checked_extent("gelu_tanh_mul gate")?;
+    up.checked_extent("gelu_tanh_mul up")?;
+    out.checked_extent("gelu_tanh_mul out")?;
+    let n = super::checked_i32(n, "gelu_tanh_mul extent")?;
+    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::gelu_tanh_mul_cuda(
+            g_ptr as *const ffi::Half,
+            u_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("gelu_tanh_mul_cuda failed: {e}"))?;
+
+    Ok(())
+}
+
+/// In-place multiply by a host scalar — Gemma 4's per-layer `layer_scalar`,
+/// a `[1]` weight the model reads to the host at load.
+pub fn scale_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, scale: f32) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(anyhow!("scale_bf16_in_place scale must be finite"));
+    }
+    let n = buf.checked_extent("scale_bf16 buf")?;
+    let n = super::checked_i32(n, "scale_bf16 extent")?;
+    let (buf_ptr, _gb) = buf.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::scale_bf16_in_place_cuda(
+            buf_ptr as *mut ffi::Half,
+            scale,
+            n,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("scale_bf16_in_place_cuda failed: {e}"))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use half::bf16;

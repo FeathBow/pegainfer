@@ -273,6 +273,51 @@ __global__ void silu_mul_kernel(
 }
 
 // ============================================================================
+// GELU-tanh-mul from separate gate/up buffers: out = gelu_tanh(gate) * up
+// (Gemma 4 MLP, hidden_activation "gelu_pytorch_tanh" — the tanh
+// approximation, not erf). Matches the HF op sequence rounding: act_fn(gate)
+// materializes a bf16 tensor before the elementwise multiply, so the
+// activation is computed in f32, cast to bf16, then multiplied in f32 and
+// rounded once more.
+// ============================================================================
+
+__global__ void gelu_tanh_mul_kernel(
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ up,
+    __nv_bfloat16 *__restrict__ out,
+    int n) {
+  // sqrt(2/pi), the gelu_pytorch_tanh constant.
+  const float kSqrt2OverPi = 0.7978845608028654f;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+    float inner = kSqrt2OverPi * (g + 0.044715f * g * g * g);
+    float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
+    out[idx] = __float2bfloat16(__bfloat162float(__float2bfloat16(gelu_g)) * u);
+  }
+}
+
+// ============================================================================
+// In-place multiply by a host scalar: buf[i] = bf16(f32(buf[i]) * scale).
+// Serves Gemma 4's per-layer layer_scalar, a [1] weight the model reads to
+// the host at load; f32 compute with a single rounding matches HF's bf16
+// elementwise multiply.
+// ============================================================================
+
+__global__ void scale_bf16_kernel(
+    __nv_bfloat16 *__restrict__ buf,
+    float scale,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    buf[idx] = __float2bfloat16(__bfloat162float(buf[idx]) * scale);
+  }
+}
+
+// ============================================================================
 // Embedding lookup: out = embed[token_id, :]
 // Reads token_id from token_id[0] (CUDA Graph safe).
 // ============================================================================
@@ -646,6 +691,23 @@ CUresult silu_mul_triton_aot_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   silu_mul_kernel<<<grid, block, 0, stream>>>(gate, up, out, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult gelu_tanh_mul_cuda(
+    const __nv_bfloat16 *gate, const __nv_bfloat16 *up,
+    __nv_bfloat16 *out, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = n / block + (n % block != 0);
+  gelu_tanh_mul_kernel<<<grid, block, 0, stream>>>(gate, up, out, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult scale_bf16_in_place_cuda(
+    __nv_bfloat16 *buf, float scale, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = n / block + (n % block != 0);
+  scale_bf16_kernel<<<grid, block, 0, stream>>>(buf, scale, n);
   return (CUresult)cudaGetLastError();
 }
 

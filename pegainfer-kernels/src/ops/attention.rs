@@ -753,27 +753,6 @@ pub fn dflash_qk_norm_rope_into(
     Ok(())
 }
 
-/// Require a capacity-backed `HiddenStates` to physically hold its logical
-/// `hidden_dim * seq_len` extent. Every `HiddenStates` field is public, so a safe
-/// caller can inflate `.seq_len` past the backing allocation; this rejects that
-/// before it reaches the kernel as an out-of-bounds read. `>=` (not `==`) keeps
-/// the capacity-backed convention where buffers are allocated at a max and
-/// `.seq_len` is rewritten to the active size per step (e.g. `batch_decode_buffers`).
-fn ensure_hidden_capacity(t: &HiddenStates, name: &str) -> Result<()> {
-    let extent = t
-        .hidden_dim
-        .checked_mul(t.seq_len)
-        .ok_or_else(|| anyhow::anyhow!("{name} logical extent overflow"))?;
-    anyhow::ensure!(
-        t.data.len() >= extent,
-        "{name} backing len {} < hidden_dim {} * seq_len {}",
-        t.data.len(),
-        t.hidden_dim,
-        t.seq_len
-    );
-    Ok(())
-}
-
 /// Validate a `[offset, offset + span)` row window into `t` and return the byte
 /// offset of `offset`, all with checked arithmetic. Release builds leave
 /// `overflow-checks` off, so an adversarial `offset` (e.g. `usize::MAX`) would
@@ -788,12 +767,24 @@ fn checked_row_offset(t: &HiddenStates, offset: usize, span: usize, name: &str) 
         "{name} row range [{offset}..{end}) exceeds seq_len {}",
         t.seq_len
     );
-    ensure_hidden_capacity(t, name)?;
+    t.checked_extent(name)?;
     let bytes = offset
         .checked_mul(t.hidden_dim)
         .and_then(|elems| elems.checked_mul(std::mem::size_of::<bf16>()))
         .ok_or_else(|| anyhow::anyhow!("{name} byte offset overflow"))?;
     Ok(bytes as u64)
+}
+
+/// `DeviceVec` fields are public too: reject a logical `len` past the backing
+/// allocation before a kernel indexes through it.
+fn ensure_vec_backed(v: &DeviceVec, name: &str) -> Result<()> {
+    anyhow::ensure!(
+        v.data.len() >= v.len,
+        "{name} backing len {} < len {}",
+        v.data.len(),
+        v.len
+    );
+    Ok(())
 }
 
 /// Plain RoPE (no QK-norm) for one EAGLE-3 draft step, because EAGLE-3 has no per-head q/k norm
@@ -818,7 +809,7 @@ pub fn eagle3_rope_into(
     // `q`/`k` are capacity-backed and reachable from safe re-exported code;
     // validate the row window and backing length before deriving raw pointers.
     let q_byte_offset = checked_row_offset(q, q_row_offset, q_seq_len, "eagle3_rope q")?;
-    ensure_hidden_capacity(k, "eagle3_rope k")?;
+    k.checked_extent("eagle3_rope k")?;
     // The kernel indexes both caches with the same `pos * head_dim + d`, and
     // `cos_max_pos` is derived from `cos_cache` alone; a shorter `sin_cache`
     // would let the kernel read out of bounds.
@@ -972,10 +963,10 @@ pub fn single_decode_nhd_into(
     // Shape asserts only relate the public metadata; validate it against the
     // backing allocations too, since safe callers can inflate `.seq_len` past a
     // small buffer (all `HiddenStates` fields are public).
-    ensure_hidden_capacity(q, "single_decode q")?;
-    ensure_hidden_capacity(k_cache, "single_decode k_cache")?;
-    ensure_hidden_capacity(v_cache, "single_decode v_cache")?;
-    ensure_hidden_capacity(output, "single_decode output")?;
+    q.checked_extent("single_decode q")?;
+    k_cache.checked_extent("single_decode k_cache")?;
+    v_cache.checked_extent("single_decode v_cache")?;
+    output.checked_extent("single_decode output")?;
 
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
@@ -1035,9 +1026,9 @@ pub fn single_prefill_nhd_causal_into(
     // Validate the row window with checked arithmetic and every backing
     // allocation before deriving pointers; `q`/`output` share the row sub-range.
     let byte_offset = checked_row_offset(q, row_offset, q_seq_len, "single_prefill_causal q")?;
-    ensure_hidden_capacity(output, "single_prefill_causal output")?;
-    ensure_hidden_capacity(k_cache, "single_prefill_causal k_cache")?;
-    ensure_hidden_capacity(v_cache, "single_prefill_causal v_cache")?;
+    output.checked_extent("single_prefill_causal output")?;
+    k_cache.checked_extent("single_prefill_causal k_cache")?;
+    v_cache.checked_extent("single_prefill_causal v_cache")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let q_ptr = q_ptr + byte_offset;
     let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
@@ -1792,10 +1783,10 @@ pub fn paged_attention_batch_decode_hd512_into(
         "hd512 decode layer {layer} >= layout.num_layers {}",
         layout.num_layers
     );
-    ensure_hidden_capacity(q, "batch_decode_hd512 q")?;
-    ensure_hidden_capacity(output, "batch_decode_hd512 output")?;
-    ensure_hidden_capacity(k, "batch_decode_hd512 k")?;
-    ensure_hidden_capacity(v, "batch_decode_hd512 v")?;
+    q.checked_extent("batch_decode_hd512 q")?;
+    output.checked_extent("batch_decode_hd512 output")?;
+    k.checked_extent("batch_decode_hd512 k")?;
+    v.checked_extent("batch_decode_hd512 v")?;
     let page_size = layout.page_size;
 
     let k_offset = (layer * layout.layer_stride) as i64;
@@ -1914,8 +1905,8 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
         "hd512 decode-via-prefill layer {layer} >= layout.num_layers {}",
         layout.num_layers
     );
-    ensure_hidden_capacity(q, "decode_via_prefill_hd512 q")?;
-    ensure_hidden_capacity(output, "decode_via_prefill_hd512 output")?;
+    q.checked_extent("decode_via_prefill_hd512 q")?;
+    output.checked_extent("decode_via_prefill_hd512 output")?;
     anyhow::ensure!(
         positions_d.len() >= plan.batch_size() as usize,
         "hd512 decode-via-prefill positions_d length {} must be >= plan.batch_size {}",
@@ -1947,8 +1938,8 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
         v.seq_len,
         batch_size
     );
-    ensure_hidden_capacity(k, "decode_via_prefill_hd512 k")?;
-    ensure_hidden_capacity(v, "decode_via_prefill_hd512 v")?;
+    k.checked_extent("decode_via_prefill_hd512 k")?;
+    v.checked_extent("decode_via_prefill_hd512 v")?;
     anyhow::ensure!(
         plan.head_dim == 512,
         "plan built for head_dim {}, expected 512",
@@ -2117,8 +2108,8 @@ pub fn batch_prefill_paged_hd512_into(
         "hd512 prefill layer {layer} >= layout.num_layers {}",
         layout.num_layers
     );
-    ensure_hidden_capacity(q, "batch_prefill_paged_hd512 q")?;
-    ensure_hidden_capacity(output, "batch_prefill_paged_hd512 output")?;
+    q.checked_extent("batch_prefill_paged_hd512 q")?;
+    output.checked_extent("batch_prefill_paged_hd512 output")?;
     anyhow::ensure!(
         plan.head_dim == 512,
         "plan built for head_dim {}, expected 512",
@@ -2241,9 +2232,9 @@ pub fn single_prefill_hd512_into(
         "causal prefill q_seq_len {q_seq_len} exceeds kv_len {kv_len}"
     );
     let byte_offset = checked_row_offset(q, row_offset, q_seq_len, "single_prefill_hd512 q")?;
-    ensure_hidden_capacity(output, "single_prefill_hd512 output")?;
-    ensure_hidden_capacity(k_cache, "single_prefill_hd512 k_cache")?;
-    ensure_hidden_capacity(v_cache, "single_prefill_hd512 v_cache")?;
+    output.checked_extent("single_prefill_hd512 output")?;
+    k_cache.checked_extent("single_prefill_hd512 k_cache")?;
+    v_cache.checked_extent("single_prefill_hd512 v_cache")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let q_ptr = q_ptr + byte_offset;
     let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
@@ -2268,6 +2259,302 @@ pub fn single_prefill_hd512_into(
     if result != 0 {
         anyhow::bail!(
             "single_prefill_cuda_hd512 failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
+/// Plain-w QK RMSNorm + RoPE prep at head_dim 256 (Gemma 4 local layers):
+/// Q and K each land in a contiguous token-major output shaped like its
+/// input. No gate, no V, and the plain weight multiply — not the (1+w)
+/// offset of the qwen35 hd256 sibling. `single_prefill` consumes a
+/// contiguous **HND** cache, so these outputs are reassembled per head
+/// before attention, not fed directly. `rotary_dim` must be positive, even
+/// and <= 256 (launcher-enforced, surfaced here as `Err`); Gemma 4 local
+/// layers pass 256, and a smaller even width keeps the hd512 sibling's
+/// partial-RoPE tail semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_rope_prefill_hd256_plain_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    q_out: &mut HiddenStates,
+    k_out: &mut HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    start_pos: usize,
+    cos_max_pos: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let seq_len = q.seq_len;
+    let q_dim = num_q_heads
+        .checked_mul(256)
+        .ok_or_else(|| anyhow::anyhow!("hd256 plain prep num_q_heads {num_q_heads} overflows"))?;
+    let kv_dim = num_kv_heads
+        .checked_mul(256)
+        .ok_or_else(|| anyhow::anyhow!("hd256 plain prep num_kv_heads {num_kv_heads} overflows"))?;
+    anyhow::ensure!(
+        q.hidden_dim == q_dim,
+        "hd256 plain prep q.hidden_dim {} != num_q_heads {} * 256",
+        q.hidden_dim,
+        num_q_heads
+    );
+    anyhow::ensure!(
+        k.hidden_dim == kv_dim,
+        "hd256 plain prep k.hidden_dim {} != num_kv_heads {} * 256",
+        k.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        q_out.hidden_dim == q.hidden_dim,
+        "hd256 plain prep q_out.hidden_dim {} != q.hidden_dim {}",
+        q_out.hidden_dim,
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        k_out.hidden_dim == k.hidden_dim,
+        "hd256 plain prep k_out.hidden_dim {} != k.hidden_dim {}",
+        k_out.hidden_dim,
+        k.hidden_dim
+    );
+    anyhow::ensure!(
+        k.seq_len == seq_len,
+        "hd256 plain prep k.seq_len {} != q.seq_len {seq_len}",
+        k.seq_len
+    );
+    anyhow::ensure!(
+        q_out.seq_len == seq_len,
+        "hd256 plain prep q_out.seq_len {} != q.seq_len {seq_len}",
+        q_out.seq_len
+    );
+    anyhow::ensure!(
+        k_out.seq_len == seq_len,
+        "hd256 plain prep k_out.seq_len {} != q.seq_len {seq_len}",
+        k_out.seq_len
+    );
+    anyhow::ensure!(
+        q_norm_weight.len == 256,
+        "hd256 plain prep q_norm_weight len {} != 256",
+        q_norm_weight.len
+    );
+    anyhow::ensure!(
+        k_norm_weight.len == 256,
+        "hd256 plain prep k_norm_weight len {} != 256",
+        k_norm_weight.len
+    );
+    let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
+        anyhow::anyhow!("hd256 plain prep start_pos {start_pos} + seq_len {seq_len} overflows")
+    })?;
+    anyhow::ensure!(
+        end_pos <= cos_max_pos,
+        "hd256 plain prep start_pos {start_pos} + seq_len {seq_len} > \
+         cos_max_pos {cos_max_pos}"
+    );
+    let table_len = cos_max_pos.checked_mul(rotary_dim).ok_or_else(|| {
+        anyhow::anyhow!(
+            "hd256 plain prep cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim} overflows"
+        )
+    })?;
+    anyhow::ensure!(
+        cos_cache.len >= table_len,
+        "hd256 plain prep cos_cache len {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        cos_cache.len
+    );
+    anyhow::ensure!(
+        sin_cache.len >= table_len,
+        "hd256 plain prep sin_cache len {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        sin_cache.len
+    );
+    ensure_vec_backed(q_norm_weight, "hd256 plain prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd256 plain prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd256 plain prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd256 plain prep sin_cache")?;
+    // The kernel indexes token-major offsets and `pos * rotary_dim + d` in
+    // i32, so the extents and the rope table extent must fit.
+    let q_extent = q.checked_extent("hd256 plain prep q")?;
+    let k_extent = k.checked_extent("hd256 plain prep k")?;
+    q_out.checked_extent("hd256 plain prep q_out")?;
+    k_out.checked_extent("hd256 plain prep k_out")?;
+    super::checked_i32(q_extent, "hd256 plain prep q extent")?;
+    super::checked_i32(k_extent, "hd256 plain prep k extent")?;
+    super::checked_i32(table_len, "hd256 plain prep rope table extent")?;
+    let num_q_heads = super::checked_i32(num_q_heads, "hd256 plain prep num_q_heads")?;
+    let num_kv_heads = super::checked_i32(num_kv_heads, "hd256 plain prep num_kv_heads")?;
+    let seq_len = super::checked_i32(seq_len, "hd256 plain prep seq_len")?;
+    let start_pos = super::checked_i32(start_pos, "hd256 plain prep start_pos")?;
+    let cos_max_pos = super::checked_i32(cos_max_pos, "hd256 plain prep cos_max_pos")?;
+    let rotary_dim = super::checked_i32(rotary_dim, "hd256 plain prep rotary_dim")?;
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    let (ko_ptr, _gko) = k_out.data.device_ptr_mut(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::qk_norm_rope_prefill_hd256_plain_cuda(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qo_ptr as *mut ffi::Half,
+            ko_ptr as *mut ffi::Half,
+            num_q_heads,
+            num_kv_heads,
+            seq_len,
+            start_pos,
+            cos_max_pos,
+            rotary_dim,
+            rms_eps,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "qk_norm_rope_prefill_hd256_plain_cuda failed with error \
+             {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
+/// Causal single-sequence prefill at head_dim 256 over a contiguous **HND**
+/// K/V cache — `k[head, pos, dim]` with `k_cache.seq_len` allocated rows per
+/// head — matching `single_prefill_cuda_hd256`'s stride contract. Q and the
+/// output stay token-major (`[num_q_heads * 256, seq_len]`).
+///
+/// `sm_scale` is explicit because it is model policy, not geometry: qwen35
+/// wants the conventional `rsqrt(head_dim)`, but Gemma 4 runs unscaled
+/// attention (`scaling = 1.0` in the HF reference), and a hardcoded rsqrt
+/// would silently mis-scale its logits by 16x.
+#[allow(clippy::too_many_arguments)]
+pub fn single_prefill_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    row_offset: usize,
+    q_seq_len: usize,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    kv_len: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "single_prefill_hd256 sm_scale {sm_scale} must be finite"
+    );
+    anyhow::ensure!(
+        num_q_heads > 0 && num_kv_heads > 0 && q_seq_len > 0,
+        "single_prefill_hd256 num_q_heads {num_q_heads}, num_kv_heads \
+         {num_kv_heads} and q_seq_len {q_seq_len} must be positive"
+    );
+    anyhow::ensure!(
+        num_q_heads.is_multiple_of(num_kv_heads)
+            && SUPPORTED_GQA_GROUP_SIZES.contains(&(num_q_heads / num_kv_heads)),
+        "single_prefill_hd256 GQA group {num_q_heads} q / {num_kv_heads} kv \
+         heads not in the instantiated sizes {SUPPORTED_GQA_GROUP_SIZES:?}"
+    );
+    let q_dim = num_q_heads.checked_mul(256).ok_or_else(|| {
+        anyhow::anyhow!("single_prefill_hd256 num_q_heads {num_q_heads} overflows")
+    })?;
+    let kv_dim = num_kv_heads.checked_mul(256).ok_or_else(|| {
+        anyhow::anyhow!("single_prefill_hd256 num_kv_heads {num_kv_heads} overflows")
+    })?;
+    anyhow::ensure!(
+        q.hidden_dim == q_dim,
+        "single_prefill_hd256 q.hidden_dim {} != num_q_heads {} * 256",
+        q.hidden_dim,
+        num_q_heads
+    );
+    anyhow::ensure!(
+        output.hidden_dim == q.hidden_dim && output.seq_len == q.seq_len,
+        "single_prefill_hd256 output {}x{} != q {}x{}",
+        output.hidden_dim,
+        output.seq_len,
+        q.hidden_dim,
+        q.seq_len
+    );
+    anyhow::ensure!(
+        k_cache.hidden_dim == kv_dim,
+        "single_prefill_hd256 k_cache.hidden_dim {} != num_kv_heads {} * 256",
+        k_cache.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        v_cache.hidden_dim == k_cache.hidden_dim && v_cache.seq_len == k_cache.seq_len,
+        "single_prefill_hd256 v_cache {}x{} != k_cache {}x{}",
+        v_cache.hidden_dim,
+        v_cache.seq_len,
+        k_cache.hidden_dim,
+        k_cache.seq_len
+    );
+    anyhow::ensure!(
+        kv_len <= k_cache.seq_len,
+        "single_prefill_hd256 kv_len {kv_len} exceeds cache rows {}",
+        k_cache.seq_len
+    );
+    anyhow::ensure!(
+        q_seq_len <= kv_len,
+        "causal prefill q_seq_len {q_seq_len} exceeds kv_len {kv_len}"
+    );
+    let byte_offset = checked_row_offset(q, row_offset, q_seq_len, "single_prefill_hd256 q")?;
+    // The C entry builds its 32-bit strides q_stride_n = num_q_heads * 256
+    // and kv_stride_h = cache rows * 256; with positive head counts and
+    // rows, each stride is bounded by its buffer's extent, so extents
+    // fitting i32 cover the stride products too.
+    let q_extent = q.checked_extent("single_prefill_hd256 q")?;
+    let out_extent = output.checked_extent("single_prefill_hd256 output")?;
+    let k_extent = k_cache.checked_extent("single_prefill_hd256 k_cache")?;
+    let v_extent = v_cache.checked_extent("single_prefill_hd256 v_cache")?;
+    super::checked_i32(q_extent, "single_prefill_hd256 q extent")?;
+    super::checked_i32(out_extent, "single_prefill_hd256 output extent")?;
+    super::checked_i32(k_extent, "single_prefill_hd256 k_cache extent")?;
+    super::checked_i32(v_extent, "single_prefill_hd256 v_cache extent")?;
+    let num_q_heads = super::checked_i32(num_q_heads, "single_prefill_hd256 num_q_heads")?;
+    let num_kv_heads = super::checked_i32(num_kv_heads, "single_prefill_hd256 num_kv_heads")?;
+    let q_seq_len = super::checked_i32(q_seq_len, "single_prefill_hd256 q_seq_len")?;
+    let kv_len = super::checked_i32(kv_len, "single_prefill_hd256 kv_len")?;
+    let kv_stride = super::checked_i32(k_cache.seq_len, "single_prefill_hd256 cache rows")?;
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + byte_offset;
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + byte_offset;
+    let result = unsafe {
+        ffi::single_prefill_cuda_hd256(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads,
+            num_kv_heads,
+            q_seq_len,
+            kv_len,
+            kv_stride,
+            sm_scale,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "single_prefill_cuda_hd256 failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }
