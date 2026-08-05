@@ -165,6 +165,15 @@ pub struct KvReservation {
     permit: OwnedPagePermit,
 }
 
+impl KvReservation {
+    /// Append this reservation's page ids to a row the caller owns. A sliding
+    /// state rebuilds that row every step, so the pages land in one buffer
+    /// instead of one `Vec` per reservation.
+    pub fn extend_page_indices_i32(&self, row: &mut Vec<i32>) {
+        row.extend(self.permit.pages().iter().map(|p| p.index() as i32));
+    }
+}
+
 /// Per-request KV state. Parallels `RecurrentState` for linear attention.
 ///
 /// Holds an RAII page permit that auto-returns pages on drop.

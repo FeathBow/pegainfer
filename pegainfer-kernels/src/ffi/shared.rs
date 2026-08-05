@@ -1055,6 +1055,7 @@ unsafe extern "C" {
         k_offset_elems: i64,
         v_offset_elems: i64,
         page_indices: *const i32,
+        page_origin: i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         seq_len: i32,

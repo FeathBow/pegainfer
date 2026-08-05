@@ -75,6 +75,26 @@ pub(crate) fn bf16_tensor(
     (view.shape().to_vec(), host)
 }
 
+/// Log-probabilities at `ids`, plus our own argmax. The 262k-way sum
+/// accumulates in f64 so the reference's own f32 log_softmax is what the
+/// comparison is limited by.
+pub(crate) fn log_softmax_at(row: &[f32], ids: &[i32]) -> (Vec<f32>, usize) {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f64 = row.iter().map(|&x| f64::from(x - max).exp()).sum();
+    let log_z = sum.ln() as f32;
+    let picked = ids
+        .iter()
+        .map(|&id| row[usize::try_from(id).expect("token id")] - max - log_z)
+        .collect();
+    let argmax = row
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+        .expect("non-empty row");
+    (picked, argmax)
+}
+
 pub(crate) fn i32_tensor(
     fixture: &safetensors::SafeTensors<'_>,
     name: &str,

@@ -1,18 +1,107 @@
 //! Per-request KV state across the two families, and the admission that
 //! keeps their pools consistent.
 
+use std::collections::VecDeque;
+
 use anyhow::Result;
+use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::kv_pool::KvPool;
+use pegainfer_core::kv_pool::KvReservation;
 use pegainfer_core::kv_pool::KvState;
 
-/// Cache slots and absolute positions coincide while `resident_origin`
-/// stays 0.
+/// The local family's state once the window can move: pages are held as
+/// one reservation each so the front can be released page by page, which a
+/// single request-owned permit cannot do. `origin_pages` counts what has
+/// been released, which is exactly what separates the two coordinate
+/// systems: `absolute = cache_relative + origin_pages * page_size`.
+pub(crate) struct SlidingLocalKv {
+    pool: KvPool,
+    resident: VecDeque<KvReservation>,
+    origin_pages: usize,
+    frontier: usize,
+}
+
+impl SlidingLocalKv {
+    pub(crate) fn new(pool: KvPool) -> Self {
+        Self {
+            pool,
+            resident: VecDeque::new(),
+            origin_pages: 0,
+            frontier: 0,
+        }
+    }
+
+    pub(crate) fn seq_len(&self) -> usize {
+        self.frontier
+    }
+
+    pub(crate) fn held_pages(&self) -> usize {
+        self.resident.len()
+    }
+
+    pub(crate) fn origin_pages(&self) -> usize {
+        self.origin_pages
+    }
+
+    pub(crate) fn page_row(&self) -> Vec<i32> {
+        let mut row = Vec::with_capacity(self.resident.len());
+        for reservation in &self.resident {
+            reservation.extend_page_indices_i32(&mut row);
+        }
+        row
+    }
+
+    pub(crate) fn layout(&self) -> &KvLayout {
+        self.pool.layout()
+    }
+
+    pub(crate) fn belongs_to(&self, pool: &KvPool) -> bool {
+        std::ptr::eq(self.pool.buffer(), pool.buffer())
+    }
+
+    pub(crate) fn extend_resident(&mut self, pages: Vec<KvReservation>) {
+        self.resident.extend(pages);
+    }
+
+    /// Move the frontier without releasing anything. Only the eviction A/B
+    /// takes this path; serving goes through [`Self::advance_and_release`].
+    #[cfg(test)]
+    pub(crate) fn advance(&mut self, count: usize) {
+        self.frontier += count;
+    }
+
+    /// Move the frontier and drop whatever that makes releasable, as one
+    /// settled move: a page goes once `(p + 1) * page_size + window <= frontier`,
+    /// since the next query at the frontier reads keys from
+    /// `frontier - (window - 1)` on. Everything is checked against the
+    /// prospective frontier before any field changes, so a refused move
+    /// leaves the request exactly where it was.
+    pub(crate) fn advance_and_release(&mut self, count: usize, window: usize) -> Result<()> {
+        let page = self.pool.layout().page_size;
+        let frontier = self.frontier + count;
+        let target = frontier.saturating_sub(window) / page;
+        let release = target.checked_sub(self.origin_pages).ok_or_else(|| {
+            anyhow::anyhow!(
+                "the origin is already {} pages in where a frontier of {frontier} allows {target}",
+                self.origin_pages
+            )
+        })?;
+        anyhow::ensure!(
+            release <= self.resident.len(),
+            "releasing {release} pages needs more than the {} resident: the row and \
+             a frontier of {frontier} have drifted apart",
+            self.resident.len()
+        );
+        self.resident.drain(..release);
+        self.origin_pages = target;
+        self.frontier = frontier;
+        Ok(())
+    }
+}
+
 pub(crate) struct GemmaKv {
-    pub(crate) local: KvState,
+    pub(crate) local: SlidingLocalKv,
     pub(crate) global: KvState,
-    /// Zero while nothing has been evicted; moving it is what splits cache
-    /// slots from absolute positions.
-    pub(crate) local_resident_origin: usize,
 }
 
 /// A refused side drops the other reservation, leaving both pools at their
@@ -40,10 +129,10 @@ pub(crate) fn admit_tokens(
     // error, and swallowing it defers the failure to the step that reads the
     // surplus page.
     let mut need = [0usize; 2];
-    for (slot, (family, held, page_size)) in [
+    for (slot, (family, accounted, page_size)) in [
         (
             "local",
-            kv.local.held_pages(),
+            kv.local.origin_pages() + kv.local.held_pages(),
             local_pool.layout().page_size,
         ),
         (
@@ -56,27 +145,39 @@ pub(crate) fn admit_tokens(
     .enumerate()
     {
         let want = kv_len.div_ceil(page_size);
-        need[slot] = want.checked_sub(held).ok_or_else(|| {
+        need[slot] = want.checked_sub(accounted).ok_or_else(|| {
             anyhow::anyhow!(
-                "{family} family already holds {held} pages where {kv_len} \
-                 tokens account for {want}"
+                "{family} family already accounts for {accounted} pages where \
+                 {kv_len} tokens need {want}"
             )
         })?;
     }
     let (local_need, global_need) = (need[0], need[1]);
-    match (
-        local_pool.try_reserve(local_need),
-        global_pool.try_reserve(global_need),
-    ) {
-        (Some(local_r), Some(global_r)) => {
-            kv.local.commit_reservation(local_r);
+    // One reservation per local page: the front is released page by page, so
+    // the pages cannot share a permit.
+    let mut local_rs = Vec::with_capacity(local_need);
+    while local_rs.len() < local_need {
+        match local_pool.try_reserve(1) {
+            Some(r) => local_rs.push(r),
+            None => break,
+        }
+    }
+    let local_granted = local_rs.len() == local_need;
+    let global_r = if local_granted {
+        global_pool.try_reserve(global_need)
+    } else {
+        None
+    };
+    match (local_granted, global_r) {
+        (true, Some(global_r)) => {
+            kv.local.extend_resident(local_rs);
             kv.global.commit_reservation(global_r);
             Ok(())
         }
-        (local_r, global_r) => {
-            let (local_granted, global_granted) = (local_r.is_some(), global_r.is_some());
+        (local_granted, global_r) => {
+            let global_granted = global_r.is_some();
             // Report availability after rollback.
-            drop((local_r, global_r));
+            drop((local_rs, global_r));
             anyhow::bail!(
                 "admission refused for {new_tokens} tokens (kv_len {kv_len}): \
                  local need {local_need} avail {} ({}), global need {global_need} avail {} ({})",
@@ -116,9 +217,8 @@ mod tests {
 
     fn kv_from(local: &KvPool, global: &KvPool) -> GemmaKv {
         GemmaKv {
-            local: local.alloc(),
+            local: SlidingLocalKv::new(local.clone()),
             global: global.alloc(),
-            local_resident_origin: 0,
         }
     }
 

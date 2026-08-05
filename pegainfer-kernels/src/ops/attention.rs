@@ -2839,10 +2839,11 @@ fn checked_paged_geometry(
 /// one kernel with no intermediate scatter.
 ///
 /// The kernel `__trap()`s on any out-of-range pos or page id as the second
-/// layer of the host validation's defence. Slot positions derive from
-/// `start_pos + token`: absolute and cache-relative coordinates coincide
-/// below the sliding window, which is this entry's contract —
-/// window-crossing callers need a separate slot mapping first.
+/// layer of the host validation's defence. `page_indices` is the resident
+/// page row and `page_origin` the absolute page its first entry covers, so
+/// a caller that released the front passes the released count; the origin is
+/// page-aligned, which keeps in-page offsets position-invariant and shifts
+/// only the row index. RoPE still runs on absolute positions.
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     ctx: &DeviceContext,
@@ -2858,6 +2859,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     sin_cache: &DeviceVec,
     layer: usize,
     page_indices: &CudaSlice<i32>,
+    page_origin: usize,
     start_pos: usize,
     cos_max_pos: usize,
     num_q_heads: usize,
@@ -2944,9 +2946,23 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
                 layout.page_size
             )
         })?;
+    let row_start = page_origin.checked_mul(layout.page_size).ok_or_else(|| {
+        anyhow::anyhow!(
+            "hd256 paged prep page_origin {page_origin} * page_size {} overflows",
+            layout.page_size
+        )
+    })?;
+    let row_end = row_start.checked_add(covered).ok_or_else(|| {
+        anyhow::anyhow!("hd256 paged prep row start {row_start} + span {covered} overflows")
+    })?;
     anyhow::ensure!(
-        covered >= end_pos,
-        "hd256 paged prep pages cover {covered} tokens, need start_pos {start_pos} + seq_len {seq_len}"
+        row_start <= start_pos,
+        "hd256 paged prep page_origin {page_origin} starts after start_pos {start_pos}"
+    );
+    anyhow::ensure!(
+        row_end >= end_pos,
+        "hd256 paged prep row covers tokens {row_start}..{row_end}, need start_pos \
+         {start_pos} + seq_len {seq_len}"
     );
     anyhow::ensure!(
         end_pos <= cos_max_pos,
@@ -2975,6 +2991,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     crate::ops::checked_i32(k_elems, "hd256 paged prep k extent")?;
     crate::ops::checked_i32(table_len, "hd256 paged prep rope table extent")?;
 
+    let page_origin_i32 = crate::ops::checked_i32(page_origin, "hd256 paged prep page_origin")?;
     let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "hd256 paged prep num_q_heads")?;
     let num_kv_heads_i32 = crate::ops::checked_i32(num_kv_heads, "hd256 paged prep num_kv_heads")?;
     let seq_len_i32 = crate::ops::checked_i32(seq_len, "hd256 paged prep seq_len")?;
@@ -3008,6 +3025,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
             geometry.k_offset_elems,
             geometry.v_offset_elems,
             pi_ptr as *const i32,
+            page_origin_i32,
             num_q_heads_i32,
             num_kv_heads_i32,
             seq_len_i32,

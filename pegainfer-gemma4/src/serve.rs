@@ -1,11 +1,11 @@
-//! KV-backed serving forward: two KV families, short-context prefill and
-//! decode, and atomic dual-pool admission.
+//! KV-backed serving forward: two KV families, prefill and decode, and
+//! atomic dual-pool admission.
 //!
 //! The layer forwards take a `GemmaStepPlan` and the pools this module owns,
 //! never a request's state. Both coordinate systems (absolute positions for
 //! RoPE, cache-relative slots for the paged scatter) coincide below the
-//! sliding window, and this module asserts it stays there: crossing the
-//! window belongs to the eviction work, not here.
+//! sliding window; past it the local family releases its front, and
+//! `origin_pages` is what converts between the two.
 //!
 //! Decode runs the prefill entries with seq_len 1 — correct, not
 //! decode-optimal. Attention reads are read-only entries (the prep kernels own the
@@ -28,6 +28,7 @@ use crate::forward::logits_tail;
 use crate::forward::validate_tokens;
 use crate::kv::GemmaKv;
 use crate::kv::PAGE_SIZE;
+use crate::kv::SlidingLocalKv;
 use crate::layer::LayerGeometry;
 use crate::layer::attention_epilogue;
 use crate::layer::build_proportional_rope_tables;
@@ -48,6 +49,9 @@ pub(crate) struct GemmaStepPlan {
     pub(crate) seq_len: usize,
     local_plan: PrefillPagedPlan,
     global_plan: PrefillPagedPlan,
+    /// Absolute page the local resident row starts at. The preps shift only
+    /// the row index by it; RoPE stays on absolute positions.
+    local_page_origin: usize,
 }
 
 /// Everything a serving step needs that outlives requests.
@@ -62,6 +66,8 @@ pub(crate) struct GemmaServe {
     global_geom: LayerGeometry,
     sliding_window: usize,
     final_logit_softcapping: f32,
+    #[cfg(test)]
+    release_enabled: bool,
     sliding_cos: DeviceVec,
     sliding_sin: DeviceVec,
     global_cos: DeviceVec,
@@ -149,6 +155,8 @@ impl GemmaServe {
             global_geom,
             sliding_window,
             final_logit_softcapping,
+            #[cfg(test)]
+            release_enabled: true,
             sliding_cos,
             sliding_sin,
             global_cos,
@@ -160,10 +168,16 @@ impl GemmaServe {
 
     pub(crate) fn alloc_kv(&self) -> GemmaKv {
         GemmaKv {
-            local: self.local_pool.alloc(),
+            local: SlidingLocalKv::new(self.local_pool.clone()),
             global: self.global_pool.alloc(),
-            local_resident_origin: 0,
         }
+    }
+
+    /// The eviction gate runs the same request twice, once with the front
+    /// held resident, to show what release does and does not change.
+    #[cfg(test)]
+    pub(crate) fn set_release_for_test(&mut self, on: bool) {
+        self.release_enabled = on;
     }
 
     fn check_step_bounds(&self, kv: &GemmaKv, kv_len: usize) -> Result<()> {
@@ -173,24 +187,10 @@ impl GemmaServe {
             kv.local.seq_len(),
             kv.global.seq_len()
         );
-        for (family, state, pool) in [
-            ("local", &kv.local, &self.local_pool),
-            ("global", &kv.global, &self.global_pool),
-        ] {
-            anyhow::ensure!(
-                state.belongs_to(pool),
-                "{family} KV state came from another pool; its page ids do not \
-                 address this one's buffer"
-            );
-        }
         anyhow::ensure!(
-            kv.local_resident_origin == 0,
-            "this path requires resident_origin 0; a moved window is not supported yet"
-        );
-        anyhow::ensure!(
-            kv_len <= self.sliding_window,
-            "fail-closed at the sliding window: kv_len {kv_len} > {}",
-            self.sliding_window
+            kv.local.belongs_to(&self.local_pool) && kv.global.belongs_to(&self.global_pool),
+            "a KV state came from another pool; its page ids do not address \
+             this one's buffer"
         );
         anyhow::ensure!(
             kv_len <= self.cos_max_pos,
@@ -208,16 +208,40 @@ impl GemmaServe {
         seq_len: usize,
     ) -> Result<GemmaStepPlan> {
         let kv_len = start_pos + seq_len;
-        let local_desc = kv.local.desc_for_len(kv_len)?;
         let global_desc = kv.global.desc_for_len(kv_len)?;
-        let local_plan = PrefillPagedPlan::new(
+        // The local plan lives in cache-relative coordinates: the resident row
+        // starts `origin_pages` pages into the sequence, and window_left masks
+        // whatever sub-window prefix the first page still carries, so a
+        // resident start that is not window-aligned loses nothing.
+        let page = kv.local.layout().page_size;
+        let origin_tokens = kv.local.origin_pages() * page;
+        let rel_kv_len = kv_len
+            .checked_sub(origin_tokens)
+            .context("the resident window starts past the step's frontier")?;
+        let rel_start = start_pos
+            .checked_sub(origin_tokens)
+            .context("the step starts before the resident window")?;
+        let row = kv.local.page_row();
+        anyhow::ensure!(
+            row.len() == rel_kv_len.div_ceil(page),
+            "local resident row of {} pages against {rel_kv_len} tokens",
+            row.len()
+        );
+        let rel_last_page = if rel_kv_len.is_multiple_of(page) {
+            page
+        } else {
+            rel_kv_len % page
+        };
+        let local_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             ctx,
-            &local_desc,
-            start_pos,
-            seq_len,
+            &[row],
+            &[rel_last_page],
+            &[rel_start],
+            &[seq_len],
             self.local_geom.num_q_heads,
             self.local_geom.num_kv_heads,
             self.local_geom.head_dim,
+            0,
         )?;
         let global_plan = PrefillPagedPlan::new(
             ctx,
@@ -233,6 +257,7 @@ impl GemmaServe {
             seq_len,
             local_plan,
             global_plan,
+            local_page_origin: kv.local.origin_pages(),
         })
     }
 
@@ -298,6 +323,7 @@ impl GemmaServe {
             &self.sliding_sin,
             family_layer,
             plan.local_plan.page_indices_d(),
+            plan.local_page_origin,
             plan.start_pos,
             self.cos_max_pos,
             geom.num_q_heads,
@@ -476,7 +502,19 @@ impl GemmaServe {
             self.local_geom.rms_norm_eps,
             self.final_logit_softcapping,
         )?;
-        kv.local.advance(seq_len);
+        // Append-then-attend: the old window and the new tokens were both
+        // resident through the layers above, so only now is the front safe to
+        // release. The local move is settled first because it is the only
+        // fallible one — the global advance cannot fail, so nothing here can
+        // leave one family ahead of the other.
+        #[cfg(test)]
+        if self.release_enabled {
+            kv.local.advance_and_release(seq_len, self.sliding_window)?;
+        } else {
+            kv.local.advance(seq_len);
+        }
+        #[cfg(not(test))]
+        kv.local.advance_and_release(seq_len, self.sliding_window)?;
         kv.global.advance(seq_len);
         Ok(logits)
     }

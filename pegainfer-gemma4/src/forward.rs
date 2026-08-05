@@ -162,28 +162,8 @@ mod oracle {
     use crate::testkit::assert_checkpoint_matches;
     use crate::testkit::f32_tensor;
     use crate::testkit::i32_tensor;
+    use crate::testkit::log_softmax_at;
     use crate::testkit::model_path;
-
-    /// Log-probabilities for one position, computed on the host from the f32
-    /// upcast of our bf16 logits — mirroring the dumper, which takes
-    /// `log_softmax` over the reference's f32 logits. f64 accumulation keeps
-    /// the 262k-way sum stable.
-    fn log_softmax_at(logits: &[f32], ids: &[i32]) -> (Vec<f32>, usize) {
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f64 = logits.iter().map(|&x| f64::from(x - max).exp()).sum();
-        let log_z = sum.ln() as f32;
-        let picked = ids
-            .iter()
-            .map(|&id| logits[usize::try_from(id).expect("token id")] - max - log_z)
-            .collect();
-        let argmax = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
-            .expect("non-empty vocab");
-        (picked, argmax)
-    }
 
     #[test]
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]

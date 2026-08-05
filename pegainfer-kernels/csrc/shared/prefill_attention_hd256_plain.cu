@@ -168,7 +168,8 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     __nv_bfloat16* __restrict__ kv_data,            // paged KV pool
     int64_t k_offset_elems,
     int64_t v_offset_elems,
-    const int* __restrict__ page_indices,           // request page list
+    const int* __restrict__ page_indices,           // resident page row
+    int page_origin,                                // absolute page of row[0]
     int num_q_heads,
     int num_kv_heads,
     int start_pos,                                  // host base position
@@ -223,9 +224,13 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     if (pos < 0 || pos >= cos_max_pos) __trap();
     // Check the device-resident page id before the first pool write. Q
     // blocks never touch the pool.
+    // The resident window starts page-aligned, so the in-page offset is
+    // position-invariant and only the row index shifts.
     int page_id = -1;
     if (!is_q) {
-        page_id = page_indices[pos / page_size];
+        int row = pos / page_size - page_origin;
+        if (row < 0) __trap();
+        page_id = page_indices[row];
         if (page_id < 0 || page_id >= num_pages) __trap();
     }
 
@@ -365,6 +370,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
     int64_t k_offset_elems,
     int64_t v_offset_elems,
     const int* page_indices,
+    int page_origin,
     int num_q_heads,
     int num_kv_heads,
     int seq_len,
@@ -382,6 +388,12 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
         pegainfer_ffi_set_last_error(
             "qkv_norm_rope_paged_prefill_hd256_plain_cuda: rotary_dim must be "
             "positive, even and <= 256");
+        return -1;
+    }
+    if (page_origin < 0 || page_origin * page_size > start_pos) {
+        pegainfer_ffi_set_last_error(
+            "qkv_norm_rope_paged_prefill_hd256_plain_cuda: page_origin must be "
+            ">= 0 and at or before start_pos");
         return -1;
     }
     if (q_batch == nullptr || k_batch == nullptr || v_batch == nullptr ||
@@ -420,6 +432,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
         k_offset_elems,
         v_offset_elems,
         page_indices,
+        page_origin,
         num_q_heads,
         num_kv_heads,
         start_pos,

@@ -10,7 +10,9 @@ use crate::kv::admit_tokens;
 use crate::testkit::GOLDEN_PATH;
 use crate::testkit::METADATA_KEY;
 use crate::testkit::assert_checkpoint_matches;
+use crate::testkit::f32_tensor;
 use crate::testkit::i32_tensor;
+use crate::testkit::log_softmax_at;
 use crate::testkit::model_path;
 
 /// Compare one logit row against the oracle's: both must be finite (a NaN
@@ -40,14 +42,303 @@ fn fixture_manifest(bytes: &[u8], key: &str) -> serde_json::Value {
     .expect("parse fixture manifest")
 }
 
-fn load_stack() -> (DeviceContext, GemmaServe, String) {
+fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
     let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0).expect("load 12B weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
-    // 1024 rope rows is the window this path is fail-closed at; the pool
-    // sizes cover one request at that length plus each pool's padding page.
-    let serve = GemmaServe::new(&ctx, weights, 1024, 66, 66).expect("serve");
+    let serve = GemmaServe::new(&ctx, weights, max_context, pages, pages).expect("serve");
     (ctx, serve, dir)
+}
+
+fn load_stack() -> (DeviceContext, GemmaServe, String) {
+    // One request at the window, plus each pool's padding page.
+    stack_with(1024, 66)
+}
+
+/// What agreement is available at this depth, measured on the reference
+/// itself: the largest gap its two backends have with each other over the
+/// ids both rank, and how often they pick the same top-1. Neither certifies
+/// anything smaller as correct; they say what a correct implementation can
+/// still be asked for.
+fn backend_floor(
+    ref_ids: &[i32],
+    ref_lps: &[f32],
+    eager_ids: &[i32],
+    eager_lps: &[f32],
+    positions: usize,
+    top_k: usize,
+) -> (f32, usize) {
+    let mut floor = 0.0f32;
+    let mut top1 = 0usize;
+    for pos in 0..positions {
+        let eager: std::collections::HashMap<i32, f32> = (0..top_k)
+            .map(|k| (eager_ids[pos * top_k + k], eager_lps[pos * top_k + k]))
+            .collect();
+        for k in 0..top_k {
+            if let Some(&e) = eager.get(&ref_ids[pos * top_k + k]) {
+                floor = floor.max((ref_lps[pos * top_k + k] - e).abs());
+            }
+        }
+        if ref_ids[pos * top_k] == eager_ids[pos * top_k] {
+            top1 += 1;
+        }
+    }
+    (floor, top1)
+}
+
+const WINDOW_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../test_data/gemma4-12b-hf-window-golden.safetensors"
+);
+
+/// One case's run through the serving path: the prompt prefilled in steps of
+/// `chunk` tokens (the whole prompt when zero), then its teacher-forced
+/// continuation one token at a time.
+struct Run {
+    rows: Vec<Vec<f32>>,
+    kv_len: usize,
+    local_pages: usize,
+    global_pages: usize,
+    /// Whether a multi-token step ran with the resident row already shifted.
+    shifted_multi_token: bool,
+}
+
+fn run_case(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    fixture: &safetensors::SafeTensors<'_>,
+    case: &str,
+    chunk: usize,
+) -> Run {
+    let (_, prompt_i32) = i32_tensor(fixture, &format!("{case}_prompt"));
+    let (_, teacher_i32) = i32_tensor(fixture, &format!("{case}_teacher"));
+    let prompt: Vec<u32> = prompt_i32
+        .iter()
+        .map(|&t| u32::try_from(t).expect("token id"))
+        .collect();
+    let step_size = if chunk == 0 { prompt.len() } else { chunk };
+    let last_chunk = prompt.len().div_ceil(step_size) - 1;
+
+    let mut kv = serve.alloc_kv();
+    let mut rows = Vec::with_capacity(teacher_i32.len() + 1);
+    let mut shifted_multi_token = false;
+    for (i, piece) in prompt.chunks(step_size).enumerate() {
+        admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, piece.len())
+            .expect("admit prompt");
+        shifted_multi_token |= kv.local.origin_pages() > 0 && piece.len() > 1;
+        let logits = serve
+            .step(ctx, &mut kv, piece, LogitsSpan::LastRow)
+            .expect("prefill");
+        if i == last_chunk {
+            rows.push(logits.to_host(ctx).expect("D2H"));
+        }
+    }
+    for &t in &teacher_i32 {
+        let token = u32::try_from(t).expect("token id");
+        admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1).expect("admit");
+        rows.push(
+            serve
+                .step(ctx, &mut kv, &[token], LogitsSpan::LastRow)
+                .expect("decode")
+                .to_host(ctx)
+                .expect("D2H"),
+        );
+    }
+    Run {
+        rows,
+        kv_len: prompt.len() + teacher_i32.len(),
+        local_pages: kv.local.held_pages(),
+        global_pages: kv.global.held_pages(),
+        shifted_multi_token,
+    }
+}
+
+/// A case's reference rows, with the tolerance and the top-1 floor its own
+/// two backends earn.
+fn reference(
+    fixture: &safetensors::SafeTensors<'_>,
+    case: &str,
+) -> (Vec<i32>, Vec<f32>, usize, usize, f32, usize) {
+    let (shape, ids) = i32_tensor(fixture, &format!("{case}_sdpa_ids"));
+    let (_, lps) = f32_tensor(fixture, &format!("{case}_sdpa_logprobs"));
+    let (_, eager_ids) = i32_tensor(fixture, &format!("{case}_eager_ids"));
+    let (_, eager_lps) = f32_tensor(fixture, &format!("{case}_eager_logprobs"));
+    let (positions, top_k) = (shape[0], shape[1]);
+    let (floor, backend_top1) = backend_floor(&ids, &lps, &eager_ids, &eager_lps, positions, top_k);
+    (
+        ids,
+        lps,
+        positions,
+        top_k,
+        (2.0 * floor).max(1.0),
+        backend_top1,
+    )
+}
+
+// Worst absolute gap against the reference's own top-k, plus how often our
+// argmax lands on its top-1.
+fn score_rows(
+    rows: &[Vec<f32>],
+    ref_ids: &[i32],
+    ref_lps: &[f32],
+    top_k: usize,
+    case: &str,
+) -> (f32, usize) {
+    let mut max_abs = 0.0f32;
+    let mut top1 = 0usize;
+    for (pos, row) in rows.iter().enumerate() {
+        let ids = &ref_ids[pos * top_k..(pos + 1) * top_k];
+        let (ours, argmax) = log_softmax_at(row, ids);
+        assert!(
+            ours.iter().all(|v| v.is_finite()),
+            "{case}: non-finite logprob at position {pos}"
+        );
+        if argmax == usize::try_from(ids[0]).expect("token id") {
+            top1 += 1;
+        }
+        for k in 0..top_k {
+            max_abs = max_abs.max((ours[k] - ref_lps[pos * top_k + k]).abs());
+        }
+    }
+    (max_abs, top1)
+}
+
+/// Gated distribution-level because a greedy chain is not reachable at this
+/// depth: the reference's own backends continue the same prompt in different
+/// directions, so each case is gated at twice its measured sdpa-vs-eager
+/// gap. A window-semantics bug misses by orders more than that floor.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint and the window fixture"]
+fn window_crossing_matches_hf() {
+    // A 4096-token prefill holds every local page at once (append then
+    // attend); decode releases down to the window afterwards.
+    let (ctx, serve, dir) = stack_with(4200, 300);
+    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    // The golden fixture fingerprints the checkpoint files; the window one
+    // only names a revision, so pin with the former and cross-check the
+    // latter against it.
+    let golden = fixture_manifest(
+        &std::fs::read(GOLDEN_PATH).expect("read golden"),
+        METADATA_KEY,
+    );
+    assert_checkpoint_matches(&golden, &dir);
+    let window = fixture_manifest(&bytes, "gemma4_window_golden");
+    assert_eq!(
+        window["revision"], golden["revision"],
+        "the window fixture was dumped from a different revision than the golden one"
+    );
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+    let page = serve.local_pool.layout().page_size;
+
+    let mut over: Vec<String> = Vec::new();
+    // Single-shot prefill for every case, then the widest one again in
+    // window-sized chunks: a prefill that fits in one step always runs at
+    // origin 0, since the front is only released afterwards, so chunking is
+    // the only way to reach a multi-token step with the row already shifted.
+    for (case, chunk) in [
+        ("w1023", 0),
+        ("w1024", 0),
+        ("w1025", 0),
+        ("w4096", 0),
+        ("w4096", 1024),
+    ] {
+        let label = if chunk == 0 {
+            case.to_string()
+        } else {
+            format!("{case}-chunked")
+        };
+        let (ref_ids, ref_lps, positions, top_k, tolerance, backend_top1) =
+            reference(&fixture, case);
+        let run = run_case(&ctx, &serve, &fixture, case, chunk);
+        assert_eq!(run.rows.len(), positions, "{label}: fixture positions");
+        assert_eq!(
+            chunk > 0,
+            run.shifted_multi_token,
+            "{label}: a shifted multi-token step is exactly what chunking adds"
+        );
+
+        let (max_abs, top1) = score_rows(&run.rows, &ref_ids, &ref_lps, top_k, &label);
+        eprintln!(
+            "{label}: max |dlogprob| {max_abs} (tol {tolerance:.2}), top-1 {top1}/{positions} \
+             (backends agree {backend_top1}/{positions}), local pages {}, global {}",
+            run.local_pages, run.global_pages
+        );
+        // A ranking regression can hide under a logprob tolerance this wide,
+        // so top-1 is gated too — against what the reference's own backends
+        // manage with each other, which is all that is reachable here.
+        assert!(
+            top1 >= backend_top1,
+            "{label}: top-1 {top1}/{positions} below the backends' own \
+             {backend_top1}/{positions}"
+        );
+        // Exactly what the release rule leaves resident: every page the
+        // frontier accounts for, minus the ones whose last token has aged out
+        // of every future window. One page late still fails here.
+        let released = run.kv_len.saturating_sub(serve.sliding_window) / page;
+        assert_eq!(
+            run.local_pages,
+            run.kv_len.div_ceil(page) - released,
+            "{label}: resident pages after {released} released"
+        );
+        assert_eq!(
+            run.global_pages,
+            run.kv_len.div_ceil(page),
+            "{label}: the global family must keep every page"
+        );
+        if max_abs > tolerance {
+            over.push(format!("{label} ({max_abs} > {tolerance})"));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "cases over their calibrated floor: {over:?}"
+    );
+}
+
+/// `window_left` masks out-of-window keys whether or not their pages are
+/// still resident, so releasing them need not change a single generated
+/// token.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint and the window fixture"]
+fn eviction_is_footprint_only() {
+    let (ctx, mut serve, _dir) = stack_with(1300, 120);
+    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+    let (_, prompt_i32) = i32_tensor(&fixture, "w1023_prompt");
+    let prompt: Vec<u32> = prompt_i32
+        .iter()
+        .map(|&t| u32::try_from(t).expect("token id"))
+        .collect();
+
+    let run = |serve: &GemmaServe| -> (Vec<u32>, usize) {
+        let mut kv = serve.alloc_kv();
+        admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prompt.len())
+            .expect("admit prompt");
+        let logits = serve
+            .step(&ctx, &mut kv, &prompt, LogitsSpan::LastRow)
+            .expect("prefill");
+        let mut next = argmax_last(&ctx, &logits).expect("argmax");
+        let mut tokens = vec![next];
+        for _ in 1..30 {
+            admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1).expect("admit");
+            let logits = serve
+                .step(&ctx, &mut kv, &[next], LogitsSpan::LastRow)
+                .expect("decode");
+            next = argmax_last(&ctx, &logits).expect("argmax");
+            tokens.push(next);
+        }
+        (tokens, kv.local.held_pages())
+    };
+
+    let (evicted, pages_evicted) = run(&serve);
+    serve.set_release_for_test(false);
+    let (retained, pages_retained) = run(&serve);
+    assert_eq!(evicted, retained, "releasing changed the generated tokens");
+    eprintln!("local pages at end: released {pages_evicted} vs retained {pages_retained}");
+    assert!(
+        pages_evicted < pages_retained,
+        "release must shrink the resident footprint ({pages_evicted} vs {pages_retained})"
+    );
 }
 
 /// The paged serving path against the no-KV oracle forward on the same

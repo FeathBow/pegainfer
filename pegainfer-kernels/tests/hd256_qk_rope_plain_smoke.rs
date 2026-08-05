@@ -285,6 +285,7 @@ fn pool_write_matches_closed_form_and_touches_nothing_else() {
         &sin_dev,
         layer,
         &page_indices,
+        0, // page_origin: the row starts at the sequence's first page
         START_POS,
         COS_MAX_POS,
         NUM_Q_HEADS,
