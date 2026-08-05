@@ -1,8 +1,10 @@
-//! Gemma 4's [`ModelLine`] implementation (registration only — the engine
-//! itself is not yet available).
+//! Gemma 4's [`ModelLine`] implementation.
+
+use std::collections::BTreeSet;
 
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::LaunchedEngine;
+use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
 
@@ -42,12 +44,34 @@ impl ModelLine for Gemma4Line {
     }
 
     fn consumed_shared_args(&self) -> &'static [&'static str] {
-        &["cuda_graph"]
+        &["device_ordinal", "cuda_graph"]
+    }
+
+    /// `--cuda-graph` defaults to true, so only an explicit request is a
+    /// request: rejecting it here costs a message instead of a weight load.
+    fn validate(
+        &self,
+        ctx: &LaunchContext<'_>,
+        provided: &BTreeSet<String>,
+    ) -> Result<(), CliError> {
+        if provided.contains("cuda_graph") && ctx.shared.cuda_graph {
+            return Err(CliError::rule(
+                "Gemma 4 serves eagerly; --cuda-graph=true is not supported",
+            ));
+        }
+        Ok(())
     }
 
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
-        crate::start_engine(ctx.model_path, EngineLoadOptions::default())
-            .map(LaunchedEngine::Handle)
+        crate::start_engine(
+            ctx.model_path,
+            &EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![ctx.shared.device_ordinal],
+                ..EngineLoadOptions::default()
+            },
+        )
+        .map(LaunchedEngine::Handle)
     }
 }
 

@@ -21,7 +21,8 @@ use crate::layer::global_layer_forward;
 use crate::layer::local_layer_forward;
 use crate::weights::Gemma4Weights;
 
-const MULTIMODAL_PLACEHOLDER_IDS: [u32; 6] = [255_999, 256_000, 258_880, 258_881, 258_882, 258_883];
+pub(crate) const MULTIMODAL_PLACEHOLDER_IDS: [u32; 6] =
+    [255_999, 256_000, 258_880, 258_881, 258_882, 258_883];
 
 /// The embedding multiplier is the bf16 rounding of `sqrt(hidden_size)` —
 /// the reference casts the scale buffer to the weight dtype before the

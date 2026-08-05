@@ -6,8 +6,10 @@ mod config;
 mod manifest;
 pub mod model_line;
 mod probe;
-// Dead until an executor calls in; test targets do use them, so an
+// The engine is the live consumer; the oracles reach the rest, so an
 // `expect(dead_code)` cannot hold in every build.
+#[cfg(feature = "gemma4")]
+mod engine;
 #[cfg(feature = "gemma4")]
 #[allow(dead_code)]
 mod forward;
@@ -34,12 +36,12 @@ use pegainfer_frontend::engine::EngineLoadOptions;
 pub(crate) use probe::probe_config_json;
 
 #[cfg(feature = "gemma4")]
-fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
-    anyhow::bail!("Gemma 4 engine is not implemented yet (registration only)")
+fn start_engine(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
+    engine::start(model_path, options)
 }
 
 #[cfg(not(feature = "gemma4"))]
-pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
+fn start_engine(_model_path: &Path, _options: &EngineLoadOptions) -> Result<EngineHandle> {
     anyhow::bail!(
         "Gemma 4 support is feature-gated; rebuild pegainfer-server with --features gemma4"
     )
