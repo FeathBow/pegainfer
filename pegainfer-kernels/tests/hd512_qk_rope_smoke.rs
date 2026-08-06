@@ -282,6 +282,7 @@ fn paged_decode_prep_matches_closed_form() {
         &q,
         &k,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,

@@ -476,6 +476,7 @@ fn batched_decode_prep_matches_closed_form() {
         &k,
         &v,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,

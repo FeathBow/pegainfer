@@ -1821,6 +1821,7 @@ impl<'a> Hd512DecodeMetadata<'a> {
 pub fn paged_attention_batch_decode_split_kv_hd512_into(
     ctx: &DeviceContext,
     q: &HiddenStates,
+    row_offset: usize,
     kv_buffer: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     layer: usize,
@@ -1847,12 +1848,18 @@ pub fn paged_attention_batch_decode_split_kv_hd512_into(
         512,
         num_kv_heads,
     )?;
-    let batch_size = q.seq_len;
+    anyhow::ensure!(
+        row_offset < q.seq_len,
+        "hd512 split decode row_offset {row_offset} leaves no rows of {}",
+        q.seq_len
+    );
+    let batch_size = q.seq_len - row_offset;
     meta.validate(batch_size)?;
     anyhow::ensure!(
-        output.seq_len == batch_size,
-        "hd512 decode output.seq_len {} != q.seq_len {batch_size}",
-        output.seq_len
+        output.seq_len == q.seq_len,
+        "hd512 decode output.seq_len {} != q.seq_len {}",
+        output.seq_len,
+        q.seq_len
     );
     let qo_dim = num_qo_heads.checked_mul(512).ok_or_else(|| {
         anyhow::anyhow!("hd512 split decode num_qo_heads {num_qo_heads} * 512 overflows")
@@ -1906,9 +1913,14 @@ pub fn paged_attention_batch_decode_split_kv_hd512_into(
     let qo_heads_i32 = crate::ops::checked_i32(num_qo_heads, "hd512 split decode qo heads")?;
     let kv_heads_i32 = crate::ops::checked_i32(num_kv_heads, "hd512 split decode kv heads")?;
 
+    let q_row_bytes = checked_row_offset(q, row_offset, batch_size, "hd512 split decode q")?;
+    let out_row_bytes =
+        checked_row_offset(output, row_offset, batch_size, "hd512 split decode output")?;
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + q_row_bytes;
     let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + out_row_bytes;
     let (pi_ptr, _gpi) = meta.page_indices.device_ptr(&ctx.stream);
     let (pip_ptr, _gpip) = meta.page_indptr.device_ptr(&ctx.stream);
     let (lpl_ptr, _glpl) = meta.last_page_len.device_ptr(&ctx.stream);
@@ -3061,6 +3073,8 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
 }
 
 /// Per-request hd256 prep; `page_origins` is the released local-window front.
+/// The decode batch is the row suffix `[row_offset..seq_len)` — 0 covers the
+/// whole tensor, a mixed step parks its prefill segment in the prefix.
 /// Invalid device metadata traps before the first paged-pool access.
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
@@ -3069,6 +3083,7 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     k: &HiddenStates,
     v: &HiddenStates,
     q_out: &mut HiddenStates,
+    row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     q_norm_weight: &DeviceVec,
@@ -3086,8 +3101,12 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
-    let batch = q.seq_len;
-    anyhow::ensure!(batch > 0, "hd256 paged decode prep needs a non-empty batch");
+    anyhow::ensure!(
+        row_offset < q.seq_len,
+        "hd256 paged decode prep row_offset {row_offset} leaves no rows of {}",
+        q.seq_len
+    );
+    let batch = q.seq_len - row_offset;
     anyhow::ensure!(
         Some(q.hidden_dim) == num_q_heads.checked_mul(256),
         "hd256 paged decode prep q.hidden_dim {} != num_q_heads {} * 256",
@@ -3095,25 +3114,28 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
         num_q_heads
     );
     anyhow::ensure!(
-        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == batch,
-        "hd256 paged decode prep q_out [{} x {}] != q [{} x {batch}]",
+        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == q.seq_len,
+        "hd256 paged decode prep q_out [{} x {}] != q [{} x {}]",
         q_out.hidden_dim,
         q_out.seq_len,
-        q.hidden_dim
+        q.hidden_dim,
+        q.seq_len
     );
     anyhow::ensure!(
-        Some(k.hidden_dim) == num_kv_heads.checked_mul(256) && k.seq_len == batch,
-        "hd256 paged decode prep k [{} x {}] != [num_kv_heads {} * 256 x {batch}]",
+        Some(k.hidden_dim) == num_kv_heads.checked_mul(256) && k.seq_len == q.seq_len,
+        "hd256 paged decode prep k [{} x {}] != [num_kv_heads {} * 256 x {}]",
         k.hidden_dim,
         k.seq_len,
-        num_kv_heads
+        num_kv_heads,
+        q.seq_len
     );
     anyhow::ensure!(
-        v.hidden_dim == k.hidden_dim && v.seq_len == batch,
-        "hd256 paged decode prep v [{} x {}] != k [{} x {batch}]",
+        v.hidden_dim == k.hidden_dim && v.seq_len == q.seq_len,
+        "hd256 paged decode prep v [{} x {}] != k [{} x {}]",
         v.hidden_dim,
         v.seq_len,
-        k.hidden_dim
+        k.hidden_dim,
+        q.seq_len
     );
     let geometry = checked_paged_geometry(
         "hd256 paged decode prep",
@@ -3172,10 +3194,19 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
         crate::ops::checked_i32(cos_max_pos, "hd256 paged decode prep cos_max_pos")?;
     let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd256 paged decode prep rotary_dim")?;
 
+    let q_row_bytes = checked_row_offset(q, row_offset, batch, "hd256 paged decode prep q")?;
+    let k_row_bytes = checked_row_offset(k, row_offset, batch, "hd256 paged decode prep k")?;
+    let v_row_bytes = checked_row_offset(v, row_offset, batch, "hd256 paged decode prep v")?;
+    let qo_row_bytes =
+        checked_row_offset(q_out, row_offset, batch, "hd256 paged decode prep q_out")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + q_row_bytes;
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let k_ptr = k_ptr + k_row_bytes;
     let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let v_ptr = v_ptr + v_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    let qo_ptr = qo_ptr + qo_row_bytes;
     // The KV states own mutation; this call borrows the shared pool handle.
     let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
     let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
@@ -3551,6 +3582,7 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     q: &HiddenStates,
     k: &HiddenStates,
     q_out: &mut HiddenStates,
+    row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     q_norm_weight: &DeviceVec,
@@ -3567,8 +3599,12 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
-    let batch = q.seq_len;
-    anyhow::ensure!(batch > 0, "hd512 paged decode prep needs a non-empty batch");
+    anyhow::ensure!(
+        row_offset < q.seq_len,
+        "hd512 paged decode prep row_offset {row_offset} leaves no rows of {}",
+        q.seq_len
+    );
+    let batch = q.seq_len - row_offset;
     anyhow::ensure!(
         Some(q.hidden_dim) == num_q_heads.checked_mul(512),
         "hd512 paged decode prep q.hidden_dim {} != num_q_heads {} * 512",
@@ -3576,18 +3612,20 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
         num_q_heads
     );
     anyhow::ensure!(
-        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == batch,
-        "hd512 paged decode prep q_out [{} x {}] != q [{} x {batch}]",
+        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == q.seq_len,
+        "hd512 paged decode prep q_out [{} x {}] != q [{} x {}]",
         q_out.hidden_dim,
         q_out.seq_len,
-        q.hidden_dim
+        q.hidden_dim,
+        q.seq_len
     );
     anyhow::ensure!(
-        Some(k.hidden_dim) == num_kv_heads.checked_mul(512) && k.seq_len == batch,
-        "hd512 paged decode prep k [{} x {}] != [num_kv_heads {} * 512 x {batch}]",
+        Some(k.hidden_dim) == num_kv_heads.checked_mul(512) && k.seq_len == q.seq_len,
+        "hd512 paged decode prep k [{} x {}] != [num_kv_heads {} * 512 x {}]",
         k.hidden_dim,
         k.seq_len,
-        num_kv_heads
+        num_kv_heads,
+        q.seq_len
     );
     let geometry = checked_paged_geometry(
         "hd512 paged decode prep",
@@ -3643,9 +3681,16 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     let cos_max_pos_i32 =
         crate::ops::checked_i32(cos_max_pos, "hd512 paged decode prep cos_max_pos")?;
     let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd512 paged decode prep rotary_dim")?;
+    let q_row_bytes = checked_row_offset(q, row_offset, batch, "hd512 paged decode prep q")?;
+    let k_row_bytes = checked_row_offset(k, row_offset, batch, "hd512 paged decode prep k")?;
+    let qo_row_bytes =
+        checked_row_offset(q_out, row_offset, batch, "hd512 paged decode prep q_out")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + q_row_bytes;
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let k_ptr = k_ptr + k_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    let qo_ptr = qo_ptr + qo_row_bytes;
     // The KV states own mutation; this call borrows the shared pool handle.
     let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
     let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);

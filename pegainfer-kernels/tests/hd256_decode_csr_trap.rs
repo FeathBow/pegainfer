@@ -53,6 +53,7 @@ fn a_window_past_the_page_array_traps() {
         &k,
         &v,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,

@@ -706,6 +706,7 @@ impl GemmaServe {
                     &scratch.k_states,
                     &scratch.v_states,
                     &mut scratch.q_prep,
+                    0,
                     self.local_pool.buffer(),
                     &self.local_pool.layout().kernel_layout(),
                     &layer.attention.q_norm,
@@ -840,6 +841,7 @@ impl GemmaServe {
                     &scratch.q_states,
                     &scratch.k_states,
                     &mut scratch.q_prep,
+                    0,
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     &layer.attention.q_norm,
@@ -874,6 +876,7 @@ impl GemmaServe {
                 ops::paged_attention_batch_decode_split_kv_hd512_into(
                     ctx,
                     &scratch.q_prep,
+                    0,
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     family_layer,
