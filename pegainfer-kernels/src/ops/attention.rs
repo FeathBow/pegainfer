@@ -2722,6 +2722,10 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     q.checked_extent("hd512 prefill prep q")?;
     q_out.checked_extent("hd512 prefill prep q_out")?;
     k.checked_extent("hd512 prefill prep k")?;
+    ensure_vec_backed(q_norm_weight, "hd512 prefill prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd512 prefill prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd512 prefill prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd512 prefill prep sin_cache")?;
 
     // Derive raw offsets from the validated layout.
     let k_offset_elems = (layer * layout.layer_stride) as i64;
@@ -2861,6 +2865,10 @@ pub fn qk_norm_partial_rope_batched_decode_hd512_into(
     q.checked_extent("hd512 decode prep q")?;
     q_out.checked_extent("hd512 decode prep q_out")?;
     k.checked_extent("hd512 decode prep k")?;
+    ensure_vec_backed(q_norm_weight, "hd512 decode prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd512 decode prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd512 decode prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd512 decode prep sin_cache")?;
 
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
