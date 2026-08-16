@@ -2999,6 +2999,8 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     let cos_max_pos_i32 = crate::ops::checked_i32(cos_max_pos, "hd256 paged prep cos_max_pos")?;
     let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd256 paged prep rotary_dim")?;
 
+    let page_indices_len =
+        crate::ops::checked_i32(page_indices.len(), "hd256 paged prep page_indices len")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
     let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
@@ -3025,6 +3027,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
             geometry.k_offset_elems,
             geometry.v_offset_elems,
             pi_ptr as *const i32,
+            page_indices_len,
             page_origin_i32,
             num_q_heads_i32,
             num_kv_heads_i32,
@@ -3042,6 +3045,173 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     if result != 0 {
         anyhow::bail!(
             "qkv_norm_rope_paged_prefill_hd256_plain_cuda failed with error \
+             {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
+/// Per-request hd256 prep; `page_origins` is the released local-window front.
+/// Invalid device metadata traps before the first paged-pool access.
+#[allow(clippy::too_many_arguments)]
+pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    q_out: &mut HiddenStates,
+    kv_pool: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    layer: usize,
+    page_indices: &CudaSlice<i32>,
+    page_indptr: &CudaSlice<i32>,
+    page_origins: &CudaSlice<i32>,
+    positions: &CudaSlice<i32>,
+    cos_max_pos: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let batch = q.seq_len;
+    anyhow::ensure!(batch > 0, "hd256 paged decode prep needs a non-empty batch");
+    anyhow::ensure!(
+        Some(q.hidden_dim) == num_q_heads.checked_mul(256),
+        "hd256 paged decode prep q.hidden_dim {} != num_q_heads {} * 256",
+        q.hidden_dim,
+        num_q_heads
+    );
+    anyhow::ensure!(
+        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == batch,
+        "hd256 paged decode prep q_out [{} x {}] != q [{} x {batch}]",
+        q_out.hidden_dim,
+        q_out.seq_len,
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        Some(k.hidden_dim) == num_kv_heads.checked_mul(256) && k.seq_len == batch,
+        "hd256 paged decode prep k [{} x {}] != [num_kv_heads {} * 256 x {batch}]",
+        k.hidden_dim,
+        k.seq_len,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        v.hidden_dim == k.hidden_dim && v.seq_len == batch,
+        "hd256 paged decode prep v [{} x {}] != k [{} x {batch}]",
+        v.hidden_dim,
+        v.seq_len,
+        k.hidden_dim
+    );
+    let geometry = checked_paged_geometry(
+        "hd256 paged decode prep",
+        layout,
+        kv_pool.len(),
+        layer,
+        256,
+        num_kv_heads,
+    )?;
+    ensure_vec_backed(q_norm_weight, "hd256 paged decode prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd256 paged decode prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd256 paged decode prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd256 paged decode prep sin_cache")?;
+    anyhow::ensure!(
+        q_norm_weight.len == 256 && k_norm_weight.len == 256,
+        "hd256 paged decode prep norm weight lens {} / {} != 256",
+        q_norm_weight.len,
+        k_norm_weight.len
+    );
+    let table_rows = cos_max_pos.checked_mul(rotary_dim).ok_or_else(|| {
+        anyhow::anyhow!(
+            "hd256 paged decode prep cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim} overflows"
+        )
+    })?;
+    crate::ops::checked_i32(table_rows, "hd256 paged decode prep rope table extent")?;
+    anyhow::ensure!(
+        cos_cache.len >= table_rows && sin_cache.len >= table_rows,
+        "hd256 paged decode prep cos/sin lens {} / {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        cos_cache.len,
+        sin_cache.len
+    );
+    anyhow::ensure!(
+        positions.len() >= batch && page_origins.len() >= batch && page_indptr.len() > batch,
+        "hd256 paged decode prep metadata lens (positions {}, origins {}, indptr {}) \
+         do not cover batch {batch}",
+        positions.len(),
+        page_origins.len(),
+        page_indptr.len()
+    );
+    let page_indices_len = crate::ops::checked_i32(
+        page_indices.len(),
+        "hd256 paged decode prep page_indices len",
+    )?;
+    let q_elems = q.checked_extent("hd256 paged decode prep q")?;
+    q_out.checked_extent("hd256 paged decode prep q_out")?;
+    let k_elems = k.checked_extent("hd256 paged decode prep k")?;
+    v.checked_extent("hd256 paged decode prep v")?;
+    crate::ops::checked_i32(q_elems, "hd256 paged decode prep q extent")?;
+    crate::ops::checked_i32(k_elems, "hd256 paged decode prep k extent")?;
+    let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "hd256 paged decode prep q heads")?;
+    let num_kv_heads_i32 =
+        crate::ops::checked_i32(num_kv_heads, "hd256 paged decode prep kv heads")?;
+    let batch_i32 = crate::ops::checked_i32(batch, "hd256 paged decode prep batch")?;
+    let cos_max_pos_i32 =
+        crate::ops::checked_i32(cos_max_pos, "hd256 paged decode prep cos_max_pos")?;
+    let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd256 paged decode prep rotary_dim")?;
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    // The KV states own mutation; this call borrows the shared pool handle.
+    let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
+    let (ip_ptr, _gip) = page_indptr.device_ptr(&ctx.stream);
+    let (og_ptr, _gog) = page_origins.device_ptr(&ctx.stream);
+    let (ps_ptr, _gps) = positions.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::qkv_norm_rope_paged_decode_hd256_plain_cuda(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qo_ptr as *mut ffi::Half,
+            pool_ptr as *mut ffi::Half,
+            geometry.k_offset_elems,
+            geometry.v_offset_elems,
+            pi_ptr as *const i32,
+            page_indices_len,
+            ip_ptr as *const i32,
+            og_ptr as *const i32,
+            ps_ptr as *const i32,
+            num_q_heads_i32,
+            num_kv_heads_i32,
+            batch_i32,
+            cos_max_pos_i32,
+            rotary_dim_i32,
+            rms_eps,
+            geometry.page_size,
+            geometry.num_pages,
+            geometry.stride_page,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "qkv_norm_rope_paged_decode_hd256_plain_cuda failed with error \
              {result}{}",
             crate::ops::ffi_exception_message(result)
         );
@@ -3315,6 +3485,8 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     let cos_max_pos_i32 = crate::ops::checked_i32(cos_max_pos, "hd512 prefill prep cos_max_pos")?;
     let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd512 prefill prep rotary_dim")?;
 
+    let page_indices_len =
+        crate::ops::checked_i32(page_indices.len(), "hd512 paged prep page_indices len")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
@@ -3339,6 +3511,7 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
             geometry.k_offset_elems,
             geometry.v_offset_elems,
             pi_ptr as *const i32,
+            page_indices_len,
             num_q_heads_i32,
             num_kv_heads_i32,
             seq_len_i32,
@@ -3355,6 +3528,157 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     if result != 0 {
         anyhow::bail!(
             "qk_norm_partial_rope_paged_prefill_hd512_cuda failed with error \
+             {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
+/// Per-request hd512 prep for the non-evicting global cache; V is the K fork.
+/// Invalid device metadata traps before the first paged-pool access.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_partial_rope_paged_decode_hd512_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    q_out: &mut HiddenStates,
+    kv_pool: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    layer: usize,
+    page_indices: &CudaSlice<i32>,
+    page_indptr: &CudaSlice<i32>,
+    positions: &CudaSlice<i32>,
+    cos_max_pos: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let batch = q.seq_len;
+    anyhow::ensure!(batch > 0, "hd512 paged decode prep needs a non-empty batch");
+    anyhow::ensure!(
+        Some(q.hidden_dim) == num_q_heads.checked_mul(512),
+        "hd512 paged decode prep q.hidden_dim {} != num_q_heads {} * 512",
+        q.hidden_dim,
+        num_q_heads
+    );
+    anyhow::ensure!(
+        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == batch,
+        "hd512 paged decode prep q_out [{} x {}] != q [{} x {batch}]",
+        q_out.hidden_dim,
+        q_out.seq_len,
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        Some(k.hidden_dim) == num_kv_heads.checked_mul(512) && k.seq_len == batch,
+        "hd512 paged decode prep k [{} x {}] != [num_kv_heads {} * 512 x {batch}]",
+        k.hidden_dim,
+        k.seq_len,
+        num_kv_heads
+    );
+    let geometry = checked_paged_geometry(
+        "hd512 paged decode prep",
+        layout,
+        kv_pool.len(),
+        layer,
+        512,
+        num_kv_heads,
+    )?;
+    ensure_vec_backed(q_norm_weight, "hd512 paged decode prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd512 paged decode prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd512 paged decode prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd512 paged decode prep sin_cache")?;
+    anyhow::ensure!(
+        q_norm_weight.len == 512 && k_norm_weight.len == 512,
+        "hd512 paged decode prep norm weight lens {} / {} != 512",
+        q_norm_weight.len,
+        k_norm_weight.len
+    );
+    let table_rows = cos_max_pos.checked_mul(rotary_dim).ok_or_else(|| {
+        anyhow::anyhow!(
+            "hd512 paged decode prep cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim} overflows"
+        )
+    })?;
+    crate::ops::checked_i32(table_rows, "hd512 paged decode prep rope table extent")?;
+    anyhow::ensure!(
+        cos_cache.len >= table_rows && sin_cache.len >= table_rows,
+        "hd512 paged decode prep cos/sin lens {} / {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        cos_cache.len,
+        sin_cache.len
+    );
+    anyhow::ensure!(
+        positions.len() >= batch && page_indptr.len() > batch,
+        "hd512 paged decode prep metadata lens (positions {}, indptr {}) do not \
+         cover batch {batch}",
+        positions.len(),
+        page_indptr.len()
+    );
+    let page_indices_len = crate::ops::checked_i32(
+        page_indices.len(),
+        "hd512 paged decode prep page_indices len",
+    )?;
+    let q_elems = q.checked_extent("hd512 paged decode prep q")?;
+    q_out.checked_extent("hd512 paged decode prep q_out")?;
+    let k_elems = k.checked_extent("hd512 paged decode prep k")?;
+    crate::ops::checked_i32(q_elems, "hd512 paged decode prep q extent")?;
+    crate::ops::checked_i32(k_elems, "hd512 paged decode prep k extent")?;
+    let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "hd512 paged decode prep q heads")?;
+    let num_kv_heads_i32 =
+        crate::ops::checked_i32(num_kv_heads, "hd512 paged decode prep kv heads")?;
+    let batch_i32 = crate::ops::checked_i32(batch, "hd512 paged decode prep batch")?;
+    let cos_max_pos_i32 =
+        crate::ops::checked_i32(cos_max_pos, "hd512 paged decode prep cos_max_pos")?;
+    let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd512 paged decode prep rotary_dim")?;
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    // The KV states own mutation; this call borrows the shared pool handle.
+    let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
+    let (ip_ptr, _gip) = page_indptr.device_ptr(&ctx.stream);
+    let (ps_ptr, _gps) = positions.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::qk_norm_partial_rope_paged_decode_hd512_cuda(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qo_ptr as *mut ffi::Half,
+            pool_ptr as *mut ffi::Half,
+            geometry.k_offset_elems,
+            geometry.v_offset_elems,
+            pi_ptr as *const i32,
+            page_indices_len,
+            ip_ptr as *const i32,
+            ps_ptr as *const i32,
+            num_q_heads_i32,
+            num_kv_heads_i32,
+            batch_i32,
+            cos_max_pos_i32,
+            rotary_dim_i32,
+            rms_eps,
+            geometry.page_size,
+            geometry.num_pages,
+            geometry.stride_page,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "qk_norm_partial_rope_paged_decode_hd512_cuda failed with error \
              {result}{}",
             crate::ops::ffi_exception_message(result)
         );

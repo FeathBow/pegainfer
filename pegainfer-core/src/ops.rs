@@ -65,10 +65,12 @@ pub use pegainfer_kernels::ops::lora_decode_fused_delta_into;
 pub use pegainfer_kernels::ops::pack_lora_b_rows_into;
 pub use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd256_into;
 pub use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd512_into;
+pub use pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into;
 pub use pegainfer_kernels::ops::qk_norm_partial_rope_paged_prefill_hd512_into;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::qk_norm_rope_batch_decode_into;
 pub use pegainfer_kernels::ops::qk_norm_rope_prefill_hd256_plain_into;
+pub use pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into;
 pub use pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into;
 pub use pegainfer_kernels::ops::rms_norm;
 #[cfg(not(feature = "kernel-call-trace"))]
