@@ -303,7 +303,7 @@ pub struct KvDesc<'a> {
 }
 
 impl KvDesc<'_> {
-    pub(crate) fn last_page_len(&self) -> usize {
+    pub fn last_page_len(&self) -> usize {
         self.last_page_len
     }
 

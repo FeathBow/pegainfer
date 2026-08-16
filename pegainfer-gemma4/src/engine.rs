@@ -1,8 +1,9 @@
-//! The Gemma 4 engine: one owned thread serving requests serially through
-//! the KV-backed forward. Batching, CUDA graphs and the prefix cache are
-//! later stages; admission, generation, cancellation and release are real
-//! from day one.
+//! The Gemma 4 engine: one owned thread with iteration-level scheduling.
+//! Prefill runs whole at the step boundary; every active request then
+//! advances one token per batched decode step, sharing each layer's weight
+//! pass.
 
+use std::collections::VecDeque;
 use std::path::Path;
 
 use anyhow::Context as AnyhowContext;
@@ -16,12 +17,14 @@ use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::unix_now_s;
 use pegainfer_sample::LogprobRequest;
 use pegainfer_sample::SampleScratch;
 use tokio::sync::mpsc;
 
 use crate::forward::MULTIMODAL_PLACEHOLDER_IDS;
+use crate::kv::GemmaKv;
 use crate::kv::PAGE_SIZE;
 use crate::kv::admit_tokens;
 use crate::serve::GemmaServe;
@@ -32,6 +35,11 @@ use crate::weights::Gemma4Weights;
 /// checkpoint's 262k `max_position_embeddings` needs a table and KV budget
 /// design of its own.
 const MAX_CONTEXT: usize = 8192;
+
+/// Decode-batch ceiling: bounds the step buffers, the sampling scratch and
+/// the pool budget. Admission beyond it queues at the step boundary rather
+/// than rejecting.
+const MAX_CONCURRENCY: usize = 16;
 
 pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
     let dir = model_path
@@ -74,8 +82,55 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                     return;
                 }
             };
-            while let Some((request, prefix)) = submit_rx.blocking_recv() {
-                state.serve_request(&request, &prefix);
+            let mut pending: VecDeque<Submitted> = VecDeque::new();
+            let mut active: Vec<Active> = Vec::new();
+            let mut disconnected = false;
+            'engine: loop {
+                loop {
+                    match submit_rx.try_recv() {
+                        Ok(item) => pending.push_back(item),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if active.is_empty() && pending.is_empty() {
+                    if disconnected {
+                        break 'engine;
+                    }
+                    match submit_rx.blocking_recv() {
+                        Some(item) => pending.push_back(item),
+                        None => break 'engine,
+                    }
+                }
+                // A request that finishes inside its own prefill never takes
+                // a slot, so slot occupancy alone does not bound this loop:
+                // a backlog of one-token requests would prefill in full
+                // before the next decode round and stall every stream in
+                // flight for its whole length. Bound the attempts too, so a
+                // burst costs the streams a bounded number of prefills per
+                // token however deep it is.
+                let mut attempts = 0;
+                while attempts < MAX_CONCURRENCY && active.len() < MAX_CONCURRENCY {
+                    let Some(item) = pending.pop_front() else {
+                        break;
+                    };
+                    attempts += 1;
+                    let can_wait = !active.is_empty();
+                    match state.admit_and_prefill(item, can_wait) {
+                        Admitted::Active(request) => active.push(*request),
+                        Admitted::Done => {}
+                        Admitted::Requeue(item) => {
+                            pending.push_front(*item);
+                            break;
+                        }
+                    }
+                }
+                if !active.is_empty() {
+                    state.decode_round(&mut active);
+                }
             }
         })
         .context("spawn gemma4 engine thread")?;
@@ -173,6 +228,38 @@ fn suppress_logits(
     Ok(())
 }
 
+type Submitted = pegainfer_frontend::engine::SubmittedRequest;
+
+/// One in-flight request between decode steps: its KV, the token that feeds
+/// the next step, and its progress counters.
+struct Active {
+    request: GenerateRequest,
+    kv: GemmaKv,
+    next: u32,
+    emitted: usize,
+    prompt_tokens: usize,
+}
+
+enum Admitted {
+    Active(Box<Active>),
+    /// Finished, refused, cancelled or failed: nothing carries forward.
+    Done,
+    /// The pools cannot hold it right now; retry once pages return.
+    Requeue(Box<Submitted>),
+}
+
+fn send_scheduled(request: &GenerateRequest, prompt_tokens: usize) -> bool {
+    request
+        .token_tx
+        .send(TokenEvent::Scheduled {
+            queued_at_unix_s: request.queued_at_unix_s.unwrap_or_else(unix_now_s),
+            scheduled_at_unix_s: unix_now_s(),
+            prompt_tokens,
+            cached_tokens: 0,
+        })
+        .is_ok()
+}
+
 /// Everything the engine thread owns for the life of the process. CUDA state
 /// is thread-affine, so it is built here rather than handed in: a context or
 /// cuBLAS handle minted on the caller thread fails with invalid-handle on the
@@ -198,13 +285,18 @@ impl EngineState {
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
         policy.check_against_vocab(vocab)?;
-        // One request at a time, and a prompt is prefilled in one step: both
-        // families hold every position of it before the window releases
-        // anything, so each pool is sized for a full-context request plus its
-        // padding page.
-        let pages = MAX_CONTEXT.div_ceil(PAGE_SIZE) + 1;
-        let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, pages, pages)?;
-        let scratch = SampleScratch::new(&ctx, vocab, 1)?;
+        // Pool budget for a batch. A prefilling request holds every page of
+        // its prompt until that step releases, so the local pool carries one
+        // full-context transient on top of the window-capped steady footprint
+        // of the other active requests; the global family never releases, so
+        // it stays linear in context for each request's whole lifetime. Both
+        // pools add the padding page they reserve.
+        let context_pages = MAX_CONTEXT.div_ceil(PAGE_SIZE);
+        let window_pages = weights.config.sliding_window.div_ceil(PAGE_SIZE) + 1;
+        let local_pages = context_pages + (MAX_CONCURRENCY - 1) * window_pages + 1;
+        let global_pages = MAX_CONCURRENCY * context_pages + 1;
+        let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, local_pages, global_pages)?;
+        let scratch = SampleScratch::new(&ctx, vocab, MAX_CONCURRENCY)?;
         let blocked = ctx
             .stream
             .clone_htod(&[bf16::NEG_INFINITY])
@@ -220,32 +312,28 @@ impl EngineState {
         })
     }
 
-    fn serve_request(
-        &mut self,
-        request: &GenerateRequest,
-        prefix: &pegainfer_frontend::engine::KvPrefix,
-    ) {
+    /// Validate, admit and prefill one request whole, emit its first token,
+    /// and hand it to the decode batch. An admission refusal is a refusal to
+    /// the client only when no active request could free the pages it needs;
+    /// otherwise the request waits at the queue head.
+    fn admit_and_prefill(&mut self, item: Submitted, can_wait: bool) -> Admitted {
+        let (request, prefix) = item;
         let sink = request.token_tx.clone();
         if sink.is_closed() {
-            return;
+            return Admitted::Done;
         }
         let prompt_tokens = request.prompt_tokens.len();
-        let scheduled = TokenEvent::Scheduled {
-            queued_at_unix_s: request.queued_at_unix_s.unwrap_or_else(unix_now_s),
-            scheduled_at_unix_s: unix_now_s(),
-            prompt_tokens,
-            cached_tokens: 0,
-        };
-        if sink.send(scheduled).is_err() {
-            return;
-        }
-
+        // Scheduled is paired with whatever ends the request, so a refusal
+        // emits it first rather than leaving the client with no lifecycle.
         let reject = |message: String| {
-            let _ = sink.send(TokenEvent::Rejected {
-                message,
-                prompt_tokens,
-                completion_tokens: 0,
-            });
+            if send_scheduled(&request, prompt_tokens) {
+                let _ = sink.send(TokenEvent::Rejected {
+                    message,
+                    prompt_tokens,
+                    completion_tokens: 0,
+                });
+            }
+            Admitted::Done
         };
         if prompt_tokens == 0 {
             return reject("empty prompt".into());
@@ -283,90 +371,242 @@ impl EngineState {
             }
         }
 
-        match self.generate(request) {
-            Ok((finish_reason, completion_tokens)) => {
-                let _ = sink.send(TokenEvent::Finished {
-                    finish_reason,
-                    prompt_tokens,
-                    completion_tokens,
-                });
-            }
-            Err(err) => {
-                log::error!("request failed: {err:#}");
-                let _ = sink.send(TokenEvent::Error {
-                    message: format!("{err:#}"),
-                    prompt_tokens,
-                    completion_tokens: 0,
-                });
-            }
-        }
-    }
-
-    /// Run one request to completion. Cancellation is the sink refusing an
-    /// event: every emitted token checks, and the request retires mid-stream
-    /// with its KV released by drop.
-    fn generate(&mut self, request: &GenerateRequest) -> Result<(FinishReason, usize)> {
-        let sink = &request.token_tx;
         let mut kv = self.serve.alloc_kv();
-
-        admit_tokens(
+        if let Err(err) = admit_tokens(
             &self.serve.local_pool,
             &self.serve.global_pool,
             &mut kv,
-            request.prompt_tokens.len(),
-        )?;
-        let mut logits = self.serve.step(
+            prompt_tokens,
+        ) {
+            if can_wait {
+                return Admitted::Requeue(Box::new((request, prefix)));
+            }
+            return reject(format!("admission refused: {err:#}"));
+        }
+        if !send_scheduled(&request, prompt_tokens) {
+            return Admitted::Done;
+        }
+
+        let fail = |message: String| {
+            let _ = sink.send(TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens: 0,
+            });
+            Admitted::Done
+        };
+        let mut logits = match self.serve.step(
             &self.ctx,
             &mut kv,
             &request.prompt_tokens,
             LogitsSpan::LastRow,
-        )?;
+        ) {
+            Ok(logits) => logits,
+            Err(err) => return fail(format!("{err:#}")),
+        };
+        if let Err(err) =
+            suppress_logits(&self.ctx, &self.blocked, &mut logits, &self.policy.suppress)
+        {
+            return fail(format!("{err:#}"));
+        }
 
-        let mut emitted = 0usize;
-        loop {
-            suppress_logits(&self.ctx, &self.blocked, &mut logits, &self.policy.suppress)?;
-            self.sample_nonce = self.sample_nonce.wrapping_add(1);
-            let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
-            let next = pegainfer_sample::select_batch(
+        self.sample_nonce = self.sample_nonce.wrapping_add(1);
+        let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
+        let next = match pegainfer_sample::select_batch(
+            &self.ctx,
+            &logits,
+            &[&request.params],
+            &[0],
+            call_seed,
+            &mut self.scratch,
+        ) {
+            Ok(tokens) => tokens[0],
+            Err(err) => return fail(format!("{err:#}")),
+        };
+        let finish = |reason: FinishReason, completion_tokens: usize| {
+            let _ = sink.send(TokenEvent::Finished {
+                finish_reason: reason,
+                prompt_tokens,
+                completion_tokens,
+            });
+            Admitted::Done
+        };
+        // The stop token retires the request without being emitted: the
+        // frontend appends its own sentinel for a terminal Stop and drops the
+        // last id, so an engine that emits EOS costs the client its final
+        // visible token.
+        if !request.params.ignore_eos && self.policy.eos.contains(&next) {
+            return finish(FinishReason::Stop, 0);
+        }
+        let logprob = if request.logprobs > 0 {
+            match pegainfer_sample::token_logprobs_batch(
                 &self.ctx,
                 &logits,
-                &[&request.params],
-                &[emitted as u64],
+                &[LogprobRequest {
+                    row: 0,
+                    picked: next,
+                    top_k: request.logprobs,
+                }],
+            ) {
+                Ok(mut scored) => scored.pop(),
+                Err(err) => return fail(format!("{err:#}")),
+            }
+        } else {
+            None
+        };
+        if sink.send(TokenEvent::Token { id: next, logprob }).is_err() {
+            return Admitted::Done;
+        }
+        if request.max_tokens <= 1 {
+            return finish(FinishReason::Length, 1);
+        }
+        Admitted::Active(Box::new(Active {
+            request,
+            kv,
+            next,
+            emitted: 1,
+            prompt_tokens,
+        }))
+    }
+
+    /// One batched decode step: every active request advances a token,
+    /// sharing each layer's weight pass. A cancelled request and a request
+    /// the pools cannot grow for retire before the batch is built; a finished
+    /// one retires after its token lands.
+    fn decode_round(&mut self, active: &mut Vec<Active>) {
+        let mut row = 0;
+        while row < active.len() {
+            let entry = &mut active[row];
+            if entry.request.token_tx.is_closed() {
+                active.swap_remove(row);
+                continue;
+            }
+            if let Err(err) = admit_tokens(
+                &self.serve.local_pool,
+                &self.serve.global_pool,
+                &mut entry.kv,
+                1,
+            ) {
+                let _ = entry.request.token_tx.send(TokenEvent::Error {
+                    message: format!("{err:#}"),
+                    prompt_tokens: entry.prompt_tokens,
+                    completion_tokens: entry.emitted,
+                });
+                active.swap_remove(row);
+                continue;
+            }
+            row += 1;
+        }
+        if active.is_empty() {
+            return;
+        }
+
+        let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
+            log::error!("{what} failed: {err:#}");
+            for entry in active.drain(..) {
+                let _ = entry.request.token_tx.send(TokenEvent::Error {
+                    message: format!("{what} failed: {err:#}"),
+                    prompt_tokens: entry.prompt_tokens,
+                    completion_tokens: entry.emitted,
+                });
+            }
+        };
+
+        let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
+        let mut logits = {
+            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            match self.serve.decode_batch_step(&self.ctx, &mut kvs, &tokens) {
+                Ok(logits) => logits,
+                Err(err) => return fail_batch(active, "batched decode", &err),
+            }
+        };
+        if let Err(err) =
+            suppress_logits(&self.ctx, &self.blocked, &mut logits, &self.policy.suppress)
+        {
+            return fail_batch(active, "suppression", &err);
+        }
+
+        self.sample_nonce = self.sample_nonce.wrapping_add(1);
+        let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
+        let picked = {
+            let params: Vec<_> = active.iter().map(|entry| &entry.request.params).collect();
+            let steps: Vec<u64> = active.iter().map(|entry| entry.emitted as u64).collect();
+            match pegainfer_sample::select_batch(
+                &self.ctx,
+                &logits,
+                &params,
+                &steps,
                 call_seed,
                 &mut self.scratch,
-            )?[0];
-            // The stop token retires the request without being emitted: the
-            // frontend appends its own protocol sentinel for the terminal Stop
-            // and unconditionally drops the last id, so an engine that emits EOS
-            // costs the client its final visible token.
-            if !request.params.ignore_eos && self.policy.eos.contains(&next) {
-                return Ok((FinishReason::Stop, emitted));
+            ) {
+                Ok(picked) => picked,
+                Err(err) => return fail_batch(active, "batched sampling", &err),
             }
-            let logprob = if request.logprobs > 0 {
-                pegainfer_sample::token_logprobs_batch(
-                    &self.ctx,
-                    &logits,
-                    &[LogprobRequest {
-                        row: 0,
-                        picked: next,
-                        top_k: request.logprobs,
-                    }],
-                )?
-                .pop()
-            } else {
-                None
-            };
-            emitted += 1;
-            if sink.send(TokenEvent::Token { id: next, logprob }).is_err() {
-                return Ok((FinishReason::Stop, emitted));
+        };
+        let mut stops = vec![false; active.len()];
+        for (row, entry) in active.iter().enumerate() {
+            stops[row] = !entry.request.params.ignore_eos && self.policy.eos.contains(&picked[row]);
+        }
+        let lp_requests: Vec<LogprobRequest> = active
+            .iter()
+            .enumerate()
+            .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[*row])
+            .map(|(row, entry)| LogprobRequest {
+                row,
+                picked: picked[row],
+                top_k: entry.request.logprobs,
+            })
+            .collect();
+        let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len()];
+        if !lp_requests.is_empty() {
+            match pegainfer_sample::token_logprobs_batch(&self.ctx, &logits, &lp_requests) {
+                Ok(scored) => {
+                    for (request, logprob) in lp_requests.iter().zip(scored) {
+                        logprobs[request.row] = Some(logprob);
+                    }
+                }
+                Err(err) => return fail_batch(active, "batched logprobs", &err),
             }
-            if emitted >= request.max_tokens {
-                return Ok((FinishReason::Length, emitted));
+        }
+
+        let mut retire: Vec<usize> = Vec::new();
+        for (row, entry) in active.iter_mut().enumerate() {
+            if stops[row] {
+                let _ = entry.request.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: entry.prompt_tokens,
+                    completion_tokens: entry.emitted,
+                });
+                retire.push(row);
+                continue;
             }
-            admit_tokens(&self.serve.local_pool, &self.serve.global_pool, &mut kv, 1)?;
-            logits = self
-                .serve
-                .step(&self.ctx, &mut kv, &[next], LogitsSpan::LastRow)?;
+            let token = picked[row];
+            entry.emitted += 1;
+            if entry
+                .request
+                .token_tx
+                .send(TokenEvent::Token {
+                    id: token,
+                    logprob: logprobs[row].take(),
+                })
+                .is_err()
+            {
+                retire.push(row);
+                continue;
+            }
+            if entry.emitted >= entry.request.max_tokens {
+                let _ = entry.request.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Length,
+                    prompt_tokens: entry.prompt_tokens,
+                    completion_tokens: entry.emitted,
+                });
+                retire.push(row);
+                continue;
+            }
+            entry.next = token;
+        }
+        for row in retire.into_iter().rev() {
+            active.swap_remove(row);
         }
     }
 }

@@ -14,6 +14,7 @@
 
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
+use cudarc::driver::CudaSlice;
 use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
@@ -42,16 +43,26 @@ pub(crate) enum LogitsSpan {
     All,
 }
 
-/// One step's plan: the layer forwards consume this and nothing
-/// else. Both families' attention plans are built over the same token span.
+/// How a step feeds the preps. The tower above them is the same either way;
+/// only the metadata a prep reads changes.
+enum StepPrep {
+    Single {
+        start_pos: usize,
+        /// Absolute page the local resident row starts at. The preps shift
+        /// only the row index by it; RoPE stays on absolute positions.
+        local_page_origin: usize,
+    },
+    /// One row per request. Each row's page window and absolute position are
+    /// the ones its family's plan already carries; what the plans do not
+    /// carry is the sliding family's released front, one page index per row.
+    Batched { local_origins: CudaSlice<i32> },
+}
+
 pub(crate) struct GemmaStepPlan {
-    pub(crate) start_pos: usize,
     pub(crate) seq_len: usize,
     local_plan: PrefillPagedPlan,
     global_plan: PrefillPagedPlan,
-    /// Absolute page the local resident row starts at. The preps shift only
-    /// the row index by it; RoPE stays on absolute positions.
-    local_page_origin: usize,
+    prep: StepPrep,
 }
 
 /// Everything a serving step needs that outlives requests.
@@ -253,11 +264,13 @@ impl GemmaServe {
             self.global_geom.head_dim,
         )?;
         Ok(GemmaStepPlan {
-            start_pos,
             seq_len,
             local_plan,
             global_plan,
-            local_page_origin: kv.local.origin_pages(),
+            prep: StepPrep::Single {
+                start_pos,
+                local_page_origin: kv.local.origin_pages(),
+            },
         })
     }
 
@@ -309,28 +322,60 @@ impl GemmaServe {
         ops::gemm_rows_into_checked(ctx, v_proj, 0, kv_dim, &normed_x, &mut v_states)?;
 
         let mut q_prep = HiddenStates::zeros(ctx, q_dim, seq_len)?;
-        ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
-            ctx,
-            &q_states,
-            &k_states,
-            &v_states,
-            &mut q_prep,
-            self.local_pool.buffer(),
-            &self.local_pool.layout().kernel_layout(),
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.sliding_cos,
-            &self.sliding_sin,
-            family_layer,
-            plan.local_plan.page_indices_d(),
-            plan.local_page_origin,
-            plan.start_pos,
-            self.cos_max_pos,
-            geom.num_q_heads,
-            geom.num_kv_heads,
-            geom.head_dim,
-            geom.rms_norm_eps,
-        )?;
+        match &plan.prep {
+            StepPrep::Single {
+                start_pos,
+                local_page_origin,
+            } => {
+                ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
+                    ctx,
+                    &q_states,
+                    &k_states,
+                    &v_states,
+                    &mut q_prep,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.sliding_cos,
+                    &self.sliding_sin,
+                    family_layer,
+                    plan.local_plan.page_indices_d(),
+                    *local_page_origin,
+                    *start_pos,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+            }
+            StepPrep::Batched { local_origins } => {
+                ops::qkv_norm_rope_paged_decode_hd256_plain_into(
+                    ctx,
+                    &q_states,
+                    &k_states,
+                    &v_states,
+                    &mut q_prep,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.sliding_cos,
+                    &self.sliding_sin,
+                    family_layer,
+                    plan.local_plan.page_indices_d(),
+                    plan.local_plan.page_indptr_d(),
+                    local_origins,
+                    plan.global_plan.positions_d(),
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+            }
+        }
 
         let mut attn = HiddenStates::zeros(ctx, q_dim, seq_len)?;
         let window_left = i32::try_from(self.sliding_window - 1).expect("window fits i32");
@@ -396,26 +441,53 @@ impl GemmaServe {
         // The prep writes both K and the weightless-normed V fork from the
         // one raw K read — no D2D fork copy on the serving path.
         let mut q_prep = HiddenStates::zeros(ctx, q_dim, seq_len)?;
-        ops::qk_norm_partial_rope_paged_prefill_hd512_into(
-            ctx,
-            &q_states,
-            &k_states,
-            &mut q_prep,
-            self.global_pool.buffer(),
-            &self.global_pool.layout().kernel_layout(),
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.global_cos,
-            &self.global_sin,
-            family_layer,
-            plan.global_plan.page_indices_d(),
-            plan.start_pos,
-            self.cos_max_pos,
-            geom.num_q_heads,
-            geom.num_kv_heads,
-            geom.head_dim,
-            geom.rms_norm_eps,
-        )?;
+        match &plan.prep {
+            StepPrep::Single { start_pos, .. } => {
+                ops::qk_norm_partial_rope_paged_prefill_hd512_into(
+                    ctx,
+                    &q_states,
+                    &k_states,
+                    &mut q_prep,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.global_cos,
+                    &self.global_sin,
+                    family_layer,
+                    plan.global_plan.page_indices_d(),
+                    *start_pos,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+            }
+            StepPrep::Batched { .. } => {
+                ops::qk_norm_partial_rope_paged_decode_hd512_into(
+                    ctx,
+                    &q_states,
+                    &k_states,
+                    &mut q_prep,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.global_cos,
+                    &self.global_sin,
+                    family_layer,
+                    plan.global_plan.page_indices_d(),
+                    plan.global_plan.page_indptr_d(),
+                    plan.global_plan.positions_d(),
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+            }
+        }
 
         let mut attn = HiddenStates::zeros(ctx, q_dim, seq_len)?;
         ops::batch_prefill_paged_hd512_into(
@@ -432,8 +504,186 @@ impl GemmaServe {
         attention_epilogue(ctx, layer, geom, x, &attn)
     }
 
-    /// One tower step over `tokens` at the current frontier: admission must
-    /// already have granted the pages, and both families advance by the end.
+    /// Plan one decode step for a whole batch: every request contributes one
+    /// row, so both families' plans are ragged and each row's page window and
+    /// position ride the plan its family already needs.
+    fn plan_decode_batch(
+        &self,
+        ctx: &DeviceContext,
+        kvs: &[&mut GemmaKv],
+    ) -> Result<GemmaStepPlan> {
+        let batch = kvs.len();
+        let page = self.local_pool.layout().page_size;
+        let mut local_rows: Vec<Vec<i32>> = Vec::with_capacity(batch);
+        let mut local_last = Vec::with_capacity(batch);
+        let mut local_start = Vec::with_capacity(batch);
+        let mut global_rows: Vec<Vec<i32>> = Vec::with_capacity(batch);
+        let mut global_last = Vec::with_capacity(batch);
+        let mut global_start = Vec::with_capacity(batch);
+        let mut local_origins = Vec::with_capacity(batch);
+        let ones = vec![1usize; batch];
+
+        for kv in kvs {
+            let start_pos = kv.local.seq_len();
+            let kv_len = start_pos + 1;
+            self.check_step_bounds(kv, kv_len)?;
+            // The local plan lives in cache-relative coordinates, the same
+            // way a single-request step builds it.
+            let origin_tokens = kv.local.origin_pages() * page;
+            let rel_kv_len = kv_len
+                .checked_sub(origin_tokens)
+                .context("the resident window starts past the step's frontier")?;
+            let rel_start = start_pos
+                .checked_sub(origin_tokens)
+                .context("the step starts before the resident window")?;
+            let row = kv.local.page_row();
+            anyhow::ensure!(
+                row.len() == rel_kv_len.div_ceil(page),
+                "local resident row of {} pages against {rel_kv_len} tokens",
+                row.len()
+            );
+            let rel_last_page = if rel_kv_len.is_multiple_of(page) {
+                page
+            } else {
+                rel_kv_len % page
+            };
+            // desc_for_len checks the held pages against this step's length,
+            // so its last-page rule and the state's page ids describe the
+            // same rows.
+            let global_desc = kv.global.desc_for_len(kv_len)?;
+            local_origins.push(i32::try_from(kv.local.origin_pages()).context("origin fits i32")?);
+            local_last.push(rel_last_page);
+            local_start.push(rel_start);
+            local_rows.push(row);
+            global_last.push(global_desc.last_page_len());
+            // The global family never releases its front, so it plans in
+            // absolute coordinates and its per-token positions are the step's
+            // — which is what both preps read.
+            global_start.push(start_pos);
+            global_rows.push(kv.global.page_indices_i32());
+        }
+
+        let local_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+            ctx,
+            &local_rows,
+            &local_last,
+            &local_start,
+            &ones,
+            self.local_geom.num_q_heads,
+            self.local_geom.num_kv_heads,
+            self.local_geom.head_dim,
+            0,
+        )?;
+        let global_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+            ctx,
+            &global_rows,
+            &global_last,
+            &global_start,
+            &ones,
+            self.global_geom.num_q_heads,
+            self.global_geom.num_kv_heads,
+            self.global_geom.head_dim,
+            0,
+        )?;
+
+        let local_origins = ctx
+            .stream
+            .clone_htod(&local_origins)
+            .map_err(|err| anyhow::anyhow!("decode batch origins H2D failed: {err}"))?;
+        Ok(GemmaStepPlan {
+            seq_len: batch,
+            local_plan,
+            global_plan,
+            prep: StepPrep::Batched { local_origins },
+        })
+    }
+
+    /// The stream that built the pools is the one that ordered every page
+    /// write already in them, so a step on any other stream has no ordering
+    /// against the KV it is about to read.
+    fn check_stream(&self, ctx: &DeviceContext) -> Result<()> {
+        anyhow::ensure!(
+            std::sync::Arc::ptr_eq(&ctx.stream, self.local_pool.buffer().stream()),
+            "a step must use the DeviceContext stream that constructed this GemmaServe"
+        );
+        Ok(())
+    }
+
+    /// Embed `tokens` and run every layer. Single and batched steps differ in
+    /// the plan they hand down, not in the tower they walk.
+    fn run_tower(
+        &self,
+        ctx: &DeviceContext,
+        tokens: &[u32],
+        plan: &GemmaStepPlan,
+    ) -> Result<HiddenStates> {
+        let weights = &self.weights;
+        let ids = ctx
+            .stream
+            .clone_htod(tokens)
+            .map_err(|err| anyhow::anyhow!("token ids H2D failed: {err}"))?;
+        let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, tokens.len())?;
+        ops::embedding_batch(ctx, &weights.embed_tokens, &ids, &mut hidden)?;
+        ops::scale_bf16_in_place(
+            ctx,
+            &mut hidden,
+            embed_scale_bf16(self.local_geom.hidden_size),
+        )?;
+        for (index, kind) in weights.config.layer_types.iter().enumerate() {
+            let layer = &weights.layers[index];
+            let family_layer = self.family_index[index];
+            hidden = match kind {
+                LayerKind::Sliding => {
+                    self.local_layer_serve(ctx, layer, family_layer, &hidden, plan)?
+                }
+                LayerKind::Global => {
+                    self.global_layer_serve(ctx, layer, family_layer, &hidden, plan)?
+                }
+            };
+        }
+        Ok(hidden)
+    }
+
+    /// One batched decode step: each request advances a single token and the
+    /// batch shares every layer's weight pass. Row `r` of the returned logits
+    /// is request `r`'s next-token distribution.
+    pub(crate) fn decode_batch_step(
+        &self,
+        ctx: &DeviceContext,
+        kvs: &mut [&mut GemmaKv],
+        tokens: &[u32],
+    ) -> Result<HiddenStates> {
+        let batch = kvs.len();
+        anyhow::ensure!(batch > 0, "a decode batch needs at least one request");
+        anyhow::ensure!(
+            tokens.len() == batch,
+            "decode batch has {batch} requests but {} tokens",
+            tokens.len()
+        );
+        self.check_stream(ctx)?;
+        let weights = &self.weights;
+        validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
+
+        let plan = self.plan_decode_batch(ctx, kvs)?;
+        let hidden = self.run_tower(ctx, tokens, &plan)?;
+        // Every row is its own request's last position, so the whole batch is
+        // the head's input.
+        let logits = logits_tail(
+            ctx,
+            weights,
+            &hidden,
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+        )?;
+        // Append-then-attend, per request: the batch shared a step, but each
+        // request owns its own frontier and its own released front.
+        for kv in kvs.iter_mut() {
+            kv.local.advance_and_release(1, self.sliding_window)?;
+            kv.global.advance(1);
+        }
+        Ok(logits)
+    }
+
     pub(crate) fn step(
         &self,
         ctx: &DeviceContext,
@@ -443,46 +693,19 @@ impl GemmaServe {
     ) -> Result<HiddenStates> {
         let seq_len = tokens.len();
         anyhow::ensure!(seq_len > 0, "step needs at least one token");
+        self.check_stream(ctx)?;
         let weights = &self.weights;
-        anyhow::ensure!(
-            std::sync::Arc::ptr_eq(&ctx.stream, self.local_pool.buffer().stream()),
-            "step must use the DeviceContext stream that constructed this GemmaServe"
-        );
         validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
         let start_pos = kv.local.seq_len();
         self.check_step_bounds(kv, start_pos + seq_len)?;
         let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
         log::debug!(
-            "gemma4 step: start_pos {} seq_len {seq_len} pages local {} global {}",
-            plan.start_pos,
+            "gemma4 step: start_pos {start_pos} seq_len {seq_len} pages local {} global {}",
             kv.local.held_pages(),
             kv.global.held_pages()
         );
 
-        let ids = ctx
-            .stream
-            .clone_htod(tokens)
-            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
-        let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, seq_len)?;
-        ops::embedding_batch(ctx, &weights.embed_tokens, &ids, &mut hidden)?;
-        ops::scale_bf16_in_place(
-            ctx,
-            &mut hidden,
-            embed_scale_bf16(self.local_geom.hidden_size),
-        )?;
-
-        for (index, kind) in weights.config.layer_types.iter().enumerate() {
-            let layer = &weights.layers[index];
-            let family_layer = self.family_index[index];
-            hidden = match kind {
-                LayerKind::Sliding => {
-                    self.local_layer_serve(ctx, layer, family_layer, &hidden, &plan)?
-                }
-                LayerKind::Global => {
-                    self.global_layer_serve(ctx, layer, family_layer, &hidden, &plan)?
-                }
-            };
-        }
+        let hidden = self.run_tower(ctx, tokens, &plan)?;
         // Projecting every prompt row through the 262k LM head materializes
         // half a gigabyte at this path's 1024-token ceiling, so the full span
         // is for callers that actually read every position.
