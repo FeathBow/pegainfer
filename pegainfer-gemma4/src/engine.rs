@@ -29,6 +29,7 @@ use crate::kv::PAGE_SIZE;
 use crate::kv::admit_tokens;
 use crate::serve::GemmaServe;
 use crate::serve::LogitsSpan;
+use crate::serve::StepArena;
 use crate::weights::Gemma4Weights;
 
 /// Serving ceiling: bounds the rope tables and the pool budget. The
@@ -267,6 +268,7 @@ fn send_scheduled(request: &GenerateRequest, prompt_tokens: usize) -> bool {
 struct EngineState {
     ctx: DeviceContext,
     serve: GemmaServe,
+    arena: StepArena,
     scratch: SampleScratch,
     policy: GenerationPolicy,
     /// The value written into a suppressed slot, resident on the device so a
@@ -297,6 +299,7 @@ impl EngineState {
         let global_pages = MAX_CONCURRENCY * context_pages + 1;
         let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, local_pages, global_pages)?;
         let scratch = SampleScratch::new(&ctx, vocab, MAX_CONCURRENCY)?;
+        let arena = serve.alloc_step_arena(&ctx, MAX_CONCURRENCY)?;
         let blocked = ctx
             .stream
             .clone_htod(&[bf16::NEG_INFINITY])
@@ -304,6 +307,7 @@ impl EngineState {
         Ok(Self {
             ctx,
             serve,
+            arena,
             scratch,
             policy,
             blocked,
@@ -515,7 +519,10 @@ impl EngineState {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let mut logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
-            match self.serve.decode_batch_step(&self.ctx, &mut kvs, &tokens) {
+            match self
+                .serve
+                .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
+            {
                 Ok(logits) => logits,
                 Err(err) => return fail_batch(active, "batched decode", &err),
             }

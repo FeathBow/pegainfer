@@ -192,10 +192,66 @@ fn weightless_value_norm(
     Ok(v_normed)
 }
 
-/// Everything downstream of attention — o_proj through the `layer_scalar`
-/// multiply (applied after both residual adds, not either branch) — is
-/// identical for both layer kinds; one implementation keeps the two
-/// forwards' numerics from drifting apart.
+/// Buffers one [`attention_epilogue_into`] call needs. The serving path holds
+/// one across every layer of every step; the oracle builds a fresh one per
+/// call, which is what the allocating [`attention_epilogue`] does.
+pub(crate) struct EpilogueScratch {
+    max_rows: usize,
+    attn_proj: HiddenStates,
+    o_normed: HiddenStates,
+    h2: HiddenStates,
+    mlp_in: HiddenStates,
+    gate: HiddenStates,
+    up: HiddenStates,
+    act: HiddenStates,
+    down: HiddenStates,
+    down_normed: HiddenStates,
+}
+
+impl EpilogueScratch {
+    pub(crate) fn new(ctx: &DeviceContext, geom: &LayerGeometry, max_rows: usize) -> Result<Self> {
+        let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
+        let wide = |rows| HiddenStates::zeros(ctx, geom.intermediate_size, rows);
+        Ok(Self {
+            max_rows,
+            attn_proj: hidden(max_rows)?,
+            o_normed: hidden(max_rows)?,
+            h2: hidden(max_rows)?,
+            mlp_in: hidden(max_rows)?,
+            gate: wide(max_rows)?,
+            up: wide(max_rows)?,
+            act: wide(max_rows)?,
+            down: hidden(max_rows)?,
+            down_normed: hidden(max_rows)?,
+        })
+    }
+
+    /// Reshape every buffer to this step's row count, refusing one past the
+    /// allocation: the ops only assert that tensors agree with each other,
+    /// so an oversize count would reach a kernel as an out-of-bounds write.
+    pub(crate) fn set_rows(&mut self, seq_len: usize) -> Result<()> {
+        anyhow::ensure!(
+            seq_len <= self.max_rows,
+            "epilogue scratch holds {} rows, not {seq_len}",
+            self.max_rows
+        );
+        for buf in [
+            &mut self.attn_proj,
+            &mut self.o_normed,
+            &mut self.h2,
+            &mut self.mlp_in,
+            &mut self.gate,
+            &mut self.up,
+            &mut self.act,
+            &mut self.down,
+            &mut self.down_normed,
+        ] {
+            buf.seq_len = seq_len;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn attention_epilogue(
     ctx: &DeviceContext,
     layer: &Gemma4Layer,
@@ -203,71 +259,102 @@ pub(crate) fn attention_epilogue(
     x: &HiddenStates,
     attn: &HiddenStates,
 ) -> Result<HiddenStates> {
+    let mut scratch = EpilogueScratch::new(ctx, geom, x.seq_len)?;
+    let mut out = HiddenStates::zeros(ctx, geom.hidden_size, x.seq_len)?;
+    attention_epilogue_into(ctx, layer, geom, x, attn, &mut scratch, &mut out)?;
+    Ok(out)
+}
+
+/// Everything downstream of attention — o_proj through the `layer_scalar`
+/// multiply (applied after both residual adds, not either branch) — is
+/// identical for both layer kinds; one implementation keeps the two
+/// forwards' numerics from drifting apart.
+pub(crate) fn attention_epilogue_into(
+    ctx: &DeviceContext,
+    layer: &Gemma4Layer,
+    geom: &LayerGeometry,
+    x: &HiddenStates,
+    attn: &HiddenStates,
+    scratch: &mut EpilogueScratch,
+    out: &mut HiddenStates,
+) -> Result<()> {
     let seq_len = x.seq_len;
-    let mut attn_proj = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    let scratch_rows = scratch.attn_proj.seq_len;
+    anyhow::ensure!(
+        scratch_rows == seq_len,
+        "epilogue scratch is shaped for {scratch_rows} rows, not {seq_len}"
+    );
+    let out_elems = geom
+        .hidden_size
+        .checked_mul(seq_len)
+        .context("epilogue output extent overflows")?;
+    anyhow::ensure!(
+        out.data.len() >= out_elems,
+        "epilogue output holds {} elements, not {out_elems}",
+        out.data.len()
+    );
+    out.hidden_dim = geom.hidden_size;
+    out.seq_len = seq_len;
     ops::gemm_rows_into_checked(
         ctx,
         &layer.attention.o_proj,
         0,
         geom.hidden_size,
         attn,
-        &mut attn_proj,
+        &mut scratch.attn_proj,
     )?;
-    let mut o_normed = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
     ops::rms_norm_batch_into(
         ctx,
-        &attn_proj,
+        &scratch.attn_proj,
         &layer.post_attention_layernorm,
         geom.rms_norm_eps,
-        &mut o_normed,
+        &mut scratch.o_normed,
     );
-    let mut h2 = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::add_batch_into(ctx, x, &o_normed, &mut h2)?;
+    ops::add_batch_into(ctx, x, &scratch.o_normed, &mut scratch.h2)?;
 
-    let mut mlp_in = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
     ops::rms_norm_batch_into(
         ctx,
-        &h2,
+        &scratch.h2,
         &layer.pre_feedforward_layernorm,
         geom.rms_norm_eps,
-        &mut mlp_in,
+        &mut scratch.mlp_in,
     );
-    let mut gate = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
-    let mut up = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
     ops::gemm_rows_into_checked(
         ctx,
         &layer.mlp.gate,
         0,
         geom.intermediate_size,
-        &mlp_in,
-        &mut gate,
+        &scratch.mlp_in,
+        &mut scratch.gate,
     )?;
     ops::gemm_rows_into_checked(
         ctx,
         &layer.mlp.up,
         0,
         geom.intermediate_size,
-        &mlp_in,
-        &mut up,
+        &scratch.mlp_in,
+        &mut scratch.up,
     )?;
-    let mut act = HiddenStates::zeros(ctx, geom.intermediate_size, seq_len)?;
-    ops::gelu_tanh_mul_batch_into(ctx, &gate, &up, &mut act)?;
-    let mut down = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::gemm_rows_into_checked(ctx, &layer.mlp.down, 0, geom.hidden_size, &act, &mut down)?;
-    let mut down_normed = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+    ops::gelu_tanh_mul_batch_into(ctx, &scratch.gate, &scratch.up, &mut scratch.act)?;
+    ops::gemm_rows_into_checked(
+        ctx,
+        &layer.mlp.down,
+        0,
+        geom.hidden_size,
+        &scratch.act,
+        &mut scratch.down,
+    )?;
     ops::rms_norm_batch_into(
         ctx,
-        &down,
+        &scratch.down,
         &layer.post_feedforward_layernorm,
         geom.rms_norm_eps,
-        &mut down_normed,
+        &mut scratch.down_normed,
     );
 
-    let mut out = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-    ops::add_batch_into(ctx, &h2, &down_normed, &mut out)?;
-    ops::scale_bf16_in_place(ctx, &mut out, layer.layer_scalar)?;
-
-    Ok(out)
+    ops::add_batch_into(ctx, &scratch.h2, &scratch.down_normed, out)?;
+    ops::scale_bf16_in_place(ctx, out, layer.layer_scalar)?;
+    Ok(())
 }
 
 /// Runs one local layer on `x` (`[hidden_size, seq_len]`), tokens at

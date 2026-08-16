@@ -587,6 +587,9 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
     // occupies at that step; out[request][step] collects results back by
     // request, wherever it sat.
     let run = |orders: &[Vec<usize>]| -> Vec<Vec<Vec<f32>>> {
+        let mut arena = serve
+            .alloc_step_arena(&ctx, lengths.len())
+            .expect("step arena");
         let mut kvs: Vec<GemmaKv> = lengths.iter().map(|_| serve.alloc_kv()).collect();
         for (request, kv) in kvs.iter_mut().enumerate() {
             let prompt = prompt_of(request);
@@ -623,7 +626,7 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
                 tokens.push(feed_of(request, step));
             }
             let logits = serve
-                .decode_batch_step(&ctx, &mut borrowed, &tokens)
+                .decode_batch_step(&ctx, &mut arena, &mut borrowed, &tokens)
                 .expect("decode");
             let host = logits.to_host(&ctx).expect("D2H");
             let vocab = logits.hidden_dim;

@@ -30,8 +30,9 @@ use crate::forward::validate_tokens;
 use crate::kv::GemmaKv;
 use crate::kv::PAGE_SIZE;
 use crate::kv::SlidingLocalKv;
+use crate::layer::EpilogueScratch;
 use crate::layer::LayerGeometry;
-use crate::layer::attention_epilogue;
+use crate::layer::attention_epilogue_into;
 use crate::layer::build_proportional_rope_tables;
 use crate::weights::Gemma4Layer;
 use crate::weights::Gemma4Weights;
@@ -63,6 +64,24 @@ pub(crate) struct GemmaStepPlan {
     local_plan: PrefillPagedPlan,
     global_plan: PrefillPagedPlan,
     prep: StepPrep,
+}
+
+pub(crate) struct StepArena {
+    epilogue: EpilogueScratch,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+impl StepArena {
+    /// Settle the step's preconditions — the allocation stream and a row
+    /// count the buffers can hold — since neither can be safely deferred
+    /// until the epilogue, by which point the step has already written KV.
+    fn open(&mut self, ctx: &DeviceContext, rows: usize) -> Result<()> {
+        anyhow::ensure!(
+            std::sync::Arc::ptr_eq(&ctx.stream, &self.stream),
+            "a step arena must be used on the stream it was allocated on"
+        );
+        self.epilogue.set_rows(rows)
+    }
 }
 
 /// Everything a serving step needs that outlives requests.
@@ -177,6 +196,17 @@ impl GemmaServe {
         })
     }
 
+    pub(crate) fn alloc_step_arena(
+        &self,
+        ctx: &DeviceContext,
+        max_rows: usize,
+    ) -> Result<StepArena> {
+        Ok(StepArena {
+            epilogue: EpilogueScratch::new(ctx, &self.local_geom, max_rows)?,
+            stream: ctx.stream.clone(),
+        })
+    }
+
     pub(crate) fn alloc_kv(&self) -> GemmaKv {
         GemmaKv {
             local: SlidingLocalKv::new(self.local_pool.clone()),
@@ -277,6 +307,7 @@ impl GemmaServe {
     fn local_layer_serve(
         &self,
         ctx: &DeviceContext,
+        epilogue: &mut EpilogueScratch,
         layer: &Gemma4Layer,
         family_layer: usize,
         x: &HiddenStates,
@@ -391,12 +422,15 @@ impl GemmaServe {
             1.0,
             window_left,
         )?;
-        attention_epilogue(ctx, layer, geom, x, &attn)
+        let mut out = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+        attention_epilogue_into(ctx, layer, geom, x, &attn, epilogue, &mut out)?;
+        Ok(out)
     }
 
     fn global_layer_serve(
         &self,
         ctx: &DeviceContext,
+        epilogue: &mut EpilogueScratch,
         layer: &Gemma4Layer,
         family_layer: usize,
         x: &HiddenStates,
@@ -501,7 +535,9 @@ impl GemmaServe {
             geom.num_q_heads,
             1.0,
         )?;
-        attention_epilogue(ctx, layer, geom, x, &attn)
+        let mut out = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
+        attention_epilogue_into(ctx, layer, geom, x, &attn, epilogue, &mut out)?;
+        Ok(out)
     }
 
     /// Plan one decode step for a whole batch: every request contributes one
@@ -614,6 +650,7 @@ impl GemmaServe {
     fn run_tower(
         &self,
         ctx: &DeviceContext,
+        epilogue: &mut EpilogueScratch,
         tokens: &[u32],
         plan: &GemmaStepPlan,
     ) -> Result<HiddenStates> {
@@ -634,10 +671,10 @@ impl GemmaServe {
             let family_layer = self.family_index[index];
             hidden = match kind {
                 LayerKind::Sliding => {
-                    self.local_layer_serve(ctx, layer, family_layer, &hidden, plan)?
+                    self.local_layer_serve(ctx, epilogue, layer, family_layer, &hidden, plan)?
                 }
                 LayerKind::Global => {
-                    self.global_layer_serve(ctx, layer, family_layer, &hidden, plan)?
+                    self.global_layer_serve(ctx, epilogue, layer, family_layer, &hidden, plan)?
                 }
             };
         }
@@ -650,6 +687,7 @@ impl GemmaServe {
     pub(crate) fn decode_batch_step(
         &self,
         ctx: &DeviceContext,
+        arena: &mut StepArena,
         kvs: &mut [&mut GemmaKv],
         tokens: &[u32],
     ) -> Result<HiddenStates> {
@@ -664,8 +702,9 @@ impl GemmaServe {
         let weights = &self.weights;
         validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
 
+        arena.open(ctx, batch)?;
         let plan = self.plan_decode_batch(ctx, kvs)?;
-        let hidden = self.run_tower(ctx, tokens, &plan)?;
+        let hidden = self.run_tower(ctx, &mut arena.epilogue, tokens, &plan)?;
         // Every row is its own request's last position, so the whole batch is
         // the head's input.
         let logits = logits_tail(
@@ -705,7 +744,8 @@ impl GemmaServe {
             kv.global.held_pages()
         );
 
-        let hidden = self.run_tower(ctx, tokens, &plan)?;
+        let mut scratch = EpilogueScratch::new(ctx, &self.local_geom, seq_len)?;
+        let hidden = self.run_tower(ctx, &mut scratch, tokens, &plan)?;
         // Projecting every prompt row through the 262k LM head materializes
         // half a gigabyte at this path's 1024-token ceiling, so the full span
         // is for callers that actually read every position.
