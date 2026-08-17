@@ -1,9 +1,10 @@
 //! KV-backed serving forward: two KV families, prefill and decode, and
 //! atomic dual-pool admission.
 //!
-//! The layer forwards take a `GemmaStepPlan` and the pools this module owns,
-//! never a request's state. Both coordinate systems (absolute positions for
-//! RoPE, cache-relative slots for the paged scatter) coincide below the
+//! The layer forwards take the step's plans and prep metadata and the
+//! pools this module owns, never a request's state. Both coordinate systems
+//! (absolute positions for RoPE, cache-relative slots for the paged
+//! scatter) coincide below the
 //! sliding window; past it the local family releases its front, and
 //! `origin_pages` is what converts between the two.
 //!
@@ -26,6 +27,7 @@ use pegainfer_core::tensor::HiddenStates;
 use crate::config::LayerKind;
 use crate::forward::embed_scale_bf16;
 use crate::forward::logits_tail;
+use crate::forward::logits_tail_into;
 use crate::forward::validate_tokens;
 use crate::kv::GemmaKv;
 use crate::kv::PAGE_SIZE;
@@ -46,7 +48,8 @@ pub(crate) enum LogitsSpan {
 
 /// How a step feeds the preps. The tower above them is the same either way;
 /// only the metadata a prep reads changes.
-enum StepPrep {
+#[derive(Clone, Copy)]
+enum PrepRef<'a> {
     Single {
         start_pos: usize,
         /// Absolute page the local resident row starts at. The preps shift
@@ -56,18 +59,136 @@ enum StepPrep {
     /// One row per request. Each row's page window and absolute position are
     /// the ones its family's plan already carries; what the plans do not
     /// carry is the sliding family's released front, one page index per row.
-    Batched { local_origins: CudaSlice<i32> },
+    Batched { local_origins: &'a CudaSlice<i32> },
 }
 
-pub(crate) struct GemmaStepPlan {
-    pub(crate) seq_len: usize,
+struct GemmaStepPlan {
+    start_pos: usize,
+    local_page_origin: usize,
     local_plan: PrefillPagedPlan,
     global_plan: PrefillPagedPlan,
-    prep: StepPrep,
+}
+
+fn upload_prefix<T: cudarc::driver::DeviceRepr>(
+    ctx: &DeviceContext,
+    slot: &mut CudaSlice<T>,
+    values: &[T],
+) -> Result<()> {
+    anyhow::ensure!(
+        values.len() <= slot.len(),
+        "step metadata of {} entries overruns its {} entry slot",
+        values.len(),
+        slot.len()
+    );
+    let mut view = slot.slice_mut(..values.len());
+    ctx.stream
+        .memcpy_htod(values, &mut view)
+        .map_err(|err| anyhow::anyhow!("step metadata H2D failed: {err}"))
+}
+
+/// The attention path's working set. Both families run the same tower over
+/// the same rows, so one set serves both: each buffer is allocated at the
+/// wider family's width and reshaped per layer.
+struct AttnScratch {
+    normed_x: HiddenStates,
+    q_states: HiddenStates,
+    k_states: HiddenStates,
+    v_states: HiddenStates,
+    q_prep: HiddenStates,
+    attn: HiddenStates,
+}
+
+impl AttnScratch {
+    fn new(
+        ctx: &DeviceContext,
+        local: &LayerGeometry,
+        global: &LayerGeometry,
+        max_rows: usize,
+    ) -> Result<Self> {
+        let q_dim = |geom: &LayerGeometry| geom.num_q_heads * geom.head_dim;
+        let kv_dim = |geom: &LayerGeometry| geom.num_kv_heads * geom.head_dim;
+        let q_max = q_dim(local).max(q_dim(global));
+        let kv_max = kv_dim(local).max(kv_dim(global));
+        Ok(Self {
+            normed_x: HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
+            q_states: HiddenStates::zeros(ctx, q_max, max_rows)?,
+            k_states: HiddenStates::zeros(ctx, kv_max, max_rows)?,
+            v_states: HiddenStates::zeros(ctx, kv_max, max_rows)?,
+            q_prep: HiddenStates::zeros(ctx, q_max, max_rows)?,
+            attn: HiddenStates::zeros(ctx, q_max, max_rows)?,
+        })
+    }
+
+    fn set(&mut self, geom: &LayerGeometry, seq_len: usize) {
+        let q_dim = geom.num_q_heads * geom.head_dim;
+        let kv_dim = geom.num_kv_heads * geom.head_dim;
+        for (buf, hidden_dim) in [
+            (&mut self.normed_x, geom.hidden_size),
+            (&mut self.q_states, q_dim),
+            (&mut self.k_states, kv_dim),
+            (&mut self.v_states, kv_dim),
+            (&mut self.q_prep, q_dim),
+            (&mut self.attn, q_dim),
+        ] {
+            buf.hidden_dim = hidden_dim;
+            buf.seq_len = seq_len;
+        }
+    }
+}
+
+/// The tower's whole working set for one step: attention buffers, epilogue
+/// buffers, and the hidden pair the layers alternate between so no layer
+/// writes the buffer it is reading.
+struct TowerScratch {
+    attn: AttnScratch,
+    epilogue: EpilogueScratch,
+    hidden: [HiddenStates; 2],
+}
+
+impl TowerScratch {
+    fn new(
+        ctx: &DeviceContext,
+        local: &LayerGeometry,
+        global: &LayerGeometry,
+        max_rows: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            attn: AttnScratch::new(ctx, local, global, max_rows)?,
+            epilogue: EpilogueScratch::new(ctx, local, max_rows)?,
+            hidden: [
+                HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
+                HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
+            ],
+        })
+    }
+
+    fn open(&mut self, seq_len: usize) -> Result<()> {
+        self.epilogue.set_rows(seq_len)?;
+        for buf in &mut self.hidden {
+            buf.seq_len = seq_len;
+        }
+        Ok(())
+    }
+}
+
+fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &mut HiddenStates) {
+    let (first, second) = hidden.split_at_mut(1);
+    if src == 0 {
+        (&first[0], &mut second[0])
+    } else {
+        (&second[0], &mut first[0])
+    }
 }
 
 pub(crate) struct StepArena {
-    epilogue: EpilogueScratch,
+    tower: TowerScratch,
+    local_plan: PrefillPagedPlan,
+    global_plan: PrefillPagedPlan,
+    local_origins: CudaSlice<i32>,
+    ids: CudaSlice<u32>,
+    head_normed: HiddenStates,
+    logits: HiddenStates,
+    max_rows: usize,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
 }
 
@@ -80,7 +201,12 @@ impl StepArena {
             std::sync::Arc::ptr_eq(&ctx.stream, &self.stream),
             "a step arena must be used on the stream it was allocated on"
         );
-        self.epilogue.set_rows(rows)
+        anyhow::ensure!(
+            rows <= self.max_rows,
+            "step of {rows} rows exceeds the arena's {} row ceiling",
+            self.max_rows
+        );
+        self.tower.open(rows)
     }
 }
 
@@ -196,13 +322,40 @@ impl GemmaServe {
         })
     }
 
+    /// One arena per engine thread, sized for the decode step; a prompt
+    /// builds a [`TowerScratch`] for its own width instead. A request's
+    /// tiles are `ceil(rows * group / cta_tile_q)` with a positive
+    /// `cta_tile_q`, so `rows * group` bounds each plan.
     pub(crate) fn alloc_step_arena(
         &self,
         ctx: &DeviceContext,
         max_rows: usize,
     ) -> Result<StepArena> {
+        let group = |geom: &LayerGeometry| geom.num_q_heads / geom.num_kv_heads;
+        let alloc = |err: &'static str| {
+            move |e: cudarc::driver::DriverError| anyhow::anyhow!("{err} alloc failed: {e}")
+        };
         Ok(StepArena {
-            epilogue: EpilogueScratch::new(ctx, &self.local_geom, max_rows)?,
+            tower: TowerScratch::new(ctx, &self.local_geom, &self.global_geom, max_rows)?,
+            local_plan: PrefillPagedPlan::new_preallocated(
+                ctx,
+                max_rows,
+                self.local_pool.capacity_pages(),
+                max_rows,
+                max_rows * group(&self.local_geom),
+            )?,
+            global_plan: PrefillPagedPlan::new_preallocated(
+                ctx,
+                max_rows,
+                self.global_pool.capacity_pages(),
+                max_rows,
+                max_rows * group(&self.global_geom),
+            )?,
+            local_origins: ctx.stream.alloc_zeros(max_rows).map_err(alloc("origins"))?,
+            ids: ctx.stream.alloc_zeros(max_rows).map_err(alloc("ids"))?,
+            head_normed: HiddenStates::zeros(ctx, self.local_geom.hidden_size, max_rows)?,
+            logits: HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, max_rows)?,
+            max_rows,
             stream: ctx.stream.clone(),
         })
     }
@@ -294,27 +447,27 @@ impl GemmaServe {
             self.global_geom.head_dim,
         )?;
         Ok(GemmaStepPlan {
-            seq_len,
+            start_pos,
+            local_page_origin: kv.local.origin_pages(),
             local_plan,
             global_plan,
-            prep: StepPrep::Single {
-                start_pos,
-                local_page_origin: kv.local.origin_pages(),
-            },
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn local_layer_serve(
         &self,
         ctx: &DeviceContext,
-        epilogue: &mut EpilogueScratch,
+        tower: &mut TowerScratch,
         layer: &Gemma4Layer,
         family_layer: usize,
-        x: &HiddenStates,
-        plan: &GemmaStepPlan,
-    ) -> Result<HiddenStates> {
+        seq_len: usize,
+        prep: PrepRef<'_>,
+        local_plan: &PrefillPagedPlan,
+        global_plan: &PrefillPagedPlan,
+        src: usize,
+    ) -> Result<()> {
         let geom = &self.local_geom;
-        let seq_len = plan.seq_len;
         let q_dim = geom.num_q_heads * geom.head_dim;
         let kv_dim = geom.num_kv_heads * geom.head_dim;
         let v_proj = layer
@@ -322,48 +475,57 @@ impl GemmaServe {
             .v_proj
             .as_ref()
             .context("local layer requires v_proj")?;
+        let TowerScratch {
+            attn: scratch,
+            epilogue,
+            hidden,
+        } = tower;
+        scratch.set(geom, seq_len);
+        let (x, out) = hidden_pair(hidden, src);
 
-        let mut normed_x = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
         ops::rms_norm_batch_into(
             ctx,
             x,
             &layer.input_layernorm,
             geom.rms_norm_eps,
-            &mut normed_x,
+            &mut scratch.normed_x,
         );
-        let mut q_states = HiddenStates::zeros(ctx, q_dim, seq_len)?;
-        let mut k_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
-        let mut v_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
         ops::gemm_rows_into_checked(
             ctx,
             &layer.attention.q_proj,
             0,
             q_dim,
-            &normed_x,
-            &mut q_states,
+            &scratch.normed_x,
+            &mut scratch.q_states,
         )?;
         ops::gemm_rows_into_checked(
             ctx,
             &layer.attention.k_proj,
             0,
             kv_dim,
-            &normed_x,
-            &mut k_states,
+            &scratch.normed_x,
+            &mut scratch.k_states,
         )?;
-        ops::gemm_rows_into_checked(ctx, v_proj, 0, kv_dim, &normed_x, &mut v_states)?;
+        ops::gemm_rows_into_checked(
+            ctx,
+            v_proj,
+            0,
+            kv_dim,
+            &scratch.normed_x,
+            &mut scratch.v_states,
+        )?;
 
-        let mut q_prep = HiddenStates::zeros(ctx, q_dim, seq_len)?;
-        match &plan.prep {
-            StepPrep::Single {
+        match prep {
+            PrepRef::Single {
                 start_pos,
                 local_page_origin,
             } => {
                 ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
                     ctx,
-                    &q_states,
-                    &k_states,
-                    &v_states,
-                    &mut q_prep,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &scratch.v_states,
+                    &mut scratch.q_prep,
                     self.local_pool.buffer(),
                     &self.local_pool.layout().kernel_layout(),
                     &layer.attention.q_norm,
@@ -371,9 +533,9 @@ impl GemmaServe {
                     &self.sliding_cos,
                     &self.sliding_sin,
                     family_layer,
-                    plan.local_plan.page_indices_d(),
-                    *local_page_origin,
-                    *start_pos,
+                    local_plan.page_indices_d(),
+                    local_page_origin,
+                    start_pos,
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
@@ -381,13 +543,13 @@ impl GemmaServe {
                     geom.rms_norm_eps,
                 )?;
             }
-            StepPrep::Batched { local_origins } => {
+            PrepRef::Batched { local_origins } => {
                 ops::qkv_norm_rope_paged_decode_hd256_plain_into(
                     ctx,
-                    &q_states,
-                    &k_states,
-                    &v_states,
-                    &mut q_prep,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &scratch.v_states,
+                    &mut scratch.q_prep,
                     self.local_pool.buffer(),
                     &self.local_pool.layout().kernel_layout(),
                     &layer.attention.q_norm,
@@ -395,10 +557,10 @@ impl GemmaServe {
                     &self.sliding_cos,
                     &self.sliding_sin,
                     family_layer,
-                    plan.local_plan.page_indices_d(),
-                    plan.local_plan.page_indptr_d(),
+                    local_plan.page_indices_d(),
+                    local_plan.page_indptr_d(),
                     local_origins,
-                    plan.global_plan.positions_d(),
+                    global_plan.positions_d(),
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
@@ -408,80 +570,82 @@ impl GemmaServe {
             }
         }
 
-        let mut attn = HiddenStates::zeros(ctx, q_dim, seq_len)?;
         let window_left = i32::try_from(self.sliding_window - 1).expect("window fits i32");
         ops::batch_prefill_paged_window_hd256_into(
             ctx,
-            &q_prep,
+            &scratch.q_prep,
             self.local_pool.buffer(),
             &self.local_pool.layout().kernel_layout(),
             family_layer,
-            &plan.local_plan,
-            &mut attn,
+            local_plan,
+            &mut scratch.attn,
             geom.num_q_heads,
             1.0,
             window_left,
         )?;
-        let mut out = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-        attention_epilogue_into(ctx, layer, geom, x, &attn, epilogue, &mut out)?;
-        Ok(out)
+        attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn global_layer_serve(
         &self,
         ctx: &DeviceContext,
-        epilogue: &mut EpilogueScratch,
+        tower: &mut TowerScratch,
         layer: &Gemma4Layer,
         family_layer: usize,
-        x: &HiddenStates,
-        plan: &GemmaStepPlan,
-    ) -> Result<HiddenStates> {
+        seq_len: usize,
+        prep: PrepRef<'_>,
+        global_plan: &PrefillPagedPlan,
+        src: usize,
+    ) -> Result<()> {
         let geom = &self.global_geom;
-        let seq_len = plan.seq_len;
         let q_dim = geom.num_q_heads * geom.head_dim;
         let kv_dim = geom.num_kv_heads * geom.head_dim;
         anyhow::ensure!(
             layer.attention.v_proj.is_none(),
             "global layer must not carry a v_proj; V is the k_proj fork"
         );
+        let TowerScratch {
+            attn: scratch,
+            epilogue,
+            hidden,
+        } = tower;
+        scratch.set(geom, seq_len);
+        let (x, out) = hidden_pair(hidden, src);
 
-        let mut normed_x = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
         ops::rms_norm_batch_into(
             ctx,
             x,
             &layer.input_layernorm,
             geom.rms_norm_eps,
-            &mut normed_x,
+            &mut scratch.normed_x,
         );
-        let mut q_states = HiddenStates::zeros(ctx, q_dim, seq_len)?;
-        let mut k_states = HiddenStates::zeros(ctx, kv_dim, seq_len)?;
         ops::gemm_rows_into_checked(
             ctx,
             &layer.attention.q_proj,
             0,
             q_dim,
-            &normed_x,
-            &mut q_states,
+            &scratch.normed_x,
+            &mut scratch.q_states,
         )?;
         ops::gemm_rows_into_checked(
             ctx,
             &layer.attention.k_proj,
             0,
             kv_dim,
-            &normed_x,
-            &mut k_states,
+            &scratch.normed_x,
+            &mut scratch.k_states,
         )?;
 
         // The prep writes both K and the weightless-normed V fork from the
         // one raw K read — no D2D fork copy on the serving path.
-        let mut q_prep = HiddenStates::zeros(ctx, q_dim, seq_len)?;
-        match &plan.prep {
-            StepPrep::Single { start_pos, .. } => {
+        match prep {
+            PrepRef::Single { start_pos, .. } => {
                 ops::qk_norm_partial_rope_paged_prefill_hd512_into(
                     ctx,
-                    &q_states,
-                    &k_states,
-                    &mut q_prep,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &mut scratch.q_prep,
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     &layer.attention.q_norm,
@@ -489,8 +653,8 @@ impl GemmaServe {
                     &self.global_cos,
                     &self.global_sin,
                     family_layer,
-                    plan.global_plan.page_indices_d(),
-                    *start_pos,
+                    global_plan.page_indices_d(),
+                    start_pos,
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
@@ -498,12 +662,12 @@ impl GemmaServe {
                     geom.rms_norm_eps,
                 )?;
             }
-            StepPrep::Batched { .. } => {
+            PrepRef::Batched { .. } => {
                 ops::qk_norm_partial_rope_paged_decode_hd512_into(
                     ctx,
-                    &q_states,
-                    &k_states,
-                    &mut q_prep,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &mut scratch.q_prep,
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     &layer.attention.q_norm,
@@ -511,9 +675,9 @@ impl GemmaServe {
                     &self.global_cos,
                     &self.global_sin,
                     family_layer,
-                    plan.global_plan.page_indices_d(),
-                    plan.global_plan.page_indptr_d(),
-                    plan.global_plan.positions_d(),
+                    global_plan.page_indices_d(),
+                    global_plan.page_indptr_d(),
+                    global_plan.positions_d(),
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
@@ -523,31 +687,29 @@ impl GemmaServe {
             }
         }
 
-        let mut attn = HiddenStates::zeros(ctx, q_dim, seq_len)?;
         ops::batch_prefill_paged_hd512_into(
             ctx,
-            &q_prep,
+            &scratch.q_prep,
             self.global_pool.buffer(),
             &self.global_pool.layout().kernel_layout(),
             family_layer,
-            &plan.global_plan,
-            &mut attn,
+            global_plan,
+            &mut scratch.attn,
             geom.num_q_heads,
             1.0,
         )?;
-        let mut out = HiddenStates::zeros(ctx, geom.hidden_size, seq_len)?;
-        attention_epilogue_into(ctx, layer, geom, x, &attn, epilogue, &mut out)?;
-        Ok(out)
+        attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
     }
 
-    /// Plan one decode step for a whole batch: every request contributes one
-    /// row, so both families' plans are ragged and each row's page window and
-    /// position ride the plan its family already needs.
+    #[allow(clippy::too_many_arguments)]
     fn plan_decode_batch(
         &self,
         ctx: &DeviceContext,
+        local_plan: &mut PrefillPagedPlan,
+        global_plan: &mut PrefillPagedPlan,
+        origins_slot: &mut CudaSlice<i32>,
         kvs: &[&mut GemmaKv],
-    ) -> Result<GemmaStepPlan> {
+    ) -> Result<()> {
         let batch = kvs.len();
         let page = self.local_pool.layout().page_size;
         let mut local_rows: Vec<Vec<i32>> = Vec::with_capacity(batch);
@@ -599,7 +761,7 @@ impl GemmaServe {
             global_rows.push(kv.global.page_indices_i32());
         }
 
-        let local_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+        local_plan.update_batch_with_cta_tile_q(
             ctx,
             &local_rows,
             &local_last,
@@ -610,7 +772,7 @@ impl GemmaServe {
             self.local_geom.head_dim,
             0,
         )?;
-        let global_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+        global_plan.update_batch_with_cta_tile_q(
             ctx,
             &global_rows,
             &global_last,
@@ -621,17 +783,7 @@ impl GemmaServe {
             self.global_geom.head_dim,
             0,
         )?;
-
-        let local_origins = ctx
-            .stream
-            .clone_htod(&local_origins)
-            .map_err(|err| anyhow::anyhow!("decode batch origins H2D failed: {err}"))?;
-        Ok(GemmaStepPlan {
-            seq_len: batch,
-            local_plan,
-            global_plan,
-            prep: StepPrep::Batched { local_origins },
-        })
+        upload_prefix(ctx, origins_slot, &local_origins)
     }
 
     /// The stream that built the pools is the one that ordered every page
@@ -645,52 +797,72 @@ impl GemmaServe {
         Ok(())
     }
 
-    /// Embed `tokens` and run every layer. Single and batched steps differ in
-    /// the plan they hand down, not in the tower they walk.
+    /// Returns the hidden slot holding the tower's output.
+    #[allow(clippy::too_many_arguments)]
     fn run_tower(
         &self,
         ctx: &DeviceContext,
-        epilogue: &mut EpilogueScratch,
-        tokens: &[u32],
-        plan: &GemmaStepPlan,
-    ) -> Result<HiddenStates> {
+        tower: &mut TowerScratch,
+        ids: &CudaSlice<u32>,
+        seq_len: usize,
+        local_plan: &PrefillPagedPlan,
+        global_plan: &PrefillPagedPlan,
+        prep: PrepRef<'_>,
+    ) -> Result<usize> {
         let weights = &self.weights;
-        let ids = ctx
-            .stream
-            .clone_htod(tokens)
-            .map_err(|err| anyhow::anyhow!("token ids H2D failed: {err}"))?;
-        let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, tokens.len())?;
-        ops::embedding_batch(ctx, &weights.embed_tokens, &ids, &mut hidden)?;
+        ops::embedding_batch(ctx, &weights.embed_tokens, ids, &mut tower.hidden[0])?;
         ops::scale_bf16_in_place(
             ctx,
-            &mut hidden,
+            &mut tower.hidden[0],
             embed_scale_bf16(self.local_geom.hidden_size),
         )?;
+        let mut src = 0usize;
         for (index, kind) in weights.config.layer_types.iter().enumerate() {
             let layer = &weights.layers[index];
             let family_layer = self.family_index[index];
-            hidden = match kind {
+            match kind {
                 LayerKind::Sliding => {
-                    self.local_layer_serve(ctx, epilogue, layer, family_layer, &hidden, plan)?
+                    self.local_layer_serve(
+                        ctx,
+                        tower,
+                        layer,
+                        family_layer,
+                        seq_len,
+                        prep,
+                        local_plan,
+                        global_plan,
+                        src,
+                    )?;
                 }
                 LayerKind::Global => {
-                    self.global_layer_serve(ctx, epilogue, layer, family_layer, &hidden, plan)?
+                    self.global_layer_serve(
+                        ctx,
+                        tower,
+                        layer,
+                        family_layer,
+                        seq_len,
+                        prep,
+                        global_plan,
+                        src,
+                    )?;
                 }
-            };
+            }
+            src ^= 1;
         }
-        Ok(hidden)
+        Ok(src)
     }
 
     /// One batched decode step: each request advances a single token and the
     /// batch shares every layer's weight pass. Row `r` of the returned logits
-    /// is request `r`'s next-token distribution.
-    pub(crate) fn decode_batch_step(
+    /// is request `r`'s next-token distribution; they live in the arena and
+    /// are valid until its next step.
+    pub(crate) fn decode_batch_step<'a>(
         &self,
         ctx: &DeviceContext,
-        arena: &mut StepArena,
+        arena: &'a mut StepArena,
         kvs: &mut [&mut GemmaKv],
         tokens: &[u32],
-    ) -> Result<HiddenStates> {
+    ) -> Result<&'a mut HiddenStates> {
         let batch = kvs.len();
         anyhow::ensure!(batch > 0, "a decode batch needs at least one request");
         anyhow::ensure!(
@@ -703,16 +875,37 @@ impl GemmaServe {
         validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
 
         arena.open(ctx, batch)?;
-        let plan = self.plan_decode_batch(ctx, kvs)?;
-        let hidden = self.run_tower(ctx, &mut arena.epilogue, tokens, &plan)?;
+        let StepArena {
+            tower,
+            local_plan,
+            global_plan,
+            local_origins,
+            ids,
+            head_normed,
+            logits,
+            ..
+        } = arena;
+        self.plan_decode_batch(ctx, local_plan, global_plan, local_origins, kvs)?;
+        upload_prefix(ctx, ids, tokens)?;
+        let src = self.run_tower(
+            ctx,
+            tower,
+            ids,
+            batch,
+            local_plan,
+            global_plan,
+            PrepRef::Batched { local_origins },
+        )?;
         // Every row is its own request's last position, so the whole batch is
         // the head's input.
-        let logits = logits_tail(
+        logits_tail_into(
             ctx,
             weights,
-            &hidden,
+            &tower.hidden[src],
             self.local_geom.rms_norm_eps,
             self.final_logit_softcapping,
+            head_normed,
+            logits,
         )?;
         // Append-then-attend, per request: the batch shared a step, but each
         // request owns its own frontier and its own released front.
@@ -744,17 +937,33 @@ impl GemmaServe {
             kv.global.held_pages()
         );
 
-        let mut scratch = EpilogueScratch::new(ctx, &self.local_geom, seq_len)?;
-        let hidden = self.run_tower(ctx, &mut scratch, tokens, &plan)?;
+        let mut tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, seq_len)?;
+        let ids = ctx
+            .stream
+            .clone_htod(tokens)
+            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
+        let src = self.run_tower(
+            ctx,
+            &mut tower,
+            &ids,
+            seq_len,
+            &plan.local_plan,
+            &plan.global_plan,
+            PrepRef::Single {
+                start_pos: plan.start_pos,
+                local_page_origin: plan.local_page_origin,
+            },
+        )?;
+        let hidden = &tower.hidden[src];
         // Projecting every prompt row through the 262k LM head materializes
         // half a gigabyte at this path's 1024-token ceiling, so the full span
         // is for callers that actually read every position.
         let mut last_row_slot = None;
         let head_input = match span {
-            LogitsSpan::All => &hidden,
+            LogitsSpan::All => hidden,
             LogitsSpan::LastRow => {
                 let mut last = HiddenStates::zeros(ctx, hidden.hidden_dim, 1)?;
-                ops::copy_hidden_token_range_into(ctx, &hidden, seq_len - 1, &mut last, 0, 1)?;
+                ops::copy_hidden_token_range_into(ctx, hidden, seq_len - 1, &mut last, 0, 1)?;
                 &*last_row_slot.insert(last)
             }
         };

@@ -135,22 +135,63 @@ pub(crate) fn logits_tail(
 ) -> Result<HiddenStates> {
     let seq_len = hidden.seq_len;
     let mut normed = HiddenStates::zeros(ctx, hidden.hidden_dim, seq_len)?;
-    ops::rms_norm_batch_into(ctx, hidden, &weights.norm, rms_norm_eps, &mut normed);
-
-    // Tied embeddings: the LM head is the embedding matrix itself.
-    let vocab_size = weights.embed_tokens.rows;
-    let mut logits = HiddenStates::zeros(ctx, vocab_size, seq_len)?;
-    ops::gemm_rows_into_checked(
+    let mut logits = HiddenStates::zeros(ctx, weights.embed_tokens.rows, seq_len)?;
+    logits_tail_into(
         ctx,
-        &weights.embed_tokens,
-        0,
-        vocab_size,
-        &normed,
+        weights,
+        hidden,
+        rms_norm_eps,
+        final_logit_softcapping,
+        &mut normed,
         &mut logits,
     )?;
-    ops::softcap_bf16_in_place(ctx, &mut logits, final_logit_softcapping)?;
-
     Ok(logits)
+}
+
+/// The arena form: `normed` and `logits` are caller-owned buffers reshaped to
+/// this call's row count, so the decode loop reaches the head without
+/// allocating.
+pub(crate) fn logits_tail_into(
+    ctx: &DeviceContext,
+    weights: &Gemma4Weights,
+    hidden: &HiddenStates,
+    rms_norm_eps: f32,
+    final_logit_softcapping: f32,
+    normed: &mut HiddenStates,
+    logits: &mut HiddenStates,
+) -> Result<()> {
+    use anyhow::Context as _;
+    let seq_len = hidden.seq_len;
+    let vocab_size = weights.embed_tokens.rows;
+    // The ops assert that the tensors agree with each other, not that the
+    // allocation behind them is long enough, so both buffers are checked
+    // before the first kernel.
+    let normed_elems = hidden
+        .hidden_dim
+        .checked_mul(seq_len)
+        .context("head normed extent overflows")?;
+    anyhow::ensure!(
+        normed.data.len() >= normed_elems,
+        "head normed buffer holds {} elements, not {normed_elems}",
+        normed.data.len()
+    );
+    let logits_elems = vocab_size
+        .checked_mul(seq_len)
+        .context("head logits extent overflows")?;
+    anyhow::ensure!(
+        logits.data.len() >= logits_elems,
+        "head logits buffer holds {} elements, not {logits_elems}",
+        logits.data.len()
+    );
+    normed.hidden_dim = hidden.hidden_dim;
+    normed.seq_len = seq_len;
+    ops::rms_norm_batch_into(ctx, hidden, &weights.norm, rms_norm_eps, normed);
+
+    // Tied embeddings: the LM head is the embedding matrix itself.
+    logits.hidden_dim = vocab_size;
+    logits.seq_len = seq_len;
+    ops::gemm_rows_into_checked(ctx, &weights.embed_tokens, 0, vocab_size, normed, logits)?;
+    ops::softcap_bf16_in_place(ctx, logits, final_logit_softcapping)
 }
 
 #[cfg(test)]

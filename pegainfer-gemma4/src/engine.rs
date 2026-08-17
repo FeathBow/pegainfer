@@ -517,7 +517,7 @@ impl EngineState {
         };
 
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
-        let mut logits = {
+        let logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
             match self
                 .serve
@@ -527,9 +527,7 @@ impl EngineState {
                 Err(err) => return fail_batch(active, "batched decode", &err),
             }
         };
-        if let Err(err) =
-            suppress_logits(&self.ctx, &self.blocked, &mut logits, &self.policy.suppress)
-        {
+        if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
             return fail_batch(active, "suppression", &err);
         }
 
@@ -540,7 +538,7 @@ impl EngineState {
             let steps: Vec<u64> = active.iter().map(|entry| entry.emitted as u64).collect();
             match pegainfer_sample::select_batch(
                 &self.ctx,
-                &logits,
+                logits,
                 &params,
                 &steps,
                 call_seed,
@@ -566,7 +564,7 @@ impl EngineState {
             .collect();
         let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len()];
         if !lp_requests.is_empty() {
-            match pegainfer_sample::token_logprobs_batch(&self.ctx, &logits, &lp_requests) {
+            match pegainfer_sample::token_logprobs_batch(&self.ctx, logits, &lp_requests) {
                 Ok(scored) => {
                     for (request, logprob) in lp_requests.iter().zip(scored) {
                         logprobs[request.row] = Some(logprob);
