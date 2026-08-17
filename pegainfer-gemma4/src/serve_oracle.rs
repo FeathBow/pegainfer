@@ -120,6 +120,9 @@ fn run_case(
     let last_chunk = prompt.len().div_ceil(step_size) - 1;
 
     let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(ctx, 1, false)
+        .expect("oracle step arena");
     let mut rows = Vec::with_capacity(teacher_i32.len() + 1);
     let mut shifted_multi_token = false;
     for (i, piece) in prompt.chunks(step_size).enumerate() {
@@ -135,14 +138,7 @@ fn run_case(
     }
     for &t in &teacher_i32 {
         let token = u32::try_from(t).expect("token id");
-        admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1).expect("admit");
-        rows.push(
-            serve
-                .step(ctx, &mut kv, &[token], LogitsSpan::LastRow)
-                .expect("decode")
-                .to_host(ctx)
-                .expect("D2H"),
-        );
+        rows.push(decode_serving(serve, ctx, &mut arena, &mut kv, token).expect("decode"));
     }
     Run {
         rows,
@@ -312,6 +308,9 @@ fn eviction_is_footprint_only() {
 
     let run = |serve: &GemmaServe| -> (Vec<u32>, usize) {
         let mut kv = serve.alloc_kv();
+        let mut arena = serve
+            .alloc_step_arena(&ctx, 1, false)
+            .expect("oracle step arena");
         admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prompt.len())
             .expect("admit prompt");
         let logits = serve
@@ -320,11 +319,8 @@ fn eviction_is_footprint_only() {
         let mut next = argmax_last(&ctx, &logits).expect("argmax");
         let mut tokens = vec![next];
         for _ in 1..30 {
-            admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1).expect("admit");
-            let logits = serve
-                .step(&ctx, &mut kv, &[next], LogitsSpan::LastRow)
-                .expect("decode");
-            next = argmax_last(&ctx, &logits).expect("argmax");
+            let row = decode_serving(serve, &ctx, &mut arena, &mut kv, next).expect("decode");
+            next = u32::try_from(argmax(&row)).expect("token id");
             tokens.push(next);
         }
         (tokens, kv.local.held_pages())
@@ -424,13 +420,13 @@ fn serve_matches_oracle_forward() {
     // Feed the ORACLE's continuation each step so one divergence cannot
     // cascade; its last row doubles as the next step's greedy pick.
     let mut oracle_last = oracle_host[(tokens.len() - 1) * vocab..tokens.len() * vocab].to_vec();
+    let mut arena = serve
+        .alloc_step_arena(&ctx, 1, false)
+        .expect("oracle step arena");
     for step in 0..4 {
         let next = u32::try_from(argmax(&oracle_last)).expect("token id");
-        admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1).expect("admit token");
-        let step_logits = serve
-            .step(&ctx, &mut kv, &[next], LogitsSpan::LastRow)
-            .expect("serve decode step");
-        let step_host = step_logits.to_host(&ctx).expect("D2H");
+        let step_host =
+            decode_serving(&serve, &ctx, &mut arena, &mut kv, next).expect("serve decode step");
         tokens.push(next);
         let o = oracle(&tokens);
         oracle_last = o[(tokens.len() - 1) * vocab..tokens.len() * vocab].to_vec();
@@ -510,6 +506,22 @@ fn greedy_matches_hf_generate() {
     );
 }
 
+/// One serving-path decode step for a single request: the batched decode
+/// entry at batch one on an eager arena. The graph path is anchored to this
+/// by the ragged determinism gate's replay-vs-eager comparison.
+fn decode_serving(
+    serve: &GemmaServe,
+    ctx: &DeviceContext,
+    arena: &mut StepArena,
+    kv: &mut GemmaKv,
+    token: u32,
+) -> Result<Vec<f32>> {
+    admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1)?;
+    let mut borrowed: [&mut GemmaKv; 1] = [kv];
+    let logits = serve.decode_batch_step(ctx, arena, &mut borrowed, &[token])?;
+    logits.to_host(ctx)
+}
+
 fn argmax(row: &[f32]) -> usize {
     row.iter()
         .enumerate()
@@ -531,13 +543,13 @@ fn generate_greedy(
     anyhow::ensure!(!prompt.is_empty(), "empty prompt");
     anyhow::ensure!(max_new > 0, "generate_greedy needs max_new >= 1");
     admit_tokens(&serve.local_pool, &serve.global_pool, kv, prompt.len())?;
+    let mut arena = serve.alloc_step_arena(ctx, 1, false)?;
     let logits = serve.step(ctx, kv, prompt, LogitsSpan::LastRow)?;
     let mut next = argmax_last(ctx, &logits)?;
     let mut out = vec![next];
     for _ in 1..max_new {
-        admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1)?;
-        let logits = serve.step(ctx, kv, &[next], LogitsSpan::LastRow)?;
-        next = argmax_last(ctx, &logits)?;
+        let row = decode_serving(serve, ctx, &mut arena, kv, next)?;
+        next = u32::try_from(argmax(&row)).context("token id")?;
         out.push(next);
     }
     Ok(out)

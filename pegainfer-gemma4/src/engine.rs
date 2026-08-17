@@ -285,6 +285,8 @@ impl EngineState {
         base_seed: u64,
         graph_enabled: bool,
     ) -> Result<Self> {
+        // Refuse an unservable global GQA shape before the multi-GiB load.
+        crate::serve::global_split_factor(&crate::config::Gemma4Config::from_file(dir)?)?;
         let (weights, _) = Gemma4Weights::from_safetensors(dir, device)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;

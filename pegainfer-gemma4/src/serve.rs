@@ -8,14 +8,15 @@
 //! sliding window; past it the local family releases its front, and
 //! `origin_pages` is what converts between the two.
 //!
-//! Decode runs the prefill entries with seq_len 1 — correct, not
-//! decode-optimal. Attention reads are read-only entries (the prep kernels own the
-//! pool writes) with sm_scale 1.0 (Gemma 4 runs unscaled attention) and
-//! window_left already passed through.
+//! Batched decode reads the local family through the windowed prefill
+//! entry at seq_len 1 and the global family through its native split-KV
+//! decode entry. Attention reads are read-only (the prep kernels own the
+//! pool writes) with sm_scale 1.0 — Gemma 4 runs unscaled attention.
 
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use half::bf16;
 use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::ops;
@@ -25,6 +26,7 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
+use crate::config::Gemma4Config;
 use crate::config::LayerKind;
 use crate::forward::embed_scale_bf16;
 use crate::forward::logits_tail;
@@ -57,11 +59,16 @@ enum PrepRef<'a> {
         /// Absolute page the local resident row starts at. The preps shift
         /// only the row index by it; RoPE stays on absolute positions.
         local_page_origin: usize,
+        global_plan: &'a PrefillPagedPlan,
     },
-    /// One row per request. Each row's page window and absolute position are
-    /// the ones its family's plan already carries; what the plans do not
-    /// carry is the sliding family's released front, one page index per row.
-    Batched { local_origins: &'a CudaSlice<i32> },
+    /// One row per request. Each row's local page window rides the local
+    /// plan; the global family's window and positions live in the step's
+    /// uploaded tables. What neither carries is the sliding family's
+    /// released front, one page index per row.
+    Batched {
+        local_origins: &'a CudaSlice<i32>,
+        global_tables: &'a GlobalTables,
+    },
 }
 
 struct GemmaStepPlan {
@@ -186,10 +193,40 @@ fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &m
     }
 }
 
+const GLOBAL_SPLIT_CHUNK_TOKENS: usize = 256;
+
+/// The global family's decode tables, uploaded per step: the per-request
+/// half feeds the prep, the factor-repeated half feeds the split-KV
+/// attention read over the pseudo-requests (see [`global_split_factor`]).
+struct GlobalTables {
+    pages: CudaSlice<i32>,
+    indptr: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
+    pseudo_pages: CudaSlice<i32>,
+    pseudo_indptr: CudaSlice<i32>,
+    pseudo_last: CudaSlice<i32>,
+}
+
+/// The split-KV plan, refilled per step at graph-stable padded shapes; the
+/// chunk size is written to its device slot once at alloc.
+struct SplitKvState {
+    request_indices_d: CudaSlice<i32>,
+    kv_tile_indices_d: CudaSlice<i32>,
+    chunk_size_d: CudaSlice<i32>,
+    o_indptr_d: CudaSlice<i32>,
+    valid_mask_d: CudaSlice<u8>,
+    tmp_v: CudaSlice<bf16>,
+    tmp_s: CudaSlice<f32>,
+    /// Chunk-count bound per pseudo-request; a step's padded slot count is
+    /// the split factor times its bucket times this.
+    cap: usize,
+}
+
 pub(crate) struct StepArena {
     tower: TowerScratch,
     local_plan: PrefillPagedPlan,
-    global_plan: PrefillPagedPlan,
+    global_tables: GlobalTables,
+    global_split: SplitKvState,
     local_origins: CudaSlice<i32>,
     ids: CudaSlice<u32>,
     head_normed: HiddenStates,
@@ -225,6 +262,34 @@ impl StepArena {
     }
 }
 
+/// How many pseudo-requests the global decode read presents each request
+/// as. FlashInfer's decode dispatcher compiles GQA groups {1,2,3,4,8}: a
+/// dispatchable group passes through whole, and a non-dispatchable group
+/// over one KV head halves into pseudo-requests — an exact memory identity
+/// only because MQA gives every query head the same KV head (the 12B
+/// global family's 16 over 1). Anything else fails loud.
+pub(crate) fn global_split_factor(config: &Gemma4Config) -> Result<usize> {
+    const DISPATCHABLE: [usize; 5] = [1, 2, 3, 4, 8];
+    let q = config.num_attention_heads;
+    let kv = config.num_global_key_value_heads;
+    anyhow::ensure!(
+        kv > 0 && q.is_multiple_of(kv),
+        "global family of {q} query heads over {kv} KV heads is not a whole GQA group"
+    );
+    let group = q / kv;
+    if DISPATCHABLE.contains(&group) {
+        return Ok(1);
+    }
+    if kv == 1 && group.is_multiple_of(2) && DISPATCHABLE.contains(&(group / 2)) {
+        return Ok(2);
+    }
+    anyhow::bail!(
+        "the global decode read has no dispatch for {q} query heads over {kv} KV heads \
+         (GQA group {group}): supported are groups 1,2,3,4,8 whole, or twice one of \
+         those over a single KV head"
+    )
+}
+
 /// Everything a serving step needs that outlives requests.
 pub(crate) struct GemmaServe {
     /// The weights these pools, rope tables and layer numbering were built
@@ -236,6 +301,7 @@ pub(crate) struct GemmaServe {
     local_geom: LayerGeometry,
     global_geom: LayerGeometry,
     sliding_window: usize,
+    global_split_factor: usize,
     final_logit_softcapping: f32,
     #[cfg(test)]
     release_enabled: bool,
@@ -267,6 +333,7 @@ impl GemmaServe {
             "weights live on device {weights_ordinal} but this context \
              allocates on device {device_ordinal}"
         );
+        let global_split_factor = global_split_factor(config)?;
         let (mut locals, mut globals) = (0usize, 0usize);
         let family_index = config
             .layer_types
@@ -325,6 +392,7 @@ impl GemmaServe {
             local_geom,
             global_geom,
             sliding_window,
+            global_split_factor,
             final_logit_softcapping,
             #[cfg(test)]
             release_enabled: true,
@@ -355,6 +423,17 @@ impl GemmaServe {
         let alloc = |err: &'static str| {
             move |e: cudarc::driver::DriverError| anyhow::anyhow!("{err} alloc failed: {e}")
         };
+        let factor = self.global_split_factor;
+        let global_split_cap = self.cos_max_pos.div_ceil(GLOBAL_SPLIT_CHUNK_TOKENS);
+        let global_split_slots = factor * max_rows * global_split_cap;
+        let global_split_heads = self.global_geom.num_q_heads / factor;
+        let mut global_chunk = ctx
+            .stream
+            .alloc_zeros(1)
+            .map_err(alloc("global chunk size"))?;
+        ctx.stream
+            .memcpy_htod(&[GLOBAL_SPLIT_CHUNK_TOKENS as i32], &mut global_chunk)
+            .map_err(|e| anyhow::anyhow!("global chunk-size upload failed: {e}"))?;
         Ok(StepArena {
             tower: TowerScratch::new(ctx, &self.local_geom, &self.global_geom, max_rows)?,
             local_plan: PrefillPagedPlan::new_preallocated(
@@ -364,13 +443,62 @@ impl GemmaServe {
                 max_rows,
                 max_rows * group(&self.local_geom),
             )?,
-            global_plan: PrefillPagedPlan::new_preallocated(
-                ctx,
-                max_rows,
-                self.global_pool.capacity_pages(),
-                max_rows,
-                max_rows * group(&self.global_geom),
-            )?,
+            global_tables: GlobalTables {
+                pages: ctx
+                    .stream
+                    .alloc_zeros(self.global_pool.capacity_pages())
+                    .map_err(alloc("global pages"))?,
+                indptr: ctx
+                    .stream
+                    .alloc_zeros(max_rows + 1)
+                    .map_err(alloc("global indptr"))?,
+                positions: ctx
+                    .stream
+                    .alloc_zeros(max_rows)
+                    .map_err(alloc("global positions"))?,
+                pseudo_pages: ctx
+                    .stream
+                    .alloc_zeros(factor * self.global_pool.capacity_pages())
+                    .map_err(alloc("global pseudo pages"))?,
+                pseudo_indptr: ctx
+                    .stream
+                    .alloc_zeros(factor * max_rows + 1)
+                    .map_err(alloc("global pseudo indptr"))?,
+                pseudo_last: ctx
+                    .stream
+                    .alloc_zeros(factor * max_rows)
+                    .map_err(alloc("global pseudo last-page lens"))?,
+            },
+            global_split: SplitKvState {
+                request_indices_d: ctx
+                    .stream
+                    .alloc_zeros(global_split_slots)
+                    .map_err(alloc("global split request indices"))?,
+                kv_tile_indices_d: ctx
+                    .stream
+                    .alloc_zeros(global_split_slots)
+                    .map_err(alloc("global split tile indices"))?,
+                chunk_size_d: global_chunk,
+                o_indptr_d: ctx
+                    .stream
+                    .alloc_zeros(factor * max_rows + 1)
+                    .map_err(alloc("global split o_indptr"))?,
+                valid_mask_d: ctx
+                    .stream
+                    .alloc_zeros(global_split_slots)
+                    .map_err(alloc("global split valid mask"))?,
+                tmp_v: ctx
+                    .stream
+                    .alloc_zeros(
+                        global_split_slots * global_split_heads * self.global_geom.head_dim,
+                    )
+                    .map_err(alloc("global split tmp_v"))?,
+                tmp_s: ctx
+                    .stream
+                    .alloc_zeros(global_split_slots * global_split_heads)
+                    .map_err(alloc("global split tmp_s"))?,
+                cap: global_split_cap,
+            },
             local_origins: ctx.stream.alloc_zeros(max_rows).map_err(alloc("origins"))?,
             ids: ctx.stream.alloc_zeros(max_rows).map_err(alloc("ids"))?,
             head_normed: HiddenStates::zeros(ctx, self.local_geom.hidden_size, max_rows)?,
@@ -489,7 +617,6 @@ impl GemmaServe {
         seq_len: usize,
         prep: PrepRef<'_>,
         local_plan: &PrefillPagedPlan,
-        global_plan: &PrefillPagedPlan,
         src: usize,
     ) -> Result<()> {
         let geom = &self.local_geom;
@@ -544,6 +671,7 @@ impl GemmaServe {
             PrepRef::Single {
                 start_pos,
                 local_page_origin,
+                ..
             } => {
                 ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
                     ctx,
@@ -568,7 +696,10 @@ impl GemmaServe {
                     geom.rms_norm_eps,
                 )?;
             }
-            PrepRef::Batched { local_origins } => {
+            PrepRef::Batched {
+                local_origins,
+                global_tables,
+            } => {
                 ops::qkv_norm_rope_paged_decode_hd256_plain_into(
                     ctx,
                     &scratch.q_states,
@@ -585,7 +716,7 @@ impl GemmaServe {
                     local_plan.page_indices_d(),
                     local_plan.page_indptr_d(),
                     local_origins,
-                    global_plan.positions_d(),
+                    &global_tables.positions,
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
@@ -620,7 +751,7 @@ impl GemmaServe {
         family_layer: usize,
         seq_len: usize,
         prep: PrepRef<'_>,
-        global_plan: &PrefillPagedPlan,
+        split: Option<&mut SplitKvState>,
         src: usize,
     ) -> Result<()> {
         let geom = &self.global_geom;
@@ -665,7 +796,11 @@ impl GemmaServe {
         // The prep writes both K and the weightless-normed V fork from the
         // one raw K read — no D2D fork copy on the serving path.
         match prep {
-            PrepRef::Single { start_pos, .. } => {
+            PrepRef::Single {
+                start_pos,
+                global_plan,
+                ..
+            } => {
                 ops::qk_norm_partial_rope_paged_prefill_hd512_into(
                     ctx,
                     &scratch.q_states,
@@ -686,8 +821,20 @@ impl GemmaServe {
                     geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
+                ops::batch_prefill_paged_hd512_into(
+                    ctx,
+                    &scratch.q_prep,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    family_layer,
+                    global_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                    1.0,
+                )?;
             }
-            PrepRef::Batched { .. } => {
+            PrepRef::Batched { global_tables, .. } => {
+                let split = split.context("batched global decode needs the split-KV state")?;
                 ops::qk_norm_partial_rope_paged_decode_hd512_into(
                     ctx,
                     &scratch.q_states,
@@ -700,29 +847,52 @@ impl GemmaServe {
                     &self.global_cos,
                     &self.global_sin,
                     family_layer,
-                    global_plan.page_indices_d(),
-                    global_plan.page_indptr_d(),
-                    global_plan.positions_d(),
+                    &global_tables.pages,
+                    &global_tables.indptr,
+                    &global_tables.positions,
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
                     geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
+                // A pure reshape: `[rows, q·512]` and `[factor·rows,
+                // (q/factor)·512]` are the same memory.
+                let factor = self.global_split_factor;
+                scratch.q_prep.hidden_dim = q_dim / factor;
+                scratch.q_prep.seq_len = factor * seq_len;
+                scratch.attn.hidden_dim = q_dim / factor;
+                scratch.attn.seq_len = factor * seq_len;
+                let meta = ops::Hd512DecodeMetadata::new(
+                    &global_tables.pseudo_pages,
+                    &global_tables.pseudo_indptr,
+                    &global_tables.pseudo_last,
+                    &split.request_indices_d,
+                    &split.kv_tile_indices_d,
+                    &split.chunk_size_d,
+                );
+                ops::paged_attention_batch_decode_split_kv_hd512_into(
+                    ctx,
+                    &scratch.q_prep,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    family_layer,
+                    &meta,
+                    &split.o_indptr_d,
+                    &split.valid_mask_d,
+                    &mut split.tmp_v,
+                    &mut split.tmp_s,
+                    factor * seq_len * split.cap,
+                    &mut scratch.attn,
+                    geom.num_q_heads / factor,
+                    1.0,
+                )?;
+                scratch.q_prep.hidden_dim = q_dim;
+                scratch.q_prep.seq_len = seq_len;
+                scratch.attn.hidden_dim = q_dim;
+                scratch.attn.seq_len = seq_len;
             }
         }
-
-        ops::batch_prefill_paged_hd512_into(
-            ctx,
-            &scratch.q_prep,
-            self.global_pool.buffer(),
-            &self.global_pool.layout().kernel_layout(),
-            family_layer,
-            global_plan,
-            &mut scratch.attn,
-            geom.num_q_heads,
-            1.0,
-        )?;
         attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
     }
 
@@ -731,7 +901,8 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         local_plan: &mut PrefillPagedPlan,
-        global_plan: &mut PrefillPagedPlan,
+        global_tables: &mut GlobalTables,
+        global_split: &mut SplitKvState,
         origins_slot: &mut CudaSlice<i32>,
         kvs: &[&mut GemmaKv],
         padded: usize,
@@ -809,16 +980,57 @@ impl GemmaServe {
             self.local_geom.head_dim,
             0,
         )?;
-        global_plan.update_batch_with_cta_tile_q(
+        let global_page = self.global_pool.layout().page_size;
+        let mut global_pages_cat: Vec<i32> = Vec::new();
+        let mut global_indptr = vec![0i32];
+        let mut positions = Vec::with_capacity(padded);
+        let mut pseudo_pages: Vec<i32> = Vec::new();
+        let mut pseudo_indptr = vec![0i32];
+        let factor = self.global_split_factor;
+        let mut pseudo_last = Vec::with_capacity(factor * padded);
+        let mut pseudo_kv_lens = Vec::with_capacity(factor * padded);
+        for r in 0..padded {
+            let row = &global_rows[r];
+            let row_len = i32::try_from(row.len()).context("global pages fit i32")?;
+            let last = i32::try_from(global_last[r]).context("global last-page len fits i32")?;
+            let kv_len = (row.len() - 1) * global_page + global_last[r];
+            positions.push(i32::try_from(global_start[r]).context("position fits i32")?);
+            global_indptr.push(global_indptr.last().unwrap() + row_len);
+            global_pages_cat.extend_from_slice(row);
+            for _ in 0..factor {
+                pseudo_pages.extend_from_slice(row);
+                pseudo_indptr.push(pseudo_indptr.last().unwrap() + row_len);
+                pseudo_last.push(last);
+                pseudo_kv_lens.push(kv_len);
+            }
+        }
+        let global_csr = ops::build_split_kv_csr(
+            GLOBAL_SPLIT_CHUNK_TOKENS,
+            global_split.cap,
+            &pseudo_kv_lens,
+            factor * padded,
+        )?;
+        upload_prefix(ctx, &mut global_tables.pages, &global_pages_cat)?;
+        upload_prefix(ctx, &mut global_tables.indptr, &global_indptr)?;
+        upload_prefix(ctx, &mut global_tables.positions, &positions)?;
+        upload_prefix(ctx, &mut global_tables.pseudo_pages, &pseudo_pages)?;
+        upload_prefix(ctx, &mut global_tables.pseudo_indptr, &pseudo_indptr)?;
+        upload_prefix(ctx, &mut global_tables.pseudo_last, &pseudo_last)?;
+        upload_prefix(
             ctx,
-            &global_rows,
-            &global_last,
-            &global_start,
-            &ones,
-            self.global_geom.num_q_heads,
-            self.global_geom.num_kv_heads,
-            self.global_geom.head_dim,
-            0,
+            &mut global_split.request_indices_d,
+            &global_csr.request_indices,
+        )?;
+        upload_prefix(
+            ctx,
+            &mut global_split.kv_tile_indices_d,
+            &global_csr.kv_tile_indices,
+        )?;
+        upload_prefix(ctx, &mut global_split.o_indptr_d, &global_csr.o_indptr)?;
+        upload_prefix(
+            ctx,
+            &mut global_split.valid_mask_d,
+            &global_csr.block_valid_mask,
         )?;
         upload_prefix(ctx, origins_slot, &local_origins)
     }
@@ -843,8 +1055,8 @@ impl GemmaServe {
         ids: &CudaSlice<u32>,
         seq_len: usize,
         local_plan: &PrefillPagedPlan,
-        global_plan: &PrefillPagedPlan,
         prep: PrepRef<'_>,
+        mut global_split: Option<&mut SplitKvState>,
     ) -> Result<usize> {
         let weights = &self.weights;
         ops::embedding_batch(ctx, &weights.embed_tokens, ids, &mut tower.hidden[0])?;
@@ -867,7 +1079,6 @@ impl GemmaServe {
                         seq_len,
                         prep,
                         local_plan,
-                        global_plan,
                         src,
                     )?;
                 }
@@ -879,7 +1090,7 @@ impl GemmaServe {
                         family_layer,
                         seq_len,
                         prep,
-                        global_plan,
+                        global_split.as_deref_mut(),
                         src,
                     )?;
                 }
@@ -905,7 +1116,8 @@ impl GemmaServe {
         let StepArena {
             tower,
             local_plan,
-            global_plan,
+            global_tables,
+            global_split,
             local_origins,
             ids,
             head_normed,
@@ -929,7 +1141,8 @@ impl GemmaServe {
                 ids,
                 padded,
                 local_plan,
-                global_plan,
+                global_tables,
+                global_split,
                 local_origins,
                 head_normed,
                 logits,
@@ -939,6 +1152,13 @@ impl GemmaServe {
         // Append-then-attend, per request: the batch shared a step, but each
         // request owns its own frontier and its own released front.
         for kv in kvs.iter_mut() {
+            #[cfg(test)]
+            if self.release_enabled {
+                kv.local.advance_and_release(1, self.sliding_window)?;
+            } else {
+                kv.local.advance(1);
+            }
+            #[cfg(not(test))]
             kv.local.advance_and_release(1, self.sliding_window)?;
             kv.global.advance(1);
         }
@@ -957,7 +1177,8 @@ impl GemmaServe {
         ids: &CudaSlice<u32>,
         rows: usize,
         local_plan: &PrefillPagedPlan,
-        global_plan: &PrefillPagedPlan,
+        global_tables: &GlobalTables,
+        global_split: &mut SplitKvState,
         local_origins: &CudaSlice<i32>,
         head_normed: &mut HiddenStates,
         logits: &mut HiddenStates,
@@ -968,8 +1189,11 @@ impl GemmaServe {
             ids,
             rows,
             local_plan,
-            global_plan,
-            PrepRef::Batched { local_origins },
+            PrepRef::Batched {
+                local_origins,
+                global_tables,
+            },
+            Some(global_split),
         )?;
         logits_tail_into(
             ctx,
@@ -1014,12 +1238,21 @@ impl GemmaServe {
         arena.open(ctx, padded)?;
         let StepArena {
             local_plan,
-            global_plan,
+            global_tables,
+            global_split,
             local_origins,
             ids,
             ..
         } = arena;
-        self.plan_decode_batch(ctx, local_plan, global_plan, local_origins, kvs, padded)?;
+        self.plan_decode_batch(
+            ctx,
+            local_plan,
+            global_tables,
+            global_split,
+            local_origins,
+            kvs,
+            padded,
+        )?;
         let mut padded_tokens = tokens.to_vec();
         padded_tokens.resize(padded, 0);
         upload_prefix(ctx, ids, &padded_tokens)?;
@@ -1053,7 +1286,8 @@ impl GemmaServe {
                 let StepArena {
                     tower,
                     local_plan,
-                    global_plan,
+                    global_tables,
+                    global_split,
                     local_origins,
                     ids,
                     head_normed,
@@ -1067,7 +1301,8 @@ impl GemmaServe {
                     ids,
                     padded,
                     local_plan,
-                    global_plan,
+                    global_tables,
+                    global_split,
                     local_origins,
                     head_normed,
                     logits,
@@ -1079,7 +1314,8 @@ impl GemmaServe {
                         ids,
                         padded,
                         local_plan,
-                        global_plan,
+                        global_tables,
+                        global_split,
                         local_origins,
                         head_normed,
                         logits,
@@ -1125,11 +1361,12 @@ impl GemmaServe {
             &ids,
             seq_len,
             &plan.local_plan,
-            &plan.global_plan,
             PrepRef::Single {
                 start_pos: plan.start_pos,
                 local_page_origin: plan.local_page_origin,
+                global_plan: &plan.global_plan,
             },
+            None,
         )?;
         let hidden = &tower.hidden[src];
         // Projecting every prompt row through the 262k LM head materializes
