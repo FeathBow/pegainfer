@@ -669,9 +669,9 @@ unsafe extern "C" {
 }
 
 // HEAD_DIM=256 paged attention. Qwen3.5-4B calls the full-attention pair; the
-// windowed pair carries the sliding-window mask for Gemma 4's local layers and
-// has no caller yet. `window_left` is an inclusive distance: an N-token window
-// passes N - 1, and -1 degrades to full attention.
+// windowed pair carries the sliding-window mask for Gemma 4's local layers.
+// `window_left` is an inclusive distance: an N-token window passes N - 1, and
+// -1 degrades to full attention.
 unsafe extern "C" {
     pub fn paged_attention_decode_cuda_hd256(
         q: *const Half,
@@ -715,6 +715,33 @@ unsafe extern "C" {
         stride_page: i64,
         sm_scale: f32,
         window_left: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn paged_attention_decode_split_kv_cuda_hd512(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        o_indptr: *const i32,
+        block_valid_mask: *const u8,
+        tmp_v: *mut Half,
+        tmp_s: *mut f32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
         stream: CUstream,
     ) -> i32;
 
@@ -959,28 +986,6 @@ unsafe extern "C" {
         seq_len: i32,
         kv_len: i32,
         max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn paged_attention_decode_cuda_hd512(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        request_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        stride_page: i64,
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;

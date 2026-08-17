@@ -1746,12 +1746,16 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
 // hd512 (Gemma 4 global layers)
 // ============================================================================
 
-/// Decode-metadata aggregate for the hd512 direct-decode path, validated at
-/// use: the wrapper calls [`Self::validate`] with the batch size it derives.
+/// Decode-metadata aggregate for the hd512 split-KV decode path, validated
+/// at use: the wrapper calls [`Self::validate`] with the batch size it
+/// derives.
 ///
-/// `page_indptr` needs at least `batch_size + 1` elements, the other per-request
-/// slices at least `batch_size`; `page_indices` must be non-empty (its
-/// per-request reach is device-side data and cannot be verified here).
+/// `page_indptr` needs at least `batch_size + 1` elements and `last_page_len`
+/// at least `batch_size`; `request_indices` and `kv_tile_indices` are
+/// per-split-slot arrays sized by the caller's padded slot count, and
+/// `kv_chunk_size` holds the one chunk-size entry the kernel reads.
+/// `page_indices` must be non-empty (its per-request reach is device-side
+/// data and cannot be verified here).
 ///
 /// The pages referenced by `page_indices` must lie within `kv_buffer`; the
 /// wrapper cannot verify device-side contents — caller contract.
@@ -1759,7 +1763,6 @@ pub struct Hd512DecodeMetadata<'a> {
     page_indices: &'a CudaSlice<i32>,
     page_indptr: &'a CudaSlice<i32>,
     last_page_len: &'a CudaSlice<i32>,
-    positions: &'a CudaSlice<i32>,
     request_indices: &'a CudaSlice<i32>,
     kv_tile_indices: &'a CudaSlice<i32>,
     kv_chunk_size: &'a CudaSlice<i32>,
@@ -1770,7 +1773,6 @@ impl<'a> Hd512DecodeMetadata<'a> {
         page_indices: &'a CudaSlice<i32>,
         page_indptr: &'a CudaSlice<i32>,
         last_page_len: &'a CudaSlice<i32>,
-        positions: &'a CudaSlice<i32>,
         request_indices: &'a CudaSlice<i32>,
         kv_tile_indices: &'a CudaSlice<i32>,
         kv_chunk_size: &'a CudaSlice<i32>,
@@ -1779,7 +1781,6 @@ impl<'a> Hd512DecodeMetadata<'a> {
             page_indices,
             page_indptr,
             last_page_len,
-            positions,
             request_indices,
             kv_tile_indices,
             kv_chunk_size,
@@ -1799,30 +1800,36 @@ impl<'a> Hd512DecodeMetadata<'a> {
         );
         for (name, len) in [
             ("last_page_len", self.last_page_len.len()),
-            ("positions", self.positions.len()),
             ("request_indices", self.request_indices.len()),
             ("kv_tile_indices", self.kv_tile_indices.len()),
-            ("kv_chunk_size", self.kv_chunk_size.len()),
         ] {
             anyhow::ensure!(
                 len >= batch_size,
                 "Hd512DecodeMetadata: {name} length {len} must be >= batch_size {batch_size}",
             );
         }
+        // The kernel reads one chunk size for the whole launch.
+        anyhow::ensure!(
+            !self.kv_chunk_size.is_empty(),
+            "Hd512DecodeMetadata: kv_chunk_size must hold its one entry"
+        );
         Ok(())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn paged_attention_batch_decode_hd512_into(
+pub fn paged_attention_batch_decode_split_kv_hd512_into(
     ctx: &DeviceContext,
     q: &HiddenStates,
-    k: &HiddenStates,
-    v: &HiddenStates,
     kv_buffer: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     layer: usize,
     meta: &Hd512DecodeMetadata,
+    split_o_indptr_d: &CudaSlice<i32>,
+    split_valid_mask_d: &CudaSlice<u8>,
+    split_tmp_v: &mut CudaSlice<bf16>,
+    split_tmp_s: &mut CudaSlice<f32>,
+    split_padded_slots: usize,
     output: &mut HiddenStates,
     num_qo_heads: usize,
     sm_scale: f32,
@@ -1832,12 +1839,14 @@ pub fn paged_attention_batch_decode_hd512_into(
         "paged_attention_batch_decode_hd512 sm_scale {sm_scale} must be finite"
     );
     let num_kv_heads = layout.num_kv_heads;
-    let head_dim = layout.head_dim;
-    anyhow::ensure!(
-        head_dim == 512,
-        "hd512 decode expects head_dim 512, got {}",
-        head_dim
-    );
+    let geometry = checked_paged_geometry(
+        "hd512 split decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        512,
+        num_kv_heads,
+    )?;
     let batch_size = q.seq_len;
     meta.validate(batch_size)?;
     anyhow::ensure!(
@@ -1845,54 +1854,57 @@ pub fn paged_attention_batch_decode_hd512_into(
         "hd512 decode output.seq_len {} != q.seq_len {batch_size}",
         output.seq_len
     );
+    let qo_dim = num_qo_heads.checked_mul(512).ok_or_else(|| {
+        anyhow::anyhow!("hd512 split decode num_qo_heads {num_qo_heads} * 512 overflows")
+    })?;
     anyhow::ensure!(
-        k.seq_len == batch_size,
-        "hd512 decode k.seq_len {} != q.seq_len {batch_size}",
-        k.seq_len
+        q.hidden_dim == qo_dim,
+        "hd512 decode q.hidden_dim {} != num_qo_heads {num_qo_heads} * 512",
+        q.hidden_dim
     );
     anyhow::ensure!(
-        v.seq_len == batch_size,
-        "hd512 decode v.seq_len {} != q.seq_len {batch_size}",
-        v.seq_len
+        output.hidden_dim == qo_dim,
+        "hd512 decode output.hidden_dim {} != num_qo_heads {num_qo_heads} * 512",
+        output.hidden_dim
     );
     anyhow::ensure!(
-        q.hidden_dim == num_qo_heads * 512,
-        "hd512 decode q.hidden_dim {} != num_qo_heads {} * 512",
-        q.hidden_dim,
-        num_qo_heads
+        split_padded_slots >= batch_size,
+        "hd512 split decode padded_slots {split_padded_slots} < batch {batch_size}"
     );
     anyhow::ensure!(
-        output.hidden_dim == num_qo_heads * 512,
-        "hd512 decode output.hidden_dim {} != num_qo_heads {} * 512",
-        output.hidden_dim,
-        num_qo_heads
+        meta.request_indices.len() >= split_padded_slots
+            && meta.kv_tile_indices.len() >= split_padded_slots
+            && split_valid_mask_d.len() >= split_padded_slots,
+        "hd512 split decode plan arrays shorter than padded_slots {split_padded_slots}"
     );
     anyhow::ensure!(
-        k.hidden_dim == num_kv_heads * 512,
-        "hd512 decode k.hidden_dim {} != num_kv_heads {} * 512",
-        k.hidden_dim,
-        num_kv_heads
+        split_o_indptr_d.len() > batch_size,
+        "hd512 split decode o_indptr len {} < batch {batch_size} + 1",
+        split_o_indptr_d.len()
     );
+    let tmp_v_need = split_padded_slots.checked_mul(qo_dim).ok_or_else(|| {
+        anyhow::anyhow!("hd512 split decode padded_slots {split_padded_slots} * {qo_dim} overflows")
+    })?;
+    let tmp_s_need = split_padded_slots
+        .checked_mul(num_qo_heads)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "hd512 split decode padded_slots {split_padded_slots} * {num_qo_heads} overflows"
+            )
+        })?;
     anyhow::ensure!(
-        v.hidden_dim == num_kv_heads * 512,
-        "hd512 decode v.hidden_dim {} != num_kv_heads {} * 512",
-        v.hidden_dim,
-        num_kv_heads
+        split_tmp_v.len() >= tmp_v_need && split_tmp_s.len() >= tmp_s_need,
+        "hd512 split decode workspace shorter than padded_slots {split_padded_slots}"
     );
-    anyhow::ensure!(
-        layer < layout.num_layers,
-        "hd512 decode layer {layer} >= layout.num_layers {}",
-        layout.num_layers
-    );
-    q.checked_extent("batch_decode_hd512 q")?;
-    output.checked_extent("batch_decode_hd512 output")?;
-    k.checked_extent("batch_decode_hd512 k")?;
-    v.checked_extent("batch_decode_hd512 v")?;
-    let page_size = layout.page_size;
-
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let q_elems = q.checked_extent("batch_decode_hd512 q")?;
+    let out_elems = output.checked_extent("batch_decode_hd512 output")?;
+    crate::ops::checked_i32(q_elems, "hd512 split decode q extent")?;
+    crate::ops::checked_i32(out_elems, "hd512 split decode output extent")?;
+    let batch_i32 = crate::ops::checked_i32(batch_size, "hd512 split decode batch")?;
+    let padded_i32 =
+        crate::ops::checked_i32(split_padded_slots, "hd512 split decode padded slots")?;
+    let qo_heads_i32 = crate::ops::checked_i32(num_qo_heads, "hd512 split decode qo heads")?;
+    let kv_heads_i32 = crate::ops::checked_i32(num_kv_heads, "hd512 split decode kv heads")?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -1903,51 +1915,47 @@ pub fn paged_attention_batch_decode_hd512_into(
     let (ri_ptr, _gri) = meta.request_indices.device_ptr(&ctx.stream);
     let (kti_ptr, _gkti) = meta.kv_tile_indices.device_ptr(&ctx.stream);
     let (kcs_ptr, _gkcs) = meta.kv_chunk_size.device_ptr(&ctx.stream);
+    let (soi_ptr, _gsoi) = split_o_indptr_d.device_ptr(&ctx.stream);
+    let (svm_ptr, _gsvm) = split_valid_mask_d.device_ptr(&ctx.stream);
+    let (stv_ptr, _gstv) = split_tmp_v.device_ptr_mut(&ctx.stream);
+    let (sts_ptr, _gsts) = split_tmp_s.device_ptr_mut(&ctx.stream);
 
     let stream = crate::tensor::active_cu_stream(ctx);
 
-    scatter_decode_kv_into_paged(
-        ctx,
-        k,
-        v,
-        kv_buffer,
-        layout,
-        layer,
-        meta.page_indices,
-        meta.page_indptr,
-        meta.last_page_len,
-        meta.positions,
-        meta.request_indices,
-        batch_size,
-        "batch hd512 decode",
-    )?;
-
+    // No KV scatter here: the serving prep kernel has already written this
+    // step's normed+roped K and its V fork; this only attends over the
+    // resident pages.
     let result = unsafe {
-        ffi::paged_attention_decode_cuda_hd512(
+        ffi::paged_attention_decode_split_kv_cuda_hd512(
             q_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             buf_ptr as *const ffi::Half,
-            k_offset,
-            v_offset,
+            geometry.k_offset_elems,
+            geometry.v_offset_elems,
             pi_ptr as *const i32,
             pip_ptr as *const i32,
             lpl_ptr as *const i32,
             ri_ptr as *const i32,
             kti_ptr as *const i32,
             kcs_ptr as *const i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            page_size as i32,
-            batch_size as i32,
-            stride_page,
+            soi_ptr as *const i32,
+            svm_ptr as *const u8,
+            stv_ptr as *mut ffi::Half,
+            sts_ptr as *mut f32,
+            qo_heads_i32,
+            kv_heads_i32,
+            512,
+            geometry.page_size,
+            batch_i32,
+            padded_i32,
+            geometry.stride_page,
             sm_scale,
             stream,
         )
     };
     if result != 0 {
         anyhow::bail!(
-            "paged_attention_decode_cuda_hd512 (batch) failed with error {result}{}",
+            "paged_attention_decode_split_kv_cuda_hd512 (batch) failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }
