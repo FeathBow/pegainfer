@@ -16,6 +16,7 @@
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
@@ -32,6 +33,7 @@ use crate::forward::validate_tokens;
 use crate::kv::GemmaKv;
 use crate::kv::PAGE_SIZE;
 use crate::kv::SlidingLocalKv;
+use crate::kv::admit_tokens;
 use crate::layer::EpilogueScratch;
 use crate::layer::LayerGeometry;
 use crate::layer::attention_epilogue_into;
@@ -171,6 +173,10 @@ impl TowerScratch {
     }
 }
 
+fn bucket_slot(bucket: usize) -> usize {
+    bucket.trailing_zeros() as usize
+}
+
 fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &mut HiddenStates) {
     let (first, second) = hidden.split_at_mut(1);
     if src == 0 {
@@ -188,6 +194,15 @@ pub(crate) struct StepArena {
     ids: CudaSlice<u32>,
     head_normed: HiddenStates,
     logits: HiddenStates,
+    /// One graph per power-of-two bucket, at index `log2(bucket)`, captured
+    /// by the startup sweep. The captured kernels read and write only
+    /// step-stable pointers; per-step change rides the plan and metadata
+    /// contents uploaded before launch.
+    graphs: Vec<CudaGraphState>,
+    graph_enabled: bool,
+    /// Floor for the padded bucket. Only the pre-capture sweep raises it, to
+    /// drive every bucket from a single dummy request.
+    min_bucket: usize,
     max_rows: usize,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
 }
@@ -330,7 +345,12 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         max_rows: usize,
+        graph_enabled: bool,
     ) -> Result<StepArena> {
+        anyhow::ensure!(
+            max_rows.is_power_of_two(),
+            "the arena's {max_rows} rows must be a power of two: steps pad to buckets"
+        );
         let group = |geom: &LayerGeometry| geom.num_q_heads / geom.num_kv_heads;
         let alloc = |err: &'static str| {
             move |e: cudarc::driver::DriverError| anyhow::anyhow!("{err} alloc failed: {e}")
@@ -355,6 +375,11 @@ impl GemmaServe {
             ids: ctx.stream.alloc_zeros(max_rows).map_err(alloc("ids"))?,
             head_normed: HiddenStates::zeros(ctx, self.local_geom.hidden_size, max_rows)?,
             logits: HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, max_rows)?,
+            graphs: (0..=bucket_slot(max_rows))
+                .map(|_| CudaGraphState::new())
+                .collect(),
+            graph_enabled,
+            min_bucket: 1,
             max_rows,
             stream: ctx.stream.clone(),
         })
@@ -709,6 +734,7 @@ impl GemmaServe {
         global_plan: &mut PrefillPagedPlan,
         origins_slot: &mut CudaSlice<i32>,
         kvs: &[&mut GemmaKv],
+        padded: usize,
     ) -> Result<()> {
         let batch = kvs.len();
         let page = self.local_pool.layout().page_size;
@@ -719,7 +745,6 @@ impl GemmaServe {
         let mut global_last = Vec::with_capacity(batch);
         let mut global_start = Vec::with_capacity(batch);
         let mut local_origins = Vec::with_capacity(batch);
-        let ones = vec![1usize; batch];
 
         for kv in kvs {
             let start_pos = kv.local.seq_len();
@@ -761,6 +786,18 @@ impl GemmaServe {
             global_rows.push(kv.global.page_indices_i32());
         }
 
+        // Pad rows write each pool's reserved padding page — never a real
+        // request's KV — at position 0 with a one-token window.
+        for _ in batch..padded {
+            local_origins.push(0);
+            local_rows.push(vec![self.local_pool.padding_page_id()]);
+            local_last.push(1);
+            local_start.push(0);
+            global_rows.push(vec![self.global_pool.padding_page_id()]);
+            global_last.push(1);
+            global_start.push(0);
+        }
+        let ones = vec![1usize; padded];
         local_plan.update_batch_with_cta_tile_q(
             ctx,
             &local_rows,
@@ -864,17 +901,7 @@ impl GemmaServe {
         tokens: &[u32],
     ) -> Result<&'a mut HiddenStates> {
         let batch = kvs.len();
-        anyhow::ensure!(batch > 0, "a decode batch needs at least one request");
-        anyhow::ensure!(
-            tokens.len() == batch,
-            "decode batch has {batch} requests but {} tokens",
-            tokens.len()
-        );
-        self.check_stream(ctx)?;
-        let weights = &self.weights;
-        validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
-
-        arena.open(ctx, batch)?;
+        let padded = self.prepare_decode_step(ctx, arena, kvs, tokens)?;
         let StepArena {
             tower,
             local_plan,
@@ -883,30 +910,32 @@ impl GemmaServe {
             ids,
             head_normed,
             logits,
+            graphs,
+            graph_enabled,
             ..
         } = arena;
-        self.plan_decode_batch(ctx, local_plan, global_plan, local_origins, kvs)?;
-        upload_prefix(ctx, ids, tokens)?;
-        let src = self.run_tower(
-            ctx,
-            tower,
-            ids,
-            batch,
-            local_plan,
-            global_plan,
-            PrepRef::Batched { local_origins },
-        )?;
-        // Every row is its own request's last position, so the whole batch is
-        // the head's input.
-        logits_tail_into(
-            ctx,
-            weights,
-            &tower.hidden[src],
-            self.local_geom.rms_norm_eps,
-            self.final_logit_softcapping,
-            head_normed,
-            logits,
-        )?;
+        if *graph_enabled {
+            let graph = &mut graphs[bucket_slot(padded)];
+            anyhow::ensure!(
+                graph.is_captured(),
+                "no captured graph for bucket {padded}; the pre-capture sweep must cover \
+                 every bucket before serving"
+            );
+            graph.launch_captured(ctx)?;
+        } else {
+            self.decode_gpu_body(
+                ctx,
+                tower,
+                ids,
+                padded,
+                local_plan,
+                global_plan,
+                local_origins,
+                head_normed,
+                logits,
+            )?;
+        }
+        logits.seq_len = batch;
         // Append-then-attend, per request: the batch shared a step, but each
         // request owns its own frontier and its own released front.
         for kv in kvs.iter_mut() {
@@ -914,6 +943,154 @@ impl GemmaServe {
             kv.global.advance(1);
         }
         Ok(logits)
+    }
+
+    /// The decode step's GPU body — embedding through the LM head. A pure
+    /// kernel sequence over step-stable pointers: no allocation, no
+    /// synchronization, no pool bookkeeping, which is what makes it
+    /// capturable.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_gpu_body(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut TowerScratch,
+        ids: &CudaSlice<u32>,
+        rows: usize,
+        local_plan: &PrefillPagedPlan,
+        global_plan: &PrefillPagedPlan,
+        local_origins: &CudaSlice<i32>,
+        head_normed: &mut HiddenStates,
+        logits: &mut HiddenStates,
+    ) -> Result<()> {
+        let src = self.run_tower(
+            ctx,
+            tower,
+            ids,
+            rows,
+            local_plan,
+            global_plan,
+            PrepRef::Batched { local_origins },
+        )?;
+        logits_tail_into(
+            ctx,
+            &self.weights,
+            &tower.hidden[src],
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+            head_normed,
+            logits,
+        )
+    }
+
+    /// Host-side preparation a decode step and its capture share: checks,
+    /// the bucket, the arena open, the plan refill and the metadata uploads.
+    fn prepare_decode_step(
+        &self,
+        ctx: &DeviceContext,
+        arena: &mut StepArena,
+        kvs: &[&mut GemmaKv],
+        tokens: &[u32],
+    ) -> Result<usize> {
+        let batch = kvs.len();
+        anyhow::ensure!(batch > 0, "a decode batch needs at least one request");
+        anyhow::ensure!(
+            tokens.len() == batch,
+            "decode batch has {batch} requests but {} tokens",
+            tokens.len()
+        );
+        anyhow::ensure!(
+            batch <= arena.max_rows,
+            "decode batch of {batch} exceeds the arena's {} row ceiling",
+            arena.max_rows
+        );
+        self.check_stream(ctx)?;
+        validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+
+        // A step computes at its power-of-two bucket whether or not graphs
+        // are on: padding is part of the numeric contract, which is what
+        // keeps a captured replay and the eager escape hatch the same
+        // arithmetic at every batch size.
+        let padded = batch.next_power_of_two().max(arena.min_bucket);
+        arena.open(ctx, padded)?;
+        let StepArena {
+            local_plan,
+            global_plan,
+            local_origins,
+            ids,
+            ..
+        } = arena;
+        self.plan_decode_batch(ctx, local_plan, global_plan, local_origins, kvs, padded)?;
+        let mut padded_tokens = tokens.to_vec();
+        padded_tokens.resize(padded, 0);
+        upload_prefix(ctx, ids, &padded_tokens)?;
+        Ok(padded)
+    }
+
+    /// Capture every power-of-two decode graph before serving, then
+    /// synchronize, so capture cost and any capture error land here rather
+    /// than on the first requests. Each bucket warms one eager pass first —
+    /// forcing lazy CUDA and cuBLAS initialization outside capture — records
+    /// the body without executing it, then drives the same step through the
+    /// serving path, which replays the fresh graph and advances the dummy.
+    pub(crate) fn precapture_decode_graphs(
+        &self,
+        ctx: &DeviceContext,
+        arena: &mut StepArena,
+    ) -> Result<()> {
+        if !arena.graph_enabled {
+            return Ok(());
+        }
+        let mut kv = self.alloc_kv();
+        admit_tokens(&self.local_pool, &self.global_pool, &mut kv, 1)?;
+        self.step(ctx, &mut kv, &[0], LogitsSpan::LastRow)?;
+        let mut bucket = 1usize;
+        while bucket <= arena.max_rows {
+            arena.min_bucket = bucket;
+            admit_tokens(&self.local_pool, &self.global_pool, &mut kv, 1)?;
+            {
+                let mut kvs: [&mut GemmaKv; 1] = [&mut kv];
+                let padded = self.prepare_decode_step(ctx, arena, &kvs, &[0])?;
+                let StepArena {
+                    tower,
+                    local_plan,
+                    global_plan,
+                    local_origins,
+                    ids,
+                    head_normed,
+                    logits,
+                    graphs,
+                    ..
+                } = arena;
+                self.decode_gpu_body(
+                    ctx,
+                    tower,
+                    ids,
+                    padded,
+                    local_plan,
+                    global_plan,
+                    local_origins,
+                    head_normed,
+                    logits,
+                )?;
+                graphs[bucket_slot(padded)].capture_only(ctx, || {
+                    self.decode_gpu_body(
+                        ctx,
+                        tower,
+                        ids,
+                        padded,
+                        local_plan,
+                        global_plan,
+                        local_origins,
+                        head_normed,
+                        logits,
+                    )
+                })?;
+                self.decode_batch_step(ctx, arena, &mut kvs, &[0])?;
+            }
+            bucket *= 2;
+        }
+        arena.min_bucket = 1;
+        ctx.sync()
     }
 
     pub(crate) fn step(

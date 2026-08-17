@@ -1,6 +1,6 @@
 # Gemma 4 serving
 
-**TL;DR:** The engine schedules per iteration: up to 16 requests hold decode slots, each prompt prefills whole at a step boundary, and every active request advances one token per batched step. Prompt plus output past 8192 tokens is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B). **This needs a 48 GiB card**: the engine sits at 32.1 GiB before it serves anything, so a 32 GiB device cannot start it. A row's output moves with the batch widths it decodes at, but not with what its companions contain.
+**TL;DR:** The engine schedules per iteration: up to 16 requests hold decode slots, each prompt prefills whole at a step boundary, and every active request advances one token per batched step. Prompt plus output past 8192 tokens is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B). **This needs a 48 GiB card**: the engine sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it. A row's output moves with the bucket widths it decodes at, but not with what its companions contain.
 
 Last touched: 2026-08
 
@@ -67,7 +67,7 @@ curl -s localhost:18099/v1/completions -H 'Content-Type: application/json' \
 
 ## What it costs to hold a slot
 
-The 16 slots are a fixed constant and the pools are sized for all of them up front. Measured on a 49140 MiB card, the process sits at **32926 MiB with no request in flight** and peaks at 32932 MiB under the load below: 22.18 GiB of weights, 9.27 GiB of pools, and the rest CUDA context, RoPE tables and step buffers.
+The 16 slots are a fixed constant and the pools are sized for all of them up front. Measured on a 49140 MiB card with the default per-bucket CUDA graphs, the process sits at **33002 MiB with no request in flight** and peaked at 33386 MiB under the serving checks below: 22.18 GiB of weights, 9.27 GiB of pools, and the rest CUDA context, RoPE tables, step buffers and the captured graphs. The eager baseline (`--cuda-graph=false`) measured 32926 MiB idle and peaked at 32932 MiB.
 
 That is a hardware floor, not a target. A 32 GiB device cannot start this configuration at all. Serving a single request needs about 2.6 GiB of pool rather than 9.27, so the slot count is what sets the floor, and it is not exposed as a knob today.
 
@@ -87,7 +87,7 @@ Throughput is eight prompts of 5 to 14 tokens at `max_tokens 24`, `temperature 0
 
 ## What concurrency does and does not change
 
-A row decoding in a batch does not produce the same logprobs as the same row decoding alone. That is worth separating from the thing it resembles — a row reading another row's pages — because only one of the two is benign. The variable that matters is the **batch width trajectory**: the sequence of widths a row's decode steps actually run at, which depends on when its companions become active and when they retire.
+A row decoding in a batch does not produce the same logprobs as the same row decoding alone. That is worth separating from the thing it resembles — a row reading another row's pages — because only one of the two is benign. The variable that matters is the **bucket-width trajectory**: the sequence of padded bucket widths a row's decode steps actually compute at, which depends on when its companions become active and when they retire. Bucketing quantizes it — batch sizes that share a power-of-two bucket share their arithmetic — so fewer distinct trajectories exist than under exact widths. (The table below was measured at exact widths on the eager build that predates bucketing.)
 
 | Contrast | Trajectory | Row's tokens | max abs delta logprob |
 | --- | --- | --- | --- |
@@ -99,6 +99,8 @@ A row decoding in a batch does not produce the same logprobs as the same row dec
 
 Hold the trajectory fixed and replace what the other rows are — their content, their prompt lengths — and the row is bit-identical, so **no companion row contaminates it**. Change when companions arrive or retire and the row moves, because the kernels pick shapes and reduction orders by batch size. (That a row reads the *right* positions and page rows in the first place is a separate question, gated by the preps' closed-form tests rather than by this comparison.)
 
+Decode steps compute at power-of-two batch buckets — a batch pads to its bucket with rows that write the pools' reserved padding pages — and are replayed as per-bucket CUDA graphs captured at startup (`--cuda-graph=false` is the eager escape hatch; padding applies either way, so the two modes are the same arithmetic). Bucketing also quantizes the width trajectory: batch sizes that share a bucket share their arithmetic.
+
 The consequence for callers: **greedy output is reproducible for a given workload on an otherwise idle device, not across workloads.** Replaying the same requests the same way returns the same tokens; sending them alongside different traffic changes the widths they decode at and can flip a near-tie. Another process on the same GPU does this too, by moving when each prompt's prefill lands relative to the decodes around it.
 
 ## Limits today
@@ -106,6 +108,5 @@ The consequence for callers: **greedy output is reproducible for a given workloa
 - **Prefill has priority over decode inside a step, up to a bounded number per turn.** Each turn admits and prefills at most the slot ceiling's worth of requests before the decode round runs, so a stream in flight pays those prefills. The bound is on attempts, not on slots taken, because a request that finishes inside its own prefill — `max_tokens` of 1, or a first token that is EOS — never occupies a slot. Measured with a streaming request underneath a flood of one-token requests: its inter-token gap goes from 29 ms idle to about 515 ms, and stays there whether 16, 48 or 96 requests are queued, which is 16 prefills plus its own decode step. Nothing stalls and nothing is dropped; the cost is latency proportional to the ceiling rather than to the backlog.
 - **No chunked prefill.** A prompt runs whole in one step, so a long prompt is one long step, and admission needs its full context in pages up front.
 - **No prefix cache.** Two requests sharing a prefix pay for it twice.
-- **No CUDA graph on the decode step**, so each step pays its launch overhead.
 - **Single GPU.** No tensor parallelism for this line yet.
 - **KV capacity is not reported to the frontend**: the engine logs `kv_cache_size_tokens=None`, so the frontend's capacity metrics stay empty for this model line.

@@ -48,11 +48,6 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
         .context("model path is not valid UTF-8")?
         .to_string();
     anyhow::ensure!(
-        !options.enable_cuda_graph,
-        "gemma4 serves eagerly; CUDA graph capture is not supported yet — \
-         pass enable_cuda_graph=false"
-    );
-    anyhow::ensure!(
         options.device_ordinals.len() == 1,
         "gemma4 is single-device; got device_ordinals {:?}",
         options.device_ordinals
@@ -63,6 +58,7 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
     );
     let device = options.device_ordinals[0];
     let base_seed = options.seed;
+    let graph_enabled = options.enable_cuda_graph;
 
     let policy = generation_policy(&dir)?;
 
@@ -72,7 +68,7 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
     let join = std::thread::Builder::new()
         .name("gemma4-engine".into())
         .spawn(move || {
-            let state = EngineState::load(&dir, device, policy, base_seed);
+            let state = EngineState::load(&dir, device, policy, base_seed, graph_enabled);
             let mut state = match state {
                 Ok(state) => {
                     let _ = ready_tx.send(Ok(()));
@@ -282,7 +278,13 @@ struct EngineState {
 }
 
 impl EngineState {
-    fn load(dir: &str, device: usize, policy: GenerationPolicy, base_seed: u64) -> Result<Self> {
+    fn load(
+        dir: &str,
+        device: usize,
+        policy: GenerationPolicy,
+        base_seed: u64,
+        graph_enabled: bool,
+    ) -> Result<Self> {
         let (weights, _) = Gemma4Weights::from_safetensors(dir, device)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
@@ -299,7 +301,8 @@ impl EngineState {
         let global_pages = MAX_CONCURRENCY * context_pages + 1;
         let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, local_pages, global_pages)?;
         let scratch = SampleScratch::new(&ctx, vocab, MAX_CONCURRENCY)?;
-        let arena = serve.alloc_step_arena(&ctx, MAX_CONCURRENCY)?;
+        let mut arena = serve.alloc_step_arena(&ctx, MAX_CONCURRENCY, graph_enabled)?;
+        serve.precapture_decode_graphs(&ctx, &mut arena)?;
         let blocked = ctx
             .stream
             .clone_htod(&[bf16::NEG_INFINITY])

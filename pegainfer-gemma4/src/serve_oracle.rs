@@ -566,8 +566,10 @@ fn argmax_last(ctx: &DeviceContext, logits: &HiddenStates) -> Result<u32> {
 #[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn a_ragged_batch_does_not_depend_on_row_order() {
     const STEPS: usize = 10;
-    let lengths = [1100usize, 40, 300, 17];
-    // Exactly the pages the four requests reach by the last step, plus the
+    // Three real requests in a four-row arena: the fourth row is the pad
+    // row, writing the pools' reserved padding pages.
+    let lengths = [1100usize, 40, 17];
+    // Exactly the pages the three requests reach by the last step, plus the
     // pool's padding page.
     let pages = lengths
         .iter()
@@ -586,10 +588,13 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
     // `orders[step % orders.len()]` lists request ids by the row each one
     // occupies at that step; out[request][step] collects results back by
     // request, wherever it sat.
-    let run = |orders: &[Vec<usize>]| -> Vec<Vec<Vec<f32>>> {
-        let mut arena = serve
-            .alloc_step_arena(&ctx, lengths.len())
-            .expect("step arena");
+    let run = |orders: &[Vec<usize>], graphs: bool| -> Vec<Vec<Vec<f32>>> {
+        let mut arena = serve.alloc_step_arena(&ctx, 4, graphs).expect("step arena");
+        if graphs {
+            serve
+                .precapture_decode_graphs(&ctx, &mut arena)
+                .expect("precapture");
+        }
         let mut kvs: Vec<GemmaKv> = lengths.iter().map(|_| serve.alloc_kv()).collect();
         for (request, kv) in kvs.iter_mut().enumerate() {
             let prompt = prompt_of(request);
@@ -639,13 +644,15 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
 
     let forward: Vec<usize> = (0..lengths.len()).collect();
     let reversed: Vec<usize> = forward.iter().rev().copied().collect();
-    let first = run(std::slice::from_ref(&forward));
-    let replayed = run(std::slice::from_ref(&forward));
-    let shuffled = run(&[forward, reversed]);
+    let first = run(std::slice::from_ref(&forward), true);
+    let replayed = run(std::slice::from_ref(&forward), true);
+    let shuffled = run(&[forward.clone(), reversed], true);
+    let eager = run(std::slice::from_ref(&forward), false);
 
     for (label, other) in [
         ("replaying", &replayed),
         ("moving its row between steps", &shuffled),
+        ("running eagerly instead of replaying the graph", &eager),
     ] {
         for (request, (rows_a, rows_b)) in first.iter().zip(other).enumerate() {
             for (step, (x, y)) in rows_a.iter().zip(rows_b).enumerate() {
