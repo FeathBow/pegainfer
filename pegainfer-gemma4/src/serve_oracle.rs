@@ -559,3 +559,111 @@ fn argmax_last(ctx: &DeviceContext, logits: &HiddenStates) -> Result<u32> {
         .context("non-empty vocab")?;
     u32::try_from(argmax).context("token id fits u32")
 }
+
+/// A fixed-width ragged batch must preserve each request's logits as rows move
+/// between steps. Distinct token streams make cross-row reads observable.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint and a GPU"]
+fn a_ragged_batch_does_not_depend_on_row_order() {
+    const STEPS: usize = 10;
+    let lengths = [1100usize, 40, 300, 17];
+    // Exactly the pages the four requests reach by the last step, plus the
+    // pool's padding page.
+    let pages = lengths
+        .iter()
+        .map(|len| (len + STEPS).div_ceil(PAGE_SIZE))
+        .sum::<usize>()
+        + 1;
+    let (ctx, serve, _dir) = stack_with(2048, pages);
+
+    let prompt_of = |request: usize| -> Vec<u32> {
+        (0..lengths[request] as u32)
+            .map(|i| 1000 + request as u32 * 2000 + i)
+            .collect()
+    };
+    let feed_of = |request: usize, step: usize| -> u32 { 20000 + (request * STEPS + step) as u32 };
+
+    // `orders[step % orders.len()]` lists request ids by the row each one
+    // occupies at that step; out[request][step] collects results back by
+    // request, wherever it sat.
+    let run = |orders: &[Vec<usize>]| -> Vec<Vec<Vec<f32>>> {
+        let mut kvs: Vec<GemmaKv> = lengths.iter().map(|_| serve.alloc_kv()).collect();
+        for (request, kv) in kvs.iter_mut().enumerate() {
+            let prompt = prompt_of(request);
+            admit_tokens(&serve.local_pool, &serve.global_pool, kv, prompt.len())
+                .expect("admit prompt");
+            serve
+                .step(&ctx, kv, &prompt, LogitsSpan::LastRow)
+                .expect("prefill");
+        }
+        assert!(
+            kvs[0].local.origin_pages() > 0,
+            "the {} token row should have released its window front",
+            lengths[0]
+        );
+        for (request, kv) in kvs.iter().enumerate().skip(1) {
+            assert_eq!(
+                kv.local.origin_pages(),
+                0,
+                "request {request} ({} prompt tokens) should still hold its front",
+                lengths[request]
+            );
+        }
+        let mut out = vec![Vec::with_capacity(STEPS); lengths.len()];
+        for step in 0..STEPS {
+            let order = &orders[step % orders.len()];
+            for kv in &mut kvs {
+                admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1).expect("admit token");
+            }
+            let mut slots: Vec<Option<&mut GemmaKv>> = kvs.iter_mut().map(Some).collect();
+            let mut borrowed = Vec::with_capacity(order.len());
+            let mut tokens = Vec::with_capacity(order.len());
+            for &request in order {
+                borrowed.push(slots[request].take().expect("each request once"));
+                tokens.push(feed_of(request, step));
+            }
+            let logits = serve
+                .decode_batch_step(&ctx, &mut borrowed, &tokens)
+                .expect("decode");
+            let host = logits.to_host(&ctx).expect("D2H");
+            let vocab = logits.hidden_dim;
+            for (row, &request) in order.iter().enumerate() {
+                out[request].push(host[row * vocab..(row + 1) * vocab].to_vec());
+            }
+        }
+        out
+    };
+
+    let forward: Vec<usize> = (0..lengths.len()).collect();
+    let reversed: Vec<usize> = forward.iter().rev().copied().collect();
+    let first = run(std::slice::from_ref(&forward));
+    let replayed = run(std::slice::from_ref(&forward));
+    let shuffled = run(&[forward, reversed]);
+
+    for (label, other) in [
+        ("replaying", &replayed),
+        ("moving its row between steps", &shuffled),
+    ] {
+        for (request, (rows_a, rows_b)) in first.iter().zip(other).enumerate() {
+            for (step, (x, y)) in rows_a.iter().zip(rows_b).enumerate() {
+                let differing = x
+                    .iter()
+                    .zip(y)
+                    .enumerate()
+                    .find(|(_, (p, q))| p.to_bits() != q.to_bits());
+                assert!(
+                    differing.is_none(),
+                    "request {request} ({} prompt tokens) step {step}: {label} changed its \
+                     logits at {:?}",
+                    lengths[request],
+                    differing.map(|(i, (p, q))| (i, *p, *q))
+                );
+            }
+        }
+    }
+    println!(
+        "ragged batch: {} rows at {:?} tokens replay identically and survive per step row moves",
+        lengths.len(),
+        lengths
+    );
+}
