@@ -267,11 +267,8 @@ impl LocalEngineBridge {
             return Ok(());
         };
 
-        // Fail loud on sampling parameters the engine cannot honor yet —
-        // silently ignoring a requested seed or penalty changes outputs
-        // without telling the client.
-        if let Some(unsupported) = crate::vllm::wire::unsupported_sampling(&sampling_params) {
-            warn!("request {request_id} rejected: unsupported sampling params: {unsupported}");
+        if let Some(unsupported) = crate::vllm::wire::unsupported_request_params(&sampling_params) {
+            warn!("request {request_id} rejected: {unsupported}");
             send_terminal_output(
                 self.engine_index,
                 output_tx,
