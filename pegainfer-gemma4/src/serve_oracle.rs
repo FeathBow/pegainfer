@@ -835,6 +835,64 @@ fn mixed_step_crosses_the_window_like_serial() {
     }
 }
 
+/// The KV ledger after a segmented admission must match the whole-prompt
+/// admission: same frontier, same origin, same resident page count. Pure
+/// bookkeeping arithmetic — no forward pass — so a divergence indicts the
+/// advance/release cycling, not any kernel. Page ids may legally differ
+/// (pool recycling), so the assertion stops at the ledger.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+fn segmented_admission_matches_whole_kv_ledger() {
+    let (_ctx, serve, dir) = stack_with(2048, 512);
+    let window = Gemma4Config::from_file(&dir)
+        .expect("config")
+        .sliding_window;
+    let total = 1500usize;
+
+    let mut whole = serve.alloc_kv();
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut whole, total).expect("admit whole");
+    whole
+        .local
+        .advance_and_release(total, window)
+        .expect("whole advance");
+    whole.global.advance(total);
+
+    let mut seg = serve.alloc_kv();
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut seg, total).expect("admit segmented");
+    let mut left = total;
+    while left > 0 {
+        let step = left.min(128);
+        seg.local
+            .advance_and_release(step, window)
+            .expect("segment advance");
+        seg.global.advance(step);
+        left -= step;
+    }
+
+    assert_eq!(seg.local.seq_len(), whole.local.seq_len(), "local frontier");
+    assert_eq!(
+        seg.global.seq_len(),
+        whole.global.seq_len(),
+        "global frontier"
+    );
+    assert_eq!(
+        seg.local.origin_pages(),
+        whole.local.origin_pages(),
+        "released-front origin"
+    );
+    assert_eq!(
+        seg.local.page_row().len(),
+        whole.local.page_row().len(),
+        "resident page count"
+    );
+    eprintln!(
+        "ledger: seq {} origin {} pages {}",
+        seg.local.seq_len(),
+        seg.local.origin_pages(),
+        seg.local.page_row().len()
+    );
+}
+
 /// The overlap-safe prefill under a lane-stream override must be bit-equal
 /// to the sync step: identical row-0 logits, the same released-window
 /// shape after the deferred release, and greedy decode over the
@@ -1102,7 +1160,7 @@ fn argmax(row: &[f32]) -> usize {
 /// Greedy continuation: prefill the prompt, then decode `max_new`
 /// tokens one at a time. Host argmax over the last position — the
 /// correctness path; sampling belongs to the serving frontend.
-fn generate_greedy(
+pub(crate) fn generate_greedy(
     serve: &GemmaServe,
     ctx: &DeviceContext,
     kv: &mut GemmaKv,

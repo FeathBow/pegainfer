@@ -422,6 +422,30 @@ fn validate_request(request: &GenerateRequest, prefix_hit_tokens: usize) -> Resu
 /// sampler-row capacity so a burst still leaves decode rows headroom.
 const MIX_MAX_PROMPTS: usize = 4;
 
+/// The chunked-walk knob: `PEGAINFER_MIX_CHUNK_TOKENS=N` walks admitted
+/// prompts through shared segment steps of at most `N` prompt rows each —
+/// live streams then advance one token per segment instead of waiting out
+/// a whole prompt. Unset (or `off`/`0`) keeps whole-prompt steps.
+fn mix_chunk_tokens() -> Result<Option<usize>> {
+    match std::env::var("PEGAINFER_MIX_CHUNK_TOKENS") {
+        Ok(raw) => parse_mix_chunk_tokens(&raw),
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_mix_chunk_tokens(raw: &str) -> Result<Option<usize>> {
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "0" | "off" => Ok(None),
+        other => match other.parse::<usize>() {
+            Ok(n) if (64..MAX_CONTEXT).contains(&n) => Ok(Some(n)),
+            _ => anyhow::bail!(
+                "PEGAINFER_MIX_CHUNK_TOKENS={raw:?} not recognized (off | N, 64 <= N < {MAX_CONTEXT})"
+            ),
+        },
+    }
+}
+
 /// The gathered step's prompt-row ceiling. Gathering amortizes only the
 /// step floor (~27 ms at 12B) while every live stream's inter-token gap
 /// pays the whole gathered step (~0.2 ms per row), so absorbing long
@@ -431,6 +455,116 @@ const MIX_MAX_PROMPTS: usize = 4;
 /// bursts are where the floor dominates; the ceiling keeps the gather
 /// there, and a long prompt keeps its own step.
 const MIX_GATHER_ROWS: usize = 512;
+
+/// One newcomer row of a mixed step's logits head, ahead of the active
+/// rows: its sampling params, its logprob request (0 = none), and whether
+/// its pick may stop it — a mid-walk segment's row is sampled and
+/// discarded, so it never stops.
+struct HeadRow<'a> {
+    params: &'a pegainfer_frontend::sampler::SamplingParams,
+    logprobs: usize,
+    ignore_eos: bool,
+}
+
+/// Suppress, sample and score one mixed step's logits — `head` describes
+/// rows `0..head.len()`, the active rows follow — then deliver the active
+/// rows' events. Returns every row's pick, logprob and stop flag; `Err`
+/// carries the failure message after the active batch has been failed.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn mixed_head_flow(
+    ctx: &DeviceContext,
+    blocked: &CudaSlice<bf16>,
+    policy: &GenerationPolicy,
+    scratch: &mut SampleScratch,
+    base_seed: u64,
+    sample_nonce: &mut u64,
+    head: &[HeadRow<'_>],
+    active: &mut Vec<Active>,
+    logits: &mut HiddenStates,
+) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>, Vec<bool>), String> {
+    let k = head.len();
+    let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
+        log::error!("{what} failed: {err:#}");
+        for entry in active.drain(..) {
+            let _ = entry.request.token_tx.send(TokenEvent::Error {
+                message: format!("{what} failed: {err:#}"),
+                prompt_tokens: entry.prompt_tokens,
+                completion_tokens: entry.emitted,
+            });
+        }
+    };
+    if let Err(err) = suppress_logits(ctx, blocked, logits, &policy.suppress) {
+        fail_batch(active, "mixed suppression", &err);
+        return Err(format!("mixed suppression failed: {err:#}"));
+    }
+
+    *sample_nonce = sample_nonce.wrapping_add(1);
+    let call_seed = base_seed ^ sample_nonce.rotate_left(17);
+    let picked = {
+        let params: Vec<_> = head
+            .iter()
+            .map(|h| h.params)
+            .chain(active.iter().map(|entry| &entry.request.params))
+            .collect();
+        let steps: Vec<u64> = std::iter::repeat_n(0u64, k)
+            .chain(active.iter().map(|entry| entry.emitted as u64))
+            .collect();
+        match pegainfer_sample::select_batch(ctx, logits, &params, &steps, call_seed, scratch) {
+            Ok(picked) => picked,
+            Err(err) => {
+                fail_batch(active, "mixed sampling", &err);
+                return Err(format!("mixed sampling failed: {err:#}"));
+            }
+        }
+    };
+    let mut stops = vec![false; active.len() + k];
+    for (j, h) in head.iter().enumerate() {
+        stops[j] = !h.ignore_eos && policy.eos.contains(&picked[j]);
+    }
+    for (row, entry) in active.iter().enumerate() {
+        stops[row + k] = !entry.request.params.ignore_eos && policy.eos.contains(&picked[row + k]);
+    }
+    let mut lp_requests: Vec<LogprobRequest> = Vec::new();
+    lp_requests.extend(
+        head.iter()
+            .enumerate()
+            .filter(|(j, h)| h.logprobs > 0 && !stops[*j])
+            .map(|(j, h)| LogprobRequest {
+                row: j,
+                picked: picked[j],
+                top_k: h.logprobs,
+            }),
+    );
+    lp_requests.extend(
+        active
+            .iter()
+            .enumerate()
+            .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[row + k])
+            .map(|(row, entry)| LogprobRequest {
+                row: row + k,
+                picked: picked[row + k],
+                top_k: entry.request.logprobs,
+            }),
+    );
+    let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len() + k];
+    if !lp_requests.is_empty() {
+        match pegainfer_sample::token_logprobs_batch(ctx, logits, &lp_requests) {
+            Ok(scored) => {
+                for (lp, scored) in lp_requests.iter().zip(scored) {
+                    logprobs[lp.row] = Some(scored);
+                }
+            }
+            Err(err) => {
+                fail_batch(active, "mixed logprobs", &err);
+                return Err(format!("mixed logprobs failed: {err:#}"));
+            }
+        }
+    }
+
+    // Active rows: the decode-round event flow, `k` logits rows up.
+    emit_decode_rows(active, &picked, &stops, &mut logprobs, k);
+    Ok((picked, logprobs, stops))
+}
 
 struct Active {
     request: GenerateRequest,
@@ -484,6 +618,9 @@ struct EngineState {
     /// The overlap lane; `None` unless `PEGAINFER_ASYNC_PREFILL` opted in
     /// at startup.
     lane: Option<AsyncPrefillLane>,
+    /// The chunked-walk segment span; `None` unless
+    /// `PEGAINFER_MIX_CHUNK_TOKENS` opted in at startup.
+    mix_chunk: Option<usize>,
 }
 
 impl EngineState {
@@ -498,6 +635,7 @@ impl EngineState {
         // the multi-GiB load.
         crate::serve::global_split_factor(&crate::config::Gemma4Config::from_file(dir)?)?;
         let lane_mode = async_prefill_mode()?;
+        let mix_chunk = mix_chunk_tokens()?;
         let (weights, _) = Gemma4Weights::from_safetensors(dir, device)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
@@ -554,6 +692,7 @@ impl EngineState {
             base_seed,
             sample_nonce: 0,
             lane,
+            mix_chunk,
         })
     }
 
@@ -670,7 +809,7 @@ impl EngineState {
                     prompt_tokens - kv.local.seq_len()
                 };
                 while newcomers.len() < MIX_MAX_PROMPTS
-                    && rows_budget < MIX_GATHER_ROWS
+                    && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
                     && newcomers.len() + active.len() < MAX_CONCURRENCY
                     && *attempts < MAX_CONCURRENCY
                 {
@@ -717,7 +856,10 @@ impl EngineState {
                         None => self.serve.alloc_kv(),
                     };
                     let new_tokens = cand_len - cand_kv.local.seq_len();
-                    if rows_budget + new_tokens > MIX_GATHER_ROWS {
+                    // Chunked mode walks the gather in shared segments that
+                    // pace themselves, so only the count, slot, pool and
+                    // attempt bounds apply.
+                    if self.mix_chunk.is_none() && rows_budget + new_tokens > MIX_GATHER_ROWS {
                         pending.push_front((cand, cand_prefix));
                         break;
                     }
@@ -955,6 +1097,288 @@ impl EngineState {
         }
     }
 
+    /// The chunked walk behind `PEGAINFER_MIX_CHUNK_TOKENS`: every
+    /// gathered prompt walks the same segment schedule, one shared mixed
+    /// step per round, packing up to `chunk` unseen prompt rows across
+    /// walkers in admission order on top of the live decode batch — the
+    /// streams advance one token per round instead of waiting out whole
+    /// prompts. Each round samples every segment's last row; only a
+    /// walker's final segment's row is kept as its first token. A drained
+    /// roster finishes the remaining tails on the plain path, one whole
+    /// scan each; walkers join the batch together when the walk ends.
+    fn mixed_walk(
+        &mut self,
+        chunk: usize,
+        newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
+        active: &mut Vec<Active>,
+    ) -> Admitted {
+        struct Walker {
+            request: GenerateRequest,
+            kv: GemmaKv,
+            resumed: Option<u64>,
+            offset: usize,
+            first: Option<(u32, Option<TokenLogprob>)>,
+            failed: bool,
+        }
+        let mut walkers: Vec<Walker> = newcomers
+            .into_iter()
+            .map(|(request, kv, resumed)| Walker {
+                offset: kv.local.seq_len(),
+                request,
+                kv,
+                resumed,
+                first: None,
+                failed: false,
+            })
+            .collect();
+
+        let mut first_round = true;
+        while walkers
+            .iter()
+            .any(|w| !w.failed && w.offset < w.request.prompt_tokens.len())
+        {
+            if !first_round {
+                self.ready_decode_rows(active);
+            }
+            first_round = false;
+
+            if active.is_empty() {
+                // The batch drained mid-walk: finish each remaining tail on
+                // the plain path — the KV frontier carries the position.
+                for w in &mut walkers {
+                    if w.failed || w.offset >= w.request.prompt_tokens.len() {
+                        continue;
+                    }
+                    let rest = &w.request.prompt_tokens[w.offset..];
+                    w.offset = w.request.prompt_tokens.len();
+                    let mut logits =
+                        match self
+                            .serve
+                            .step(&self.ctx, &mut w.kv, rest, LogitsSpan::LastRow)
+                        {
+                            Ok(logits) => logits,
+                            Err(err) => {
+                                let _ = w.request.token_tx.send(TokenEvent::Error {
+                                    message: format!("walk tail prefill failed: {err:#}"),
+                                    prompt_tokens: w.request.prompt_tokens.len(),
+                                    completion_tokens: 0,
+                                });
+                                w.failed = true;
+                                continue;
+                            }
+                        };
+                    let head = [HeadRow {
+                        params: &w.request.params,
+                        logprobs: w.request.logprobs,
+                        ignore_eos: w.request.params.ignore_eos,
+                    }];
+                    match mixed_head_flow(
+                        &self.ctx,
+                        &self.blocked,
+                        &self.policy,
+                        &mut self.scratch,
+                        self.base_seed,
+                        &mut self.sample_nonce,
+                        &head,
+                        active,
+                        &mut logits,
+                    ) {
+                        Ok((picked, mut lps, _)) => {
+                            w.first = Some((picked[0], lps[0].take()));
+                        }
+                        Err(message) => {
+                            let _ = w.request.token_tx.send(TokenEvent::Error {
+                                message,
+                                prompt_tokens: w.request.prompt_tokens.len(),
+                                completion_tokens: 0,
+                            });
+                            w.failed = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // This round's slate, in walker order: rows to take per walker
+            // and whether that take completes its prompt.
+            let mut budget = chunk;
+            let mut takes: Vec<Option<(usize, bool)>> = vec![None; walkers.len()];
+            for (wi, w) in walkers.iter().enumerate() {
+                if w.failed {
+                    continue;
+                }
+                let rest = w.request.prompt_tokens.len() - w.offset;
+                if rest == 0 || budget == 0 {
+                    continue;
+                }
+                let take = rest.min(budget);
+                takes[wi] = Some((take, take == rest));
+                budget -= take;
+            }
+
+            let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
+            let stepped = {
+                let mut kvs: Vec<&mut GemmaKv> =
+                    active.iter_mut().map(|entry| &mut entry.kv).collect();
+                let mut prefills: Vec<(&mut GemmaKv, &[u32])> = Vec::new();
+                for (w, t) in walkers.iter_mut().zip(&takes) {
+                    if let Some((take, _)) = *t {
+                        let seg = &w.request.prompt_tokens[w.offset..w.offset + take];
+                        prefills.push((&mut w.kv, seg));
+                    }
+                }
+                self.serve.mixed_prefill_decode_step(
+                    &self.ctx,
+                    &mut self.arena,
+                    &mut prefills,
+                    &mut kvs,
+                    &decode_tokens,
+                )
+            };
+            let logits = match stepped {
+                Ok(logits) => logits,
+                Err(err) => {
+                    log::error!("walk step failed: {err:#}");
+                    for entry in active.drain(..) {
+                        let _ = entry.request.token_tx.send(TokenEvent::Error {
+                            message: format!("walk step failed: {err:#}"),
+                            prompt_tokens: entry.prompt_tokens,
+                            completion_tokens: entry.emitted,
+                        });
+                    }
+                    for w in walkers.drain(..) {
+                        let _ = w.request.token_tx.send(TokenEvent::Error {
+                            message: format!("walk step failed: {err:#}"),
+                            prompt_tokens: w.request.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                    }
+                    return Admitted::Done;
+                }
+            };
+
+            let flow = {
+                let head: Vec<HeadRow<'_>> = walkers
+                    .iter()
+                    .zip(&takes)
+                    .filter(|(_, t)| t.is_some())
+                    .map(|(w, t)| {
+                        let (_, last) = t.expect("filtered");
+                        HeadRow {
+                            params: &w.request.params,
+                            logprobs: if last { w.request.logprobs } else { 0 },
+                            ignore_eos: if last {
+                                w.request.params.ignore_eos
+                            } else {
+                                true
+                            },
+                        }
+                    })
+                    .collect();
+                mixed_head_flow(
+                    &self.ctx,
+                    &self.blocked,
+                    &self.policy,
+                    &mut self.scratch,
+                    self.base_seed,
+                    &mut self.sample_nonce,
+                    &head,
+                    active,
+                    logits,
+                )
+            };
+            match flow {
+                Ok((picked, mut lps, _)) => {
+                    let mut si = 0usize;
+                    for (w, t) in walkers.iter_mut().zip(&takes) {
+                        if let Some((take, last)) = *t {
+                            w.offset += take;
+                            if last {
+                                w.first = Some((picked[si], lps[si].take()));
+                            }
+                            si += 1;
+                        }
+                    }
+                }
+                Err(message) => {
+                    for w in walkers.drain(..) {
+                        let _ = w.request.token_tx.send(TokenEvent::Error {
+                            message: message.clone(),
+                            prompt_tokens: w.request.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                    }
+                    return Admitted::Done;
+                }
+            }
+        }
+
+        // Every walker's first token came from its final segment; capture
+        // and join the batch exactly like the whole-prompt form.
+        for w in walkers {
+            if w.failed {
+                continue;
+            }
+            let Walker {
+                request,
+                kv,
+                resumed,
+                first,
+                ..
+            } = w;
+            let prompt_tokens = request.prompt_tokens.len();
+            let Some((next, logprob)) = first else {
+                let _ = request.token_tx.send(TokenEvent::Error {
+                    message: "the walk produced no first token".into(),
+                    prompt_tokens,
+                    completion_tokens: 0,
+                });
+                continue;
+            };
+            if let Some(cache) = self.prefix_cache.as_mut() {
+                if let Some(entry) =
+                    self.serve
+                        .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+                {
+                    cache.insert(entry, resumed);
+                }
+            }
+            // The stop token retires the request without being emitted,
+            // the same contract as every other admission path.
+            if !request.params.ignore_eos && self.policy.eos.contains(&next) {
+                let _ = request.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens,
+                    completion_tokens: 0,
+                });
+                continue;
+            }
+            if request
+                .token_tx
+                .send(TokenEvent::Token { id: next, logprob })
+                .is_err()
+            {
+                continue;
+            }
+            if request.max_tokens <= 1 {
+                let _ = request.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Length,
+                    prompt_tokens,
+                    completion_tokens: 1,
+                });
+                continue;
+            }
+            active.push(Active {
+                request,
+                kv,
+                next,
+                emitted: 1,
+                prompt_tokens,
+            });
+        }
+        Admitted::Done
+    }
+
     /// Retire every active request the next step cannot serve — a closed
     /// sink, or a pool that cannot grow its KV by one token — and admit the
     /// step's token for the rest.
@@ -995,7 +1419,9 @@ impl EngineState {
         mut newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
         active: &mut Vec<Active>,
     ) -> Admitted {
-        let k = newcomers.len();
+        if let Some(chunk) = self.mix_chunk {
+            return self.mixed_walk(chunk, newcomers, active);
+        }
         let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
             log::error!("{what} failed: {err:#}");
             for entry in active.drain(..) {
@@ -1052,94 +1478,30 @@ impl EngineState {
                 }
             }
         }
-        if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
-            fail_batch(active, "mixed suppression", &err);
-            return fail_newcomers(
-                &mut newcomers,
-                &format!("mixed suppression failed: {err:#}"),
-            );
-        }
-
-        self.sample_nonce = self.sample_nonce.wrapping_add(1);
-        let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
-        let picked = {
-            let params: Vec<_> = newcomers
+        let (picked, mut logprobs, stops) = {
+            let head: Vec<HeadRow<'_>> = newcomers
                 .iter()
-                .map(|(request, _, _)| &request.params)
-                .chain(active.iter().map(|entry| &entry.request.params))
+                .map(|(request, _, _)| HeadRow {
+                    params: &request.params,
+                    logprobs: request.logprobs,
+                    ignore_eos: request.params.ignore_eos,
+                })
                 .collect();
-            let steps: Vec<u64> = std::iter::repeat_n(0u64, k)
-                .chain(active.iter().map(|entry| entry.emitted as u64))
-                .collect();
-            match pegainfer_sample::select_batch(
+            match mixed_head_flow(
                 &self.ctx,
-                logits,
-                &params,
-                &steps,
-                call_seed,
+                &self.blocked,
+                &self.policy,
                 &mut self.scratch,
+                self.base_seed,
+                &mut self.sample_nonce,
+                &head,
+                active,
+                logits,
             ) {
-                Ok(picked) => picked,
-                Err(err) => {
-                    fail_batch(active, "mixed sampling", &err);
-                    return fail_newcomers(
-                        &mut newcomers,
-                        &format!("mixed sampling failed: {err:#}"),
-                    );
-                }
+                Ok(flow) => flow,
+                Err(message) => return fail_newcomers(&mut newcomers, &message),
             }
         };
-        let mut stops = vec![false; active.len() + k];
-        for (j, (request, _, _)) in newcomers.iter().enumerate() {
-            stops[j] = !request.params.ignore_eos && self.policy.eos.contains(&picked[j]);
-        }
-        for (row, entry) in active.iter().enumerate() {
-            stops[row + k] =
-                !entry.request.params.ignore_eos && self.policy.eos.contains(&picked[row + k]);
-        }
-        let mut lp_requests: Vec<LogprobRequest> = Vec::new();
-        lp_requests.extend(
-            newcomers
-                .iter()
-                .enumerate()
-                .filter(|(j, (request, _, _))| request.logprobs > 0 && !stops[*j])
-                .map(|(j, (request, _, _))| LogprobRequest {
-                    row: j,
-                    picked: picked[j],
-                    top_k: request.logprobs,
-                }),
-        );
-        lp_requests.extend(
-            active
-                .iter()
-                .enumerate()
-                .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[row + k])
-                .map(|(row, entry)| LogprobRequest {
-                    row: row + k,
-                    picked: picked[row + k],
-                    top_k: entry.request.logprobs,
-                }),
-        );
-        let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len() + k];
-        if !lp_requests.is_empty() {
-            match pegainfer_sample::token_logprobs_batch(&self.ctx, logits, &lp_requests) {
-                Ok(scored) => {
-                    for (lp, scored) in lp_requests.iter().zip(scored) {
-                        logprobs[lp.row] = Some(scored);
-                    }
-                }
-                Err(err) => {
-                    fail_batch(active, "mixed logprobs", &err);
-                    return fail_newcomers(
-                        &mut newcomers,
-                        &format!("mixed logprobs failed: {err:#}"),
-                    );
-                }
-            }
-        }
-
-        // Active rows: the decode-round event flow, `k` logits rows up.
-        emit_decode_rows(active, &picked, &stops, &mut logprobs, k);
 
         // The newcomers: their first tokens are logits rows `0..k`.
         for (j, (request, kv, _)) in newcomers.into_iter().enumerate() {
@@ -1545,6 +1907,225 @@ mod lane_tests {
         lane_lifecycle_script("green:35");
     }
 
+    fn walk_request(prompt: Vec<u32>, max_tokens: usize) -> (GenerateRequest, TokenStreamReceiver) {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        (
+            GenerateRequest {
+                trace_parent: None,
+                request_id: None,
+                queued_at_unix_s: None,
+                data_parallel_rank: None,
+                prompt_tokens: prompt,
+                params: pegainfer_frontend::sampler::SamplingParams {
+                    ignore_eos: true,
+                    ..pegainfer_frontend::sampler::SamplingParams::default()
+                },
+                max_tokens,
+                lora_adapter: None,
+                kv_transfer_params: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            },
+            token_rx,
+        )
+    }
+
+    fn walk_drain(rx: &mut TokenStreamReceiver, name: &str, into: &mut Vec<u32>) {
+        loop {
+            match rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Token { id, .. }) => into.push(id),
+                Some(TokenEvent::Finished { .. }) => return,
+                Some(TokenEvent::Error { message, .. } | TokenEvent::Rejected { message, .. }) => {
+                    panic!("{name}: {message}")
+                }
+                Some(_) => {}
+                None => panic!("{name}: channel closed without Finished"),
+            }
+        }
+    }
+
+    /// A single-request episode through the plain admission path — the
+    /// engine's own serial reference: same suppression, same sampler.
+    fn walk_serial(state: &mut super::EngineState, prompt: &[u32], budget: usize) -> Vec<u32> {
+        let (request, mut rx) = walk_request(prompt.to_vec(), budget);
+        let mut active = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        let mut attempts = 0usize;
+        match state.admit_and_prefill(
+            (request, pegainfer_frontend::engine::KvPrefix::none()),
+            false,
+            &mut active,
+            &mut pending,
+            &mut attempts,
+        ) {
+            super::Admitted::Active(entry) => active.push(*entry),
+            super::Admitted::Done => {}
+            super::Admitted::Requeue(_) => panic!("serial episode requeued"),
+        }
+        while !active.is_empty() {
+            state.decode_round(&mut active);
+        }
+        let mut out = Vec::new();
+        walk_drain(&mut rx, "serial episode", &mut out);
+        out
+    }
+
+    /// One shared walk against the engine's own serial path: three fixture
+    /// prompts get their reference sequences from single-request episodes
+    /// through the plain admission path — same suppression, same sampler —
+    /// then a rider decodes while the other two walk 24-token segments in
+    /// one gathered episode, and finally both walk again from an idle
+    /// roster (the whole-scan tail path). Every request's greedy sequence
+    /// must match its reference whole.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
+    fn the_gathered_walk_matches_the_serial_path() {
+        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        let policy = super::generation_policy(&dir).expect("policy");
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_data/gemma4-12b-generate.safetensors"
+        );
+        let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
+        let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+        let cases = ["a", "b", "c"];
+        let prompts: Vec<Vec<u32>> = cases
+            .iter()
+            .map(|case| {
+                let (_, prompt_i32) =
+                    crate::testkit::i32_tensor(&fixture, &format!("{case}_prompt"));
+                prompt_i32
+                    .iter()
+                    .map(|&t| u32::try_from(t).expect("token id"))
+                    .collect()
+            })
+            .collect();
+        let budgets = [24usize, 17, 21];
+
+        let serial: Vec<Vec<u32>> = prompts
+            .iter()
+            .zip(budgets)
+            .map(|(prompt, budget)| walk_serial(&mut state, prompt, budget))
+            .collect();
+        for (i, sequence) in serial.iter().enumerate() {
+            assert_eq!(
+                sequence.len(),
+                budgets[i],
+                "serial episode {i} reached its budget"
+            );
+        }
+
+        // Phase one: the rider decodes while b and c walk one gathered
+        // 24-token-segment episode; boundary rounds carry a final and a
+        // non-final segment, so the walker-to-row bookkeeping is exercised.
+        let (req_a, mut rx_a) = walk_request(prompts[0].clone(), budgets[0]);
+        let mut pending = std::collections::VecDeque::new();
+        let mut attempts = 0usize;
+        let mut active: Vec<super::Active> = Vec::new();
+        match state.admit_and_prefill(
+            (req_a, pegainfer_frontend::engine::KvPrefix::none()),
+            false,
+            &mut active,
+            &mut pending,
+            &mut attempts,
+        ) {
+            super::Admitted::Active(entry) => active.push(*entry),
+            _ => panic!("rider admission must hand back an active lane"),
+        }
+
+        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), budgets[1]);
+        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), budgets[2]);
+        let mut kv_b = state.serve.alloc_kv();
+        let mut kv_c = state.serve.alloc_kv();
+        crate::kv::admit_tokens(
+            &state.serve.local_pool,
+            &state.serve.global_pool,
+            &mut kv_b,
+            prompts[1].len(),
+        )
+        .expect("admit walker b");
+        crate::kv::admit_tokens(
+            &state.serve.local_pool,
+            &state.serve.global_pool,
+            &mut kv_c,
+            prompts[2].len(),
+        )
+        .expect("admit walker c");
+        state.ready_decode_rows(&mut active);
+        let admitted = state.mixed_walk(
+            24,
+            vec![(req_b, kv_b, None), (req_c, kv_c, None)],
+            &mut active,
+        );
+        assert!(
+            matches!(admitted, super::Admitted::Done),
+            "the walk returns Done"
+        );
+        assert_eq!(active.len(), 3, "rider plus both walkers keep decoding");
+        while !active.is_empty() {
+            state.decode_round(&mut active);
+        }
+        let mut produced: Vec<Vec<u32>> = vec![Vec::new(); 3];
+        walk_drain(&mut rx_a, "rider", &mut produced[0]);
+        walk_drain(&mut rx_b, "walker b", &mut produced[1]);
+        walk_drain(&mut rx_c, "walker c", &mut produced[2]);
+        for (i, case) in cases.iter().enumerate() {
+            assert_eq!(
+                produced[i], serial[i],
+                "case {case}: the gathered walk diverged from the serial path"
+            );
+            eprintln!("case {case}: {} tokens gathered == serial", serial[i].len());
+        }
+
+        // Phase two: the same walk from an idle roster — both tails feed
+        // whole through the drained-roster path.
+        let (req_a2, mut rx_a2) = walk_request(prompts[0].clone(), budgets[0]);
+        let (req_b2, mut rx_b2) = walk_request(prompts[1].clone(), budgets[1]);
+        let mut kv_a2 = state.serve.alloc_kv();
+        let mut kv_b2 = state.serve.alloc_kv();
+        crate::kv::admit_tokens(
+            &state.serve.local_pool,
+            &state.serve.global_pool,
+            &mut kv_a2,
+            prompts[0].len(),
+        )
+        .expect("admit idle walker a");
+        crate::kv::admit_tokens(
+            &state.serve.local_pool,
+            &state.serve.global_pool,
+            &mut kv_b2,
+            prompts[1].len(),
+        )
+        .expect("admit idle walker b");
+        let mut active2: Vec<super::Active> = Vec::new();
+        let admitted2 = state.mixed_walk(
+            24,
+            vec![(req_a2, kv_a2, None), (req_b2, kv_b2, None)],
+            &mut active2,
+        );
+        assert!(
+            matches!(admitted2, super::Admitted::Done),
+            "the idle walk returns Done"
+        );
+        assert_eq!(active2.len(), 2, "both idle walkers keep decoding");
+        while !active2.is_empty() {
+            state.decode_round(&mut active2);
+        }
+        let mut produced2: Vec<Vec<u32>> = vec![Vec::new(); 2];
+        walk_drain(&mut rx_a2, "idle walker a", &mut produced2[0]);
+        walk_drain(&mut rx_b2, "idle walker b", &mut produced2[1]);
+        for i in 0..2 {
+            assert_eq!(
+                produced2[i], serial[i],
+                "idle case {}: the walk diverged from the serial path",
+                cases[i]
+            );
+        }
+    }
+
     /// The production gather against one live engine, interleavings pinned:
     /// the streamer's budget outlasts the script and its sink drops last,
     /// so the decode batch is never empty and every admission takes the
@@ -1656,6 +2237,22 @@ mod lane_tests {
         ] {
             assert!(
                 parse_async_prefill_mode(bad).is_err(),
+                "{bad:?} must refuse, not silently degrade"
+            );
+        }
+    }
+
+    #[test]
+    fn mix_chunk_tokens_parses_or_refuses() {
+        use super::parse_mix_chunk_tokens;
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(parse_mix_chunk_tokens(off).unwrap(), None);
+        }
+        assert_eq!(parse_mix_chunk_tokens("2048").unwrap(), Some(2048));
+        assert_eq!(parse_mix_chunk_tokens("64").unwrap(), Some(64));
+        for bad in ["63", "8192", "on", "2k", "-1"] {
+            assert!(
+                parse_mix_chunk_tokens(bad).is_err(),
                 "{bad:?} must refuse, not silently degrade"
             );
         }

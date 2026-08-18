@@ -1796,24 +1796,35 @@ impl GemmaServe {
             let rel_start = start
                 .checked_sub(origin_tokens)
                 .context("the step starts before the resident window")?;
-            let row = kv.local.page_row();
+            // A walking prompt parks every page up front, so its resident
+            // row over-covers a mid-walk entry; the attention derives its
+            // kv length from the row, so each entry's row is truncated to
+            // exactly its coverage — an identity for whole-prompt steps —
+            // after asserting the row reaches that far.
+            let mut row = kv.local.page_row();
             anyhow::ensure!(
-                row.len() == rel_kv_len.div_ceil(page),
-                "local resident row of {} pages against {rel_kv_len} tokens",
+                row.len() >= rel_kv_len.div_ceil(page),
+                "local resident row of {} pages cannot cover {rel_kv_len} tokens",
                 row.len()
             );
+            row.truncate(rel_kv_len.div_ceil(page));
             let rel_last = if rel_kv_len.is_multiple_of(page) {
                 page
             } else {
                 rel_kv_len % page
             };
-            let global_desc = kv.global.desc_for_len(kv_len)?;
-            let global_row = kv.global.page_indices_i32();
+            let mut global_row = kv.global.page_indices_i32();
             anyhow::ensure!(
-                global_row.len() == kv_len.div_ceil(global_page),
-                "global resident row of {} pages against {kv_len} tokens",
+                global_row.len() >= kv_len.div_ceil(global_page),
+                "global resident row of {} pages cannot cover {kv_len} tokens",
                 global_row.len()
             );
+            global_row.truncate(kv_len.div_ceil(global_page));
+            let global_last = if kv_len.is_multiple_of(global_page) {
+                global_page
+            } else {
+                kv_len % global_page
+            };
             for i in 0..prompt.len() {
                 mix_rows.push(start + i, &row, kv.local.origin_pages(), &global_row)?;
             }
@@ -1822,7 +1833,7 @@ impl GemmaServe {
                 rows: prompt.len(),
             });
             row_cursor += prompt.len();
-            prefill_global_last.push(global_desc.last_page_len());
+            prefill_global_last.push(global_last);
             prefill_global_start.push(start);
             prefill_global_rows.push(global_row);
             local_rows.push(row);
@@ -2327,4 +2338,4 @@ pub(crate) struct PrefillPass {
 
 #[path = "serve_oracle.rs"]
 #[cfg(test)]
-mod oracle;
+pub(crate) mod oracle;
