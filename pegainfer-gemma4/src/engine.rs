@@ -1204,8 +1204,149 @@ mod gate {
 
 #[cfg(test)]
 mod lane_tests {
+    use std::path::Path;
+
+    use pegainfer_frontend::engine::EngineLoadOptions;
+    use pegainfer_frontend::engine::FinishReason;
+    use pegainfer_frontend::engine::GenerateRequest;
+    use pegainfer_frontend::engine::TokenEvent;
+    use pegainfer_frontend::engine::TokenSink;
+    use pegainfer_frontend::engine::TokenStreamReceiver;
+    use pegainfer_frontend::sampler::SamplingParams;
+
     use super::AsyncPrefillMode;
     use super::parse_async_prefill_mode;
+
+    fn submit(
+        handle: &pegainfer_frontend::engine::EngineHandle,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+    ) -> TokenStreamReceiver {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        handle
+            .submit(GenerateRequest {
+                trace_parent: None,
+                request_id: None,
+                queued_at_unix_s: None,
+                data_parallel_rank: None,
+                prompt_tokens,
+                params: SamplingParams {
+                    ignore_eos: true,
+                    ..SamplingParams::default()
+                },
+                max_tokens,
+                lora_adapter: None,
+                kv_transfer_params: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            })
+            .expect("submit");
+        token_rx
+    }
+
+    struct Drained {
+        tokens: usize,
+        cached: usize,
+        finish: FinishReason,
+    }
+
+    fn drain(rx: &mut TokenStreamReceiver, name: &str) -> Drained {
+        let mut tokens = 0;
+        let mut cached = 0;
+        loop {
+            match rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Token { .. }) => tokens += 1,
+                Some(TokenEvent::Scheduled { cached_tokens, .. }) => cached = cached_tokens,
+                Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
+                Some(TokenEvent::Finished { finish_reason, .. }) => {
+                    return Drained {
+                        tokens,
+                        cached,
+                        finish: finish_reason,
+                    };
+                }
+                Some(TokenEvent::Error { message, .. }) => panic!("{name}: error: {message}"),
+                Some(TokenEvent::Rejected { message, .. }) => panic!("{name}: rejected: {message}"),
+                None => panic!("{name}: channel closed without Finished"),
+            }
+        }
+    }
+
+    fn ids(len: usize, salt: u32) -> Vec<u32> {
+        (0..len as u32)
+            .map(|i| 1000 + (i * 37 + salt) % 50000)
+            .collect()
+    }
+
+    /// The whole async lifecycle against one live engine: a streamer decodes
+    /// while a long prompt rides the lane, a second arrival queues behind
+    /// the busy lane, a warm prefix-cache hit launches the lane with only
+    /// its unseen suffix (the join gate refuses a pass that processed the
+    /// wrong one), a dropped sink cancels cleanly, and the engine still
+    /// serves afterwards.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
+    fn the_lane_engine_lifecycle_completes() {
+        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
+        // so no other thread reads the environment concurrently.
+        unsafe {
+            std::env::set_var("PEGAINFER_ASYNC_PREFILL", "shared");
+            std::env::set_var("PEGAINFER_PREFIX_CACHE", "4");
+        }
+        let handle = super::start(Path::new(&dir), &EngineLoadOptions::default());
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("PEGAINFER_ASYNC_PREFILL");
+            std::env::remove_var("PEGAINFER_PREFIX_CACHE");
+        }
+        let handle = handle.expect("engine start");
+
+        let mut streamer = submit(&handle, ids(40, 0), 96);
+        let mut seen = 0;
+        while seen < 2 {
+            match streamer.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Token { .. }) => seen += 1,
+                Some(TokenEvent::Error { message, .. }) => panic!("streamer: {message}"),
+                Some(_) => {}
+                None => panic!("streamer closed early"),
+            }
+        }
+
+        let long_prompt = ids(1500, 7);
+        let mut lane_rx = submit(&handle, long_prompt.clone(), 4);
+        let mut queued_rx = submit(&handle, ids(60, 3), 4);
+        let lane = drain(&mut lane_rx, "lane prefill");
+        assert_eq!((lane.tokens, lane.finish), (4, FinishReason::Length));
+        let queued = drain(&mut queued_rx, "queued behind the lane");
+        assert_eq!((queued.tokens, queued.finish), (4, FinishReason::Length));
+
+        // Warm hit: the long prompt plus a new turn resumes at the captured
+        // frontier and rides the lane with only the suffix.
+        let mut warm_prompt = long_prompt;
+        warm_prompt.extend(ids(60, 11));
+        let mut warm_rx = submit(&handle, warm_prompt, 4);
+        let warm = drain(&mut warm_rx, "warm suffix on the lane");
+        assert_eq!((warm.tokens, warm.finish), (4, FinishReason::Length));
+        assert_eq!(
+            warm.cached, 1500,
+            "the warm admission must resume at the captured frontier"
+        );
+
+        // A cancelled request: drop the sink right after submitting a lane
+        // prompt; the engine must survive and keep serving.
+        drop(submit(&handle, ids(1500, 23), 8));
+        let mut after_rx = submit(&handle, ids(40, 29), 4);
+        let after = drain(&mut after_rx, "after the cancelled lane prompt");
+        assert_eq!((after.tokens, after.finish), (4, FinishReason::Length));
+
+        let streamer_done = drain(&mut streamer, "streamer");
+        assert_eq!(
+            (streamer_done.tokens + 2, streamer_done.finish),
+            (96, FinishReason::Length)
+        );
+    }
 
     #[test]
     fn async_prefill_mode_parses_or_refuses() {
