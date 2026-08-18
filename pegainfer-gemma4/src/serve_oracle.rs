@@ -885,8 +885,53 @@ fn segmented_admission_matches_whole_kv_ledger() {
         whole.local.page_row().len(),
         "resident page count"
     );
+
+    // Third arm: reserve per segment instead of up front. The ledger must
+    // land in the same place, and the local residency must stay bounded by
+    // window plus segment the whole way — the property that frees a long
+    // prompt's admission from holding its full context in pages.
+    let page = PAGE_SIZE;
+    let residency_cap = window.div_ceil(page) + 128usize.div_ceil(page) + 1;
+    let mut segadmit = serve.alloc_kv();
+    let mut left = total;
+    while left > 0 {
+        let step = left.min(128);
+        admit_tokens(&serve.local_pool, &serve.global_pool, &mut segadmit, step)
+            .expect("admit segment");
+        segadmit
+            .local
+            .advance_and_release(step, window)
+            .expect("segment advance");
+        segadmit.global.advance(step);
+        left -= step;
+        assert!(
+            segadmit.local.page_row().len() <= residency_cap,
+            "local residency {} exceeds window plus segment ({residency_cap})",
+            segadmit.local.page_row().len()
+        );
+    }
+    assert_eq!(
+        segadmit.local.seq_len(),
+        whole.local.seq_len(),
+        "segment-admitted local frontier"
+    );
+    assert_eq!(
+        segadmit.global.seq_len(),
+        whole.global.seq_len(),
+        "segment-admitted global frontier"
+    );
+    assert_eq!(
+        segadmit.local.origin_pages(),
+        whole.local.origin_pages(),
+        "segment-admitted released-front origin"
+    );
+    assert_eq!(
+        segadmit.local.page_row().len(),
+        whole.local.page_row().len(),
+        "segment-admitted resident page count"
+    );
     eprintln!(
-        "ledger: seq {} origin {} pages {}",
+        "ledger: seq {} origin {} pages {} (segment-admitted residency capped at {residency_cap})",
         seg.local.seq_len(),
         seg.local.origin_pages(),
         seg.local.page_row().len()

@@ -456,6 +456,18 @@ fn parse_mix_chunk_tokens(raw: &str) -> Result<Option<usize>> {
 /// there, and a long prompt keeps its own step.
 const MIX_GATHER_ROWS: usize = 512;
 
+/// Admit the pages `take` more tokens need, unless the walker already
+/// accounts for them — a walker reserved ahead of its frontier skips the
+/// call, because the ledger treats holding more than the frontier's
+/// account as an error to surface, not a surplus to spend.
+fn admit_walk_segment(serve: &GemmaServe, kv: &mut GemmaKv, take: usize) -> Result<()> {
+    let want = (kv.local.seq_len() + take).div_ceil(PAGE_SIZE);
+    if want <= kv.local.origin_pages() + kv.local.held_pages() {
+        return Ok(());
+    }
+    admit_tokens(&serve.local_pool, &serve.global_pool, kv, take)
+}
+
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
 /// holds the token its final segment sampled until the walker graduates.
 struct Walker {
@@ -876,9 +888,17 @@ impl EngineState {
                     };
                     let new_tokens = cand_len - cand_kv.local.seq_len();
                     // Chunked mode walks the gather in shared segments that
-                    // pace themselves, so the row ceiling does not apply —
-                    // the transient provision above always does.
-                    let cand_pages = new_tokens.div_ceil(crate::kv::PAGE_SIZE);
+                    // pace themselves, so the row ceiling does not apply and
+                    // a candidate reserves only its first round's quantum —
+                    // each later round admits its own segment, so a walker
+                    // never holds more than window plus segment. The
+                    // transient provision bounds whatever is reserved here,
+                    // chunked or not.
+                    let reserve_tokens = match self.mix_chunk {
+                        Some(chunk) => new_tokens.min(chunk),
+                        None => new_tokens,
+                    };
+                    let cand_pages = reserve_tokens.div_ceil(PAGE_SIZE);
                     if (self.mix_chunk.is_none() && rows_budget + new_tokens > MIX_GATHER_ROWS)
                         || transient_pages + cand_pages > context_pages
                     {
@@ -889,7 +909,7 @@ impl EngineState {
                         &self.serve.local_pool,
                         &self.serve.global_pool,
                         &mut cand_kv,
-                        new_tokens,
+                        reserve_tokens,
                     )
                     .is_err()
                     {
@@ -1186,6 +1206,16 @@ impl EngineState {
                     if w.failed || w.offset >= w.request.prompt_tokens.len() {
                         continue;
                     }
+                    let rest_len = w.request.prompt_tokens.len() - w.offset;
+                    if let Err(err) = admit_walk_segment(&self.serve, &mut w.kv, rest_len) {
+                        let _ = w.request.token_tx.send(TokenEvent::Error {
+                            message: format!("walk tail admission failed: {err:#}"),
+                            prompt_tokens: w.request.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                        w.failed = true;
+                        continue;
+                    }
                     let rest = &w.request.prompt_tokens[w.offset..];
                     w.offset = w.request.prompt_tokens.len();
                     let mut logits =
@@ -1240,7 +1270,7 @@ impl EngineState {
             // and whether that take completes its prompt.
             let mut budget = chunk;
             let mut takes: Vec<Option<(usize, bool)>> = vec![None; walkers.len()];
-            for (wi, w) in walkers.iter().enumerate() {
+            for (wi, w) in walkers.iter_mut().enumerate() {
                 if w.failed {
                     continue;
                 }
@@ -1249,6 +1279,19 @@ impl EngineState {
                     continue;
                 }
                 let take = rest.min(budget);
+                // Reserve what this round writes; a walker holding these
+                // pages already skips the call. A refusal means the pool's
+                // provision failed — fail the walker loud rather than
+                // stall the round.
+                if let Err(err) = admit_walk_segment(&self.serve, &mut w.kv, take) {
+                    let _ = w.request.token_tx.send(TokenEvent::Error {
+                        message: format!("walk segment admission failed: {err:#}"),
+                        prompt_tokens: w.request.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                    w.failed = true;
+                    continue;
+                }
                 takes[wi] = Some((take, take == rest));
                 budget -= take;
             }
