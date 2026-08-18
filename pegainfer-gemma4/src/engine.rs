@@ -819,6 +819,14 @@ impl EngineState {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
+                // The local pool provisions exactly one full-context
+                // transient on top of the other rows' window-capped
+                // footprint, so the gather's upfront reservations may
+                // never total more than that one transient — a walk holds
+                // its pages across many rounds while the live rows keep
+                // growing toward their windows.
+                let context_pages = MAX_CONTEXT.div_ceil(crate::kv::PAGE_SIZE);
+                let mut transient_pages = rows_budget.div_ceil(crate::kv::PAGE_SIZE);
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
                     && newcomers.len() + active.len() < MAX_CONCURRENCY
@@ -868,9 +876,12 @@ impl EngineState {
                     };
                     let new_tokens = cand_len - cand_kv.local.seq_len();
                     // Chunked mode walks the gather in shared segments that
-                    // pace themselves, so only the count, slot, pool and
-                    // attempt bounds apply.
-                    if self.mix_chunk.is_none() && rows_budget + new_tokens > MIX_GATHER_ROWS {
+                    // pace themselves, so the row ceiling does not apply —
+                    // the transient provision above always does.
+                    let cand_pages = new_tokens.div_ceil(crate::kv::PAGE_SIZE);
+                    if (self.mix_chunk.is_none() && rows_budget + new_tokens > MIX_GATHER_ROWS)
+                        || transient_pages + cand_pages > context_pages
+                    {
                         pending.push_front((cand, cand_prefix));
                         break;
                     }
@@ -889,6 +900,7 @@ impl EngineState {
                         continue;
                     }
                     rows_budget += new_tokens;
+                    transient_pages += cand_pages;
                     newcomers.push((cand, cand_kv, cand_resumed));
                 }
                 return self.mixed_admission(newcomers, active);
@@ -1988,6 +2000,121 @@ mod lane_tests {
         out
     }
 
+    fn walk_fixture_prompts() -> Vec<Vec<u32>> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_data/gemma4-12b-generate.safetensors"
+        );
+        let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
+        let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+        ["a", "b", "c"]
+            .iter()
+            .map(|case| {
+                let (_, prompt_i32) =
+                    crate::testkit::i32_tensor(&fixture, &format!("{case}_prompt"));
+                prompt_i32
+                    .iter()
+                    .map(|&t| u32::try_from(t).expect("token id"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn headroom_admit(
+        state: &mut super::EngineState,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        active: &mut Vec<super::Active>,
+        pending: &mut std::collections::VecDeque<pegainfer_frontend::engine::SubmittedRequest>,
+    ) -> TokenStreamReceiver {
+        let (request, rx) = walk_request(prompt, max_tokens);
+        let mut attempts = 0usize;
+        match state.admit_and_prefill(
+            (request, pegainfer_frontend::engine::KvPrefix::none()),
+            false,
+            active,
+            pending,
+            &mut attempts,
+        ) {
+            super::Admitted::Active(entry) => active.push(*entry),
+            super::Admitted::Done => {}
+            super::Admitted::Requeue(_) => panic!("headroom admission requeued"),
+        }
+        rx
+    }
+
+    /// The gather may reserve at most one full context of transient pages,
+    /// chunked or not: the local pool provisions exactly one, and a walk
+    /// holds its reservation across many rounds while the live rows keep
+    /// growing toward their windows. Ten one-page streams plus four
+    /// near-context prompts must all finish — the unbounded gather took
+    /// all four reservations at once and starved the streams' next pages
+    /// mid-walk.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
+    fn the_gathered_transient_leaves_headroom() {
+        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        let policy = super::generation_policy(&dir).expect("policy");
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        state.mix_chunk = Some(64);
+        let prompts = walk_fixture_prompts();
+        let short: Vec<u32> = prompts[0].iter().copied().take(8).collect();
+        let long: Vec<u32> = prompts[0].iter().cycle().copied().take(5900).collect();
+
+        let mut active: Vec<super::Active> = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        let mut stream_rx: Vec<TokenStreamReceiver> = (0..10)
+            .map(|_| headroom_admit(&mut state, short.clone(), 400, &mut active, &mut pending))
+            .collect();
+        assert_eq!(active.len(), 10, "every stream holds a decode slot");
+
+        let mut long_rx: Vec<TokenStreamReceiver> = Vec::new();
+        let (first_long, first_rx) = walk_request(long.clone(), 2);
+        long_rx.push(first_rx);
+        for _ in 0..3 {
+            let (request, rx) = walk_request(long.clone(), 2);
+            pending.push_back((request, pegainfer_frontend::engine::KvPrefix::none()));
+            long_rx.push(rx);
+        }
+        let mut attempts = 0usize;
+        match state.admit_and_prefill(
+            (first_long, pegainfer_frontend::engine::KvPrefix::none()),
+            false,
+            &mut active,
+            &mut pending,
+            &mut attempts,
+        ) {
+            super::Admitted::Active(entry) => active.push(*entry),
+            super::Admitted::Done => {}
+            super::Admitted::Requeue(_) => panic!("first long prompt requeued"),
+        }
+        while let Some(item) = pending.pop_front() {
+            let mut attempts = 0usize;
+            match state.admit_and_prefill(item, false, &mut active, &mut pending, &mut attempts) {
+                super::Admitted::Active(entry) => active.push(*entry),
+                super::Admitted::Done => {}
+                super::Admitted::Requeue(item) => {
+                    pending.push_front(*item);
+                    state.decode_round(&mut active);
+                }
+            }
+        }
+        while !active.is_empty() {
+            state.decode_round(&mut active);
+        }
+        for (i, rx) in long_rx.iter_mut().enumerate() {
+            let mut produced = Vec::new();
+            walk_drain(rx, &format!("long prompt {i}"), &mut produced);
+            assert_eq!(produced.len(), 2, "long prompt {i} reached its budget");
+        }
+        for (i, rx) in stream_rx.iter_mut().enumerate() {
+            let mut produced = Vec::new();
+            walk_drain(rx, &format!("stream {i}"), &mut produced);
+            assert_eq!(produced.len(), 400, "stream {i} reached its budget");
+        }
+    }
+
     /// One shared walk against the engine's own serial path: three fixture
     /// prompts get their reference sequences from single-request episodes
     /// through the plain admission path — same suppression, same sampler —
@@ -2004,24 +2131,8 @@ mod lane_tests {
         let policy = super::generation_policy(&dir).expect("policy");
         let mut state =
             super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../test_data/gemma4-12b-generate.safetensors"
-        );
-        let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
-        let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+        let prompts = walk_fixture_prompts();
         let cases = ["a", "b", "c"];
-        let prompts: Vec<Vec<u32>> = cases
-            .iter()
-            .map(|case| {
-                let (_, prompt_i32) =
-                    crate::testkit::i32_tensor(&fixture, &format!("{case}_prompt"));
-                prompt_i32
-                    .iter()
-                    .map(|&t| u32::try_from(t).expect("token id"))
-                    .collect()
-            })
-            .collect();
         let budgets = [24usize, 17, 21];
 
         let serial: Vec<Vec<u32>> = prompts
