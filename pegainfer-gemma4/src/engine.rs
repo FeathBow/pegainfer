@@ -409,13 +409,17 @@ impl EngineState {
             }
         }
 
+        let mut resumed = None;
         let mut kv = match self
             .prefix_cache
             .as_mut()
             .and_then(|cache| cache.resolve(&request.prompt_tokens))
         {
             Some((entry, t)) => match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
-                Ok(kv) => kv,
+                Ok(kv) => {
+                    resumed = Some(entry.id);
+                    kv
+                }
                 Err(err) => {
                     log::warn!("gemma4 prefix-cache restore failed (falling back): {err:#}");
                     self.serve.alloc_kv()
@@ -459,7 +463,7 @@ impl EngineState {
         if !active.is_empty() {
             self.ready_decode_rows(active);
             if !active.is_empty() {
-                return self.mixed_admission(request, kv, active);
+                return self.mixed_admission(request, kv, active, resumed);
             }
         }
 
@@ -486,7 +490,7 @@ impl EngineState {
                 self.serve
                     .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
             {
-                cache.insert(entry);
+                cache.insert(entry, resumed);
             }
         }
         if let Err(err) =
@@ -592,6 +596,7 @@ impl EngineState {
         request: GenerateRequest,
         mut kv: GemmaKv,
         active: &mut Vec<Active>,
+        resumed: Option<u64>,
     ) -> Admitted {
         let sink = request.token_tx.clone();
         let prompt_tokens = request.prompt_tokens.len();
@@ -638,7 +643,7 @@ impl EngineState {
                 self.serve
                     .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
             {
-                cache.insert(entry);
+                cache.insert(entry, resumed);
             }
         }
         if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {

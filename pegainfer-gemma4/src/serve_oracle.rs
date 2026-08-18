@@ -878,7 +878,7 @@ fn prefix_restore_matches_cold_path() {
                 let entry = serve
                     .capture_checkpoint(&ctx, &kv, turn1.clone())
                     .expect("capture");
-                cache.insert(entry);
+                cache.insert(entry, None);
             }
             // A divergence below the window floor must miss.
             if name == "long" {

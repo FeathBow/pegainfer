@@ -34,6 +34,9 @@ pub(crate) struct CachedKv {
     pub(crate) local_pages: Vec<KvReservation>,
     /// Front-released page count at capture — the window's origin.
     pub(crate) local_origin: usize,
+    /// Stable identity: the restore that resumed from this entry names it
+    /// as the successor's ancestor at insert time.
+    pub(crate) id: u64,
     stamp: u64,
 }
 
@@ -49,6 +52,7 @@ impl CachedKv {
             global_pages,
             local_pages,
             local_origin,
+            id: 0,
             stamp: 0,
         }
     }
@@ -129,26 +133,18 @@ impl PrefixCache {
         Some((best, t))
     }
 
-    /// Insert a captured tail. A new tail supersedes every entry of its own
-    /// lineage — one whose sequence it matches to within a generated tail's
-    /// worth of divergence — so the cache holds one entry per live
-    /// conversation instead of churning every turn's tail through the LRU.
-    /// Beyond that, plain LRU capacity eviction.
-    pub(crate) fn insert(&mut self, mut entry: CachedKv) {
+    /// Insert a captured tail. When the captured request resumed from a
+    /// cached entry, that entry — and only that entry — is its stale
+    /// ancestor and is replaced: lineage is the restore itself, never
+    /// inferred from token content, so two conversations sharing all but a
+    /// few trailing tokens both stay. Beyond that, a full cache evicts LRU.
+    pub(crate) fn insert(&mut self, mut entry: CachedKv, ancestor: Option<u64>) {
         self.clock += 1;
         entry.stamp = self.clock;
-        self.entries.retain(|e| {
-            let lcp = e
-                .token_ids
-                .iter()
-                .zip(&entry.token_ids)
-                .take_while(|(a, b)| a == b)
-                .count();
-            // A successor re-renders this entry's whole prompt minus the
-            // turn-boundary merge; a foreign entry that merely shares a
-            // system prefix stops far earlier and stays.
-            lcp < e.token_ids.len().saturating_sub(8)
-        });
+        entry.id = self.clock;
+        if let Some(id) = ancestor {
+            self.entries.retain(|e| e.id != id);
+        }
         if self.entries.len() >= self.cap {
             self.evict_lru();
         }
