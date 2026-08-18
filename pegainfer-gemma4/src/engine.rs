@@ -1133,10 +1133,20 @@ impl EngineState {
             .collect();
 
         let mut first_round = true;
-        while walkers
-            .iter()
-            .any(|w| !w.failed && w.offset < w.request.prompt_tokens.len())
-        {
+        loop {
+            // A client that disconnected mid-walk stops consuming rounds;
+            // its pages return with the walker.
+            for w in &mut walkers {
+                if !w.failed && w.request.token_tx.is_closed() {
+                    w.failed = true;
+                }
+            }
+            if !walkers
+                .iter()
+                .any(|w| !w.failed && w.offset < w.request.prompt_tokens.len())
+            {
+                break;
+            }
             if !first_round {
                 self.ready_decode_rows(active);
             }
@@ -1975,9 +1985,11 @@ mod lane_tests {
     /// prompts get their reference sequences from single-request episodes
     /// through the plain admission path — same suppression, same sampler —
     /// then a rider decodes while the other two walk 24-token segments in
-    /// one gathered episode, and finally both walk again from an idle
-    /// roster (the whole-scan tail path). Every request's greedy sequence
-    /// must match its reference whole.
+    /// one gathered episode (boundary rounds carry a final and a non-final
+    /// segment), both walk again from an idle roster (the whole-scan tail
+    /// path), and a walker cancelled before the first round is dropped
+    /// without touching its partner or the rider. Every surviving
+    /// request's greedy sequence must match its reference whole.
     #[test]
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
     fn the_gathered_walk_matches_the_serial_path() {
@@ -2018,9 +2030,6 @@ mod lane_tests {
             );
         }
 
-        // Phase one: the rider decodes while b and c walk one gathered
-        // 24-token-segment episode; boundary rounds carry a final and a
-        // non-final segment, so the walker-to-row bookkeeping is exercised.
         let (req_a, mut rx_a) = walk_request(prompts[0].clone(), budgets[0]);
         let mut pending = std::collections::VecDeque::new();
         let mut attempts = 0usize;
@@ -2080,8 +2089,6 @@ mod lane_tests {
             eprintln!("case {case}: {} tokens gathered == serial", serial[i].len());
         }
 
-        // Phase two: the same walk from an idle roster — both tails feed
-        // whole through the drained-roster path.
         let (req_a2, mut rx_a2) = walk_request(prompts[0].clone(), budgets[0]);
         let (req_b2, mut rx_b2) = walk_request(prompts[1].clone(), budgets[1]);
         let mut kv_a2 = state.serve.alloc_kv();
@@ -2124,6 +2131,70 @@ mod lane_tests {
                 cases[i]
             );
         }
+
+        let (req_c3, mut rx_c3) = walk_request(prompts[2].clone(), budgets[2]);
+        let mut pending3 = std::collections::VecDeque::new();
+        let mut attempts3 = 0usize;
+        let mut active3: Vec<super::Active> = Vec::new();
+        match state.admit_and_prefill(
+            (req_c3, pegainfer_frontend::engine::KvPrefix::none()),
+            false,
+            &mut active3,
+            &mut pending3,
+            &mut attempts3,
+        ) {
+            super::Admitted::Active(entry) => active3.push(*entry),
+            _ => panic!("phase three rider admission must hand back an active lane"),
+        }
+        let (req_a3, rx_a3) = walk_request(prompts[0].clone(), budgets[0]);
+        let (req_b3, mut rx_b3) = walk_request(prompts[1].clone(), budgets[1]);
+        drop(rx_a3);
+        let mut kv_a3 = state.serve.alloc_kv();
+        let mut kv_b3 = state.serve.alloc_kv();
+        crate::kv::admit_tokens(
+            &state.serve.local_pool,
+            &state.serve.global_pool,
+            &mut kv_a3,
+            prompts[0].len(),
+        )
+        .expect("admit cancelled walker");
+        crate::kv::admit_tokens(
+            &state.serve.local_pool,
+            &state.serve.global_pool,
+            &mut kv_b3,
+            prompts[1].len(),
+        )
+        .expect("admit surviving walker");
+        state.ready_decode_rows(&mut active3);
+        let admitted3 = state.mixed_walk(
+            24,
+            vec![(req_a3, kv_a3, None), (req_b3, kv_b3, None)],
+            &mut active3,
+        );
+        assert!(
+            matches!(admitted3, super::Admitted::Done),
+            "the walk with a cancelled walker returns Done"
+        );
+        assert_eq!(
+            active3.len(),
+            2,
+            "the rider and the surviving walker keep decoding"
+        );
+        while !active3.is_empty() {
+            state.decode_round(&mut active3);
+        }
+        let mut produced3 = Vec::new();
+        walk_drain(&mut rx_b3, "surviving walker", &mut produced3);
+        assert_eq!(
+            produced3, serial[1],
+            "the surviving walker diverged from the serial path"
+        );
+        let mut produced_rider3 = Vec::new();
+        walk_drain(&mut rx_c3, "phase three rider", &mut produced_rider3);
+        assert_eq!(
+            produced_rider3, serial[2],
+            "the phase three rider diverged from the serial path"
+        );
     }
 
     /// The production gather against one live engine, interleavings pinned:
