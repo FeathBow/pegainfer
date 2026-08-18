@@ -1,6 +1,6 @@
 # Gemma 4 serving
 
-**TL;DR:** The engine schedules per iteration: up to 16 requests hold decode slots, each prompt prefills whole at a step boundary, and every active request advances one token per batched step. Prompt plus output past 8192 tokens is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B). **This needs a 48 GiB card**: the engine sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it. A row's output moves with the bucket widths it decodes at, but not with what its companions contain.
+**TL;DR:** The engine schedules per iteration: up to 16 requests hold decode slots, each prompt prefills whole at a step boundary, and every active request advances one token per batched step. Prompt plus output past 8192 tokens is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B). **This needs a 48 GiB card**: the engine sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it. A row's output moves with the bucket widths it decodes at, but not with what its companions contain. An opt-in conversation prefix cache (`PEGAINFER_PREFIX_CACHE=K`) resumes multi-turn prompts at the cost of a pre-allocated page budget.
 
 Last touched: 2026-08
 
@@ -30,7 +30,7 @@ The shapes behind the page: the local family is 40 layers of 8 KV heads at head_
 
 The asymmetry is the design: the local family only has to hold one full-context transient — the request currently prefilling, which has not released its front yet — on top of the window-capped steady footprint of everyone else. The global family never releases, so it stays linear in context for each request's whole lifetime, and that is what makes it the larger page count despite the smaller page.
 
-Each pool also reserves one padding page, which is the `+ 1` in both lines.
+Each pool also reserves one padding page, which is the `+ 1` in both lines. With `PEGAINFER_PREFIX_CACHE=K` set, both lines grow by the cache's own budget — `+ K * W` local and `+ K * C/2` global pages — so cached pages never eat the serving reserve.
 
 ## What a client has to send
 
@@ -71,6 +71,16 @@ The 16 slots are a fixed constant and the pools are sized for all of them up fro
 
 That is a hardware floor, not a target. A 32 GiB device cannot start this configuration at all. Serving a single request needs about 2.6 GiB of pool rather than 9.27, so the slot count is what sets the floor, and it is not exposed as a knob today.
 
+## The conversation prefix cache (opt-in)
+
+`PEGAINFER_PREFIX_CACHE=K` (unset by default) keeps copies of up to K completed prompt states, so the next turn of a conversation resumes where its history ends instead of prefilling all of it again. Unset, nothing is allocated and admission behaves exactly as above.
+
+When a request's prefill completes, the engine copies its prompt-state pages — the global family up to the prompt frontier plus the local family's resident window — into cache-owned pages. Only the prompt region is captured: generated tokens do not re-render into the next turn's prompt verbatim, so only the prompt prefix can ever be hit again. At admission the prompt resolves against the cache by longest common prefix, clamped to the sliding-window floor — a resume below the released window front cannot be rebuilt and misses by construction. A hit restores by copying the pages back and prefilling only the unseen suffix, and `Scheduled` reports the resumed count as `cached_tokens`.
+
+The cache brings its own page budget, added to the pool lines above at startup. A prompt longer than half the serving context (4096 tokens today) is not captured — that bound is what keeps the cache's pool share equal to what its entries paid for. A new turn's capture supersedes its conversation's older entry, capacity evicts LRU, and an admission that cannot reserve pages evicts cache entries before waiting.
+
+At `PEGAINFER_PREFIX_CACHE=16` the idle footprint measured **39242 MiB** against the 33034 MiB baseline — the difference is the pre-allocated cache budget.
+
 ## Measured behaviour
 
 Single GPU (sm_89, x86_64), CUDA 12.9, 12B checkpoint, greedy (`temperature 0`):
@@ -107,6 +117,6 @@ The consequence for callers: **greedy output is reproducible for a given workloa
 
 - **An admission rides the live decode batch instead of freezing it.** With streams in flight, a newcomer's prompt shares one eager step with the decode batch: the prompt rows sit in the row prefix, every active stream advances its token in the suffix, and one sampler call covers the newcomer's first token and every active row. Measured with a streaming request underneath a flood of one-token requests: its inter-token gap stays at about 30 ms — one mixed step — whether 16, 48 or 96 requests are queued, where the frozen-prefill scheduling this replaced measured about 500 ms at the same depths. Admission attempts per turn stay bounded by the slot ceiling; a prompt arriving with nothing active still prefills alone.
 - **No chunked prefill.** A prompt runs whole in one step, so a long prompt is one long step, and admission needs its full context in pages up front.
-- **No prefix cache.** Two requests sharing a prefix pay for it twice.
+- **No cross-request prefix sharing.** Two live requests with a common prefix pay for it twice; the opt-in conversation cache above serves consecutive turns of one conversation, not concurrent requests.
 - **Single GPU.** No tensor parallelism for this line yet.
 - **KV capacity is not reported to the frontend**: the engine logs `kv_cache_size_tokens=None`, so the frontend's capacity metrics stay empty for this model line.
