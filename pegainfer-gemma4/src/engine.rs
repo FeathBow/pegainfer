@@ -1279,20 +1279,23 @@ mod lane_tests {
             .collect()
     }
 
-    /// The whole async lifecycle against one live engine: a streamer decodes
-    /// while a long prompt rides the lane, a second arrival queues behind
-    /// the busy lane, a warm prefix-cache hit launches the lane with only
-    /// its unseen suffix (the join gate refuses a pass that processed the
-    /// wrong one), a dropped sink cancels cleanly, and the engine still
-    /// serves afterwards.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
-    fn the_lane_engine_lifecycle_completes() {
+    /// The whole async lifecycle against one live engine, with every
+    /// interleaving pinned by construction: the streamer's budget outlasts
+    /// the script and its sink is dropped only at the end, so the decode
+    /// batch is never empty and every admission below takes the lane. A
+    /// long prompt rides the lane while a second arrival waits out the busy
+    /// lane; a warm prefix-cache hit launches with only its unseen suffix
+    /// (the join gate refuses a pass that processed the wrong one); a
+    /// request cancelled after `Scheduled` — past every sync-path exit, so
+    /// the drop lands while its pass is in flight — exits through the join;
+    /// an out-of-vocab prompt fails the launch itself and the lane drains;
+    /// and the engine still serves after all of it.
+    fn lane_lifecycle_script(mode: &str) {
         let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
         // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
         // so no other thread reads the environment concurrently.
         unsafe {
-            std::env::set_var("PEGAINFER_ASYNC_PREFILL", "shared");
+            std::env::set_var("PEGAINFER_ASYNC_PREFILL", mode);
             std::env::set_var("PEGAINFER_PREFIX_CACHE", "4");
         }
         let handle = super::start(Path::new(&dir), &EngineLoadOptions::default());
@@ -1303,7 +1306,10 @@ mod lane_tests {
         }
         let handle = handle.expect("engine start");
 
-        let mut streamer = submit(&handle, ids(40, 0), 96);
+        // The streamer pins the decode batch non-empty for the whole
+        // script: its budget is far past the script's round count, and its
+        // sink drops only after the last assertion.
+        let mut streamer = submit(&handle, ids(40, 0), 1024);
         let mut seen = 0;
         while seen < 2 {
             match streamer.blocking_recv().map(|(_, event)| event) {
@@ -1334,18 +1340,59 @@ mod lane_tests {
             "the warm admission must resume at the captured frontier"
         );
 
-        // A cancelled request: drop the sink right after submitting a lane
-        // prompt; the engine must survive and keep serving.
-        drop(submit(&handle, ids(1500, 23), 8));
-        let mut after_rx = submit(&handle, ids(40, 29), 4);
-        let after = drain(&mut after_rx, "after the cancelled lane prompt");
-        assert_eq!((after.tokens, after.finish), (4, FinishReason::Length));
+        // In-flight cancellation: `Scheduled` is sent past every sync-path
+        // exit, so a sink dropped after it lands while the lane pass runs.
+        let mut cancel_rx = submit(&handle, ids(1500, 23), 8);
+        loop {
+            match cancel_rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Scheduled { .. }) => break,
+                Some(TokenEvent::Error { message, .. }) => panic!("cancel arm: {message}"),
+                Some(_) => {}
+                None => panic!("cancel arm closed before Scheduled"),
+            }
+        }
+        drop(cancel_rx);
 
-        let streamer_done = drain(&mut streamer, "streamer");
-        assert_eq!(
-            (streamer_done.tokens + 2, streamer_done.finish),
-            (96, FinishReason::Length)
-        );
+        // Launch failure: an out-of-vocab id passes admission and fails
+        // inside the lane pass; the lane drains and reports, loudly.
+        let mut bad = ids(200, 31);
+        bad[100] = 300_000;
+        let mut bad_rx = submit(&handle, bad, 4);
+        loop {
+            match bad_rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Error { message, .. }) => {
+                    assert!(
+                        message.contains("prefill failed"),
+                        "launch failure must name the prefill: {message}"
+                    );
+                    break;
+                }
+                Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
+                    panic!("an out-of-vocab prompt must not produce tokens")
+                }
+                Some(_) => {}
+                None => panic!("launch failure lost its error event"),
+            }
+        }
+
+        let mut after_rx = submit(&handle, ids(40, 29), 4);
+        let after = drain(&mut after_rx, "after the cancelled and failed lanes");
+        assert_eq!((after.tokens, after.finish), (4, FinishReason::Length));
+        drop(streamer);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
+    fn the_lane_engine_lifecycle_completes() {
+        lane_lifecycle_script("shared");
+    }
+
+    /// The green twin exercises the partitioned completion path —
+    /// `cuGreenCtxRecordEvent` rather than the plain stream record.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
+    fn the_green_lane_engine_lifecycle_completes() {
+        lane_lifecycle_script("green:35");
     }
 
     #[test]
