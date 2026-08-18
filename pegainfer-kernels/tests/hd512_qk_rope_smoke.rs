@@ -219,6 +219,7 @@ fn prefill_prep_matches_closed_form() {
         &q,
         &k,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,
@@ -227,6 +228,7 @@ fn prefill_prep_matches_closed_form() {
         &sin_dev,
         layer,
         &page_indices,
+        0,
         START_POS,
         8, // cos_max_pos
         NUM_Q_HEADS,
@@ -428,6 +430,7 @@ fn rejects_bad_rotary_dim() {
             &q,
             &k,
             &mut q_out,
+            0,
             &pool,
             &layout,
             &qn,
@@ -436,6 +439,7 @@ fn rejects_bad_rotary_dim() {
             &sin_dev,
             0, // layer
             &page_indices,
+            0,
             0, // start_pos
             8, // cos_max_pos
             NUM_Q_HEADS,
@@ -499,6 +503,7 @@ fn prefill_rejects_position_beyond_cos_table() {
         &q,
         &k,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,
@@ -507,6 +512,7 @@ fn prefill_rejects_position_beyond_cos_table() {
         &sin_dev,
         0, // layer
         &page_indices,
+        0,
         1, // start_pos
         4, // cos_max_pos
         NUM_Q_HEADS,
@@ -554,6 +560,7 @@ fn prefill_rejects_undersized_kv_pool() {
             &q,
             &k,
             &mut q_out,
+            0,
             &pool,
             &layout,
             &qn,
@@ -562,6 +569,7 @@ fn prefill_rejects_undersized_kv_pool() {
             &sin_dev,
             0, // layer
             &page_indices,
+            0,
             0, // start_pos
             8, // cos_max_pos
             NUM_Q_HEADS,
@@ -826,5 +834,112 @@ fn split_read_row_offset_serves_only_the_suffix() {
         out_a[read_dim..],
         out_b[..],
         "suffix outputs must match the zero-offset read bit for bit"
+    );
+}
+
+/// The row and page-table windows of the hd512 prefill prep: the offset arm
+/// carries a filler prefix row and a junk leading table entry the kernel
+/// must neither read nor dereference; its suffix outputs and pool writes
+/// must equal a zero-offset run bit for bit, and the prefix row of `q_out`
+/// stays untouched.
+#[test]
+fn prefill_prep_row_offset_serves_only_the_suffix() {
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, 8);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+
+    // Per-row distinct suffix bytes shared between the arms.
+    let suffix = |base: f32, dim: usize| -> Vec<bf16> {
+        (0..SEQ_LEN)
+            .flat_map(|t| vec![bf16::from_f32(base + t as f32); dim])
+            .collect()
+    };
+    let with_prefix = |sfx: &[bf16], dim: usize| -> Vec<bf16> {
+        let mut host = vec![bf16::from_f32(FILLER); dim];
+        host.extend_from_slice(sfx);
+        host
+    };
+    let (qs, ks) = (suffix(Q_INPUT, Q_DIM), suffix(K_INPUT, KV_DIM));
+
+    let run =
+        |offset: usize, q_host: &[bf16], k_host: &[bf16], table: &[i32], pages_offset: usize| {
+            let rows = offset + SEQ_LEN;
+            let q = HiddenStates::from_host(ctx, q_host, Q_DIM, rows).expect("q H2D");
+            let k = HiddenStates::from_host(ctx, k_host, KV_DIM, rows).expect("k H2D");
+            let sentinel = vec![bf16::from_f32(SENTINEL); Q_DIM * rows];
+            let mut q_out =
+                HiddenStates::from_host(ctx, &sentinel, Q_DIM, rows).expect("q_out H2D");
+            let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
+            let page_indices: CudaSlice<i32> = ctx.stream.clone_htod(table).expect("pages H2D");
+            qk_norm_partial_rope_paged_prefill_hd512_into(
+                ctx,
+                &q,
+                &k,
+                &mut q_out,
+                offset,
+                &pool,
+                &layout,
+                &qn,
+                &kn,
+                &cos_dev,
+                &sin_dev,
+                layer,
+                &page_indices,
+                pages_offset,
+                START_POS,
+                8,
+                NUM_Q_HEADS,
+                NUM_KV_HEADS,
+                ROTARY_DIM,
+                EPS,
+            )
+            .expect("prefill prep launch");
+            let out: Vec<u32> = q_out
+                .to_host(ctx)
+                .expect("q_out D2H")
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
+            let pool_bits: Vec<u16> = pool_host.iter().map(|x| x.to_bits()).collect();
+            (out, pool_bits)
+        };
+
+    // The junk entry is a valid, unreferenced page: a wrong dereference
+    // lands visibly in the pool comparison instead of out of bounds.
+    let mut junk_table = vec![6i32];
+    junk_table.extend_from_slice(&PAGE_INDICES);
+    let (out_a, pool_a) = run(
+        1,
+        &with_prefix(&qs, Q_DIM),
+        &with_prefix(&ks, KV_DIM),
+        &junk_table,
+        1,
+    );
+    let (out_b, pool_b) = run(0, &qs, &ks, &PAGE_INDICES, 0);
+
+    let sentinel_bits = bf16::from_f32(SENTINEL).to_f32().to_bits();
+    assert!(
+        out_a[..Q_DIM].iter().all(|&b| b == sentinel_bits),
+        "the prefix row of q_out must stay untouched"
+    );
+    assert_eq!(
+        out_a[Q_DIM..],
+        out_b[..],
+        "suffix q_out rows must match the zero-offset run bit for bit"
+    );
+    assert_eq!(
+        pool_a, pool_b,
+        "pool writes must match the zero-offset run bit for bit"
     );
 }

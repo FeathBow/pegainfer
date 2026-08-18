@@ -2871,6 +2871,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     k: &HiddenStates,
     v: &HiddenStates,
     q_out: &mut HiddenStates,
+    row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     q_norm_weight: &DeviceVec,
@@ -2879,6 +2880,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     sin_cache: &DeviceVec,
     layer: usize,
     page_indices: &CudaSlice<i32>,
+    pages_offset: usize,
     page_origin: usize,
     start_pos: usize,
     cos_max_pos: usize,
@@ -2887,7 +2889,21 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
-    let seq_len = q.seq_len;
+    // The prompt segment is the row suffix `[row_offset..seq_len)` with its
+    // page table `pages_offset` elements into the (possibly concatenated)
+    // table — a multi-prompt mixed step parks earlier prompts and their
+    // tables in the prefixes.
+    anyhow::ensure!(
+        row_offset < q.seq_len,
+        "hd256 paged prep row_offset {row_offset} leaves no rows of {}",
+        q.seq_len
+    );
+    let seq_len = q.seq_len - row_offset;
+    anyhow::ensure!(
+        pages_offset < page_indices.len(),
+        "hd256 paged prep pages_offset {pages_offset} exceeds table len {}",
+        page_indices.len()
+    );
     let q_dim = num_q_heads.checked_mul(256).ok_or_else(|| {
         anyhow::anyhow!("hd256 paged prep num_q_heads {num_q_heads} * 256 overflows")
     })?;
@@ -2906,9 +2922,10 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
         q.hidden_dim
     );
     anyhow::ensure!(
-        q_out.seq_len == seq_len,
-        "hd256 paged prep q_out.seq_len {} != q.seq_len {seq_len}",
-        q_out.seq_len
+        q_out.seq_len == q.seq_len,
+        "hd256 paged prep q_out.seq_len {} != q.seq_len {}",
+        q_out.seq_len,
+        q.seq_len
     );
     anyhow::ensure!(
         k.hidden_dim == kv_dim,
@@ -2922,14 +2939,16 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
         k.hidden_dim
     );
     anyhow::ensure!(
-        k.seq_len == seq_len,
-        "hd256 paged prep k.seq_len {} != q.seq_len {seq_len}",
-        k.seq_len
+        k.seq_len == q.seq_len,
+        "hd256 paged prep k.seq_len {} != q.seq_len {}",
+        k.seq_len,
+        q.seq_len
     );
     anyhow::ensure!(
-        v.seq_len == seq_len,
-        "hd256 paged prep v.seq_len {} != q.seq_len {seq_len}",
-        v.seq_len
+        v.seq_len == q.seq_len,
+        "hd256 paged prep v.seq_len {} != q.seq_len {}",
+        v.seq_len,
+        q.seq_len
     );
     let geometry = checked_paged_geometry(
         "hd256 paged prep",
@@ -2956,13 +2975,12 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
         anyhow::anyhow!("hd256 paged prep start_pos {start_pos} + seq_len {seq_len} overflows")
     })?;
-    let covered = page_indices
-        .len()
+    let covered = (page_indices.len() - pages_offset)
         .checked_mul(layout.page_size)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "hd256 paged prep page_indices len {} * page_size {} overflows",
-                page_indices.len(),
+                "hd256 paged prep page window {} * page_size {} overflows",
+                page_indices.len() - pages_offset,
                 layout.page_size
             )
         })?;
@@ -3019,12 +3037,22 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     let cos_max_pos_i32 = crate::ops::checked_i32(cos_max_pos, "hd256 paged prep cos_max_pos")?;
     let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd256 paged prep rotary_dim")?;
 
-    let page_indices_len =
-        crate::ops::checked_i32(page_indices.len(), "hd256 paged prep page_indices len")?;
+    let page_indices_len = crate::ops::checked_i32(
+        page_indices.len() - pages_offset,
+        "hd256 paged prep page window len",
+    )?;
+    let q_row_bytes = checked_row_offset(q, row_offset, seq_len, "hd256 paged prep q")?;
+    let k_row_bytes = checked_row_offset(k, row_offset, seq_len, "hd256 paged prep k")?;
+    let v_row_bytes = checked_row_offset(v, row_offset, seq_len, "hd256 paged prep v")?;
+    let qo_row_bytes = checked_row_offset(q_out, row_offset, seq_len, "hd256 paged prep q_out")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + q_row_bytes;
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let k_ptr = k_ptr + k_row_bytes;
     let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let v_ptr = v_ptr + v_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    let qo_ptr = qo_ptr + qo_row_bytes;
     // The KV state owns mutation; this call borrows its shared pool handle.
     let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
     let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
@@ -3032,6 +3060,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
     let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
     let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
+    let pi_ptr = pi_ptr + (pages_offset * std::mem::size_of::<i32>()) as u64;
 
     let result = unsafe {
         ffi::qkv_norm_rope_paged_prefill_hd256_plain_cuda(
@@ -3403,6 +3432,7 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     q: &HiddenStates,
     k: &HiddenStates,
     q_out: &mut HiddenStates,
+    row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     q_norm_weight: &DeviceVec,
@@ -3411,6 +3441,7 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     sin_cache: &DeviceVec,
     layer: usize,
     page_indices: &CudaSlice<i32>,
+    pages_offset: usize,
     start_pos: usize,
     cos_max_pos: usize,
     num_q_heads: usize,
@@ -3418,7 +3449,19 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
-    let seq_len = q.seq_len;
+    // Same suffix-window contract as the hd256 prefill prep: the segment
+    // is the rows `[row_offset..seq_len)` with its table at `pages_offset`.
+    anyhow::ensure!(
+        row_offset < q.seq_len,
+        "hd512 prefill prep row_offset {row_offset} leaves no rows of {}",
+        q.seq_len
+    );
+    let seq_len = q.seq_len - row_offset;
+    anyhow::ensure!(
+        pages_offset < page_indices.len(),
+        "hd512 prefill prep pages_offset {pages_offset} exceeds table len {}",
+        page_indices.len()
+    );
     let q_dim = num_q_heads.checked_mul(512).ok_or_else(|| {
         anyhow::anyhow!("hd512 prefill prep num_q_heads {num_q_heads} * 512 overflows")
     })?;
@@ -3437,9 +3480,10 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         q.hidden_dim
     );
     anyhow::ensure!(
-        q_out.seq_len == seq_len,
-        "hd512 prefill prep q_out.seq_len {} != q.seq_len {seq_len}",
-        q_out.seq_len
+        q_out.seq_len == q.seq_len,
+        "hd512 prefill prep q_out.seq_len {} != q.seq_len {}",
+        q_out.seq_len,
+        q.seq_len
     );
     anyhow::ensure!(
         k.hidden_dim == kv_dim,
@@ -3447,9 +3491,10 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         k.hidden_dim
     );
     anyhow::ensure!(
-        k.seq_len == seq_len,
-        "hd512 prefill prep k.seq_len {} != q.seq_len {seq_len}",
-        k.seq_len
+        k.seq_len == q.seq_len,
+        "hd512 prefill prep k.seq_len {} != q.seq_len {}",
+        k.seq_len,
+        q.seq_len
     );
     let geometry = checked_paged_geometry(
         "hd512 prefill prep",
@@ -3472,13 +3517,12 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
         anyhow::anyhow!("hd512 prefill prep start_pos {start_pos} + seq_len {seq_len} overflows")
     })?;
-    let covered = page_indices
-        .len()
+    let covered = (page_indices.len() - pages_offset)
         .checked_mul(layout.page_size)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "hd512 prefill prep page_indices len {} * page_size {} overflows",
-                page_indices.len(),
+                "hd512 prefill prep page window {} * page_size {} overflows",
+                page_indices.len() - pages_offset,
                 layout.page_size
             )
         })?;
@@ -3524,11 +3568,19 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     let cos_max_pos_i32 = crate::ops::checked_i32(cos_max_pos, "hd512 prefill prep cos_max_pos")?;
     let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd512 prefill prep rotary_dim")?;
 
-    let page_indices_len =
-        crate::ops::checked_i32(page_indices.len(), "hd512 paged prep page_indices len")?;
+    let page_indices_len = crate::ops::checked_i32(
+        page_indices.len() - pages_offset,
+        "hd512 paged prep page window len",
+    )?;
+    let q_row_bytes = checked_row_offset(q, row_offset, seq_len, "hd512 prefill prep q")?;
+    let k_row_bytes = checked_row_offset(k, row_offset, seq_len, "hd512 prefill prep k")?;
+    let qo_row_bytes = checked_row_offset(q_out, row_offset, seq_len, "hd512 prefill prep q_out")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + q_row_bytes;
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let k_ptr = k_ptr + k_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    let qo_ptr = qo_ptr + qo_row_bytes;
     // The KV state owns mutation; this call borrows its shared pool handle.
     let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
     let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
@@ -3536,6 +3588,7 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
     let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
     let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
+    let pi_ptr = pi_ptr + (pages_offset * std::mem::size_of::<i32>()) as u64;
 
     let result = unsafe {
         ffi::qk_norm_partial_rope_paged_prefill_hd512_cuda(
