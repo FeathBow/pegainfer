@@ -506,6 +506,197 @@ fn greedy_matches_hf_generate() {
     );
 }
 
+fn mixed_gate_argmax(host: &[f32], row: usize, vocab: usize) -> u32 {
+    u32::try_from(argmax(&host[row * vocab..(row + 1) * vocab])).expect("token id")
+}
+
+fn mixed_gate_decode_rounds(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    arena: &mut StepArena,
+    lanes: &mut Vec<(usize, GemmaKv, u32)>,
+    produced: &mut [Vec<u32>],
+    budgets: &[usize],
+    rounds: usize,
+) {
+    for _ in 0..rounds {
+        if lanes.is_empty() {
+            break;
+        }
+        let tokens: Vec<u32> = lanes.iter().map(|(_, _, next)| *next).collect();
+        for (_, kv, _) in lanes.iter_mut() {
+            admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1).expect("admit decode");
+        }
+        let (vocab, host);
+        {
+            let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+            let logits = serve
+                .decode_batch_step(ctx, arena, &mut kvs, &tokens)
+                .expect("batched decode");
+            vocab = logits.hidden_dim;
+            host = logits.to_host(ctx).expect("logits D2H");
+        }
+        let mut retire: Vec<usize> = Vec::new();
+        for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
+            let token = mixed_gate_argmax(&host, row, vocab);
+            produced[*req].push(token);
+            if produced[*req].len() >= budgets[*req] {
+                retire.push(row);
+            } else {
+                *next = token;
+            }
+        }
+        for row in retire.into_iter().rev() {
+            lanes.swap_remove(row);
+        }
+    }
+}
+
+/// A mixed admission — the prompt sharing one step with the live decode
+/// batch — must be token-exact against the serial path, for the newcomer
+/// (logits row 0) and every incumbent lane (rows 1..), across two
+/// admissions at different batch sizes and the pure-decode rounds between
+/// them.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint and the generate fixture"]
+fn mixed_step_matches_serial_greedy() {
+    let (ctx, serve, _dir) = stack_with(1024, 200);
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_data/gemma4-12b-generate.safetensors"
+    );
+    let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+    let cases = ["a", "b", "c"];
+    let prompts: Vec<Vec<u32>> = cases
+        .iter()
+        .map(|case| {
+            let (_, prompt_i32) = i32_tensor(&fixture, &format!("{case}_prompt"));
+            prompt_i32
+                .iter()
+                .map(|&t| u32::try_from(t).expect("token id"))
+                .collect()
+        })
+        .collect();
+    let budgets = [50usize, 37, 44];
+
+    let serial: Vec<Vec<u32>> = prompts
+        .iter()
+        .zip(budgets)
+        .map(|(prompt, budget)| {
+            let mut kv = serve.alloc_kv();
+            generate_greedy(&serve, &ctx, &mut kv, prompt, budget).expect("serial greedy")
+        })
+        .collect();
+
+    let mut arena = serve.alloc_step_arena(&ctx, 4, false).expect("step arena");
+    let mut lanes: Vec<(usize, GemmaKv, u32)> = Vec::new();
+    let mut produced: Vec<Vec<u32>> = vec![Vec::new(); cases.len()];
+
+    // Lane a arrives alone — the plain prefill path — then three decode
+    // rounds so the mixed admissions below meet a warm batch.
+    {
+        let mut kv = serve.alloc_kv();
+        admit_tokens(
+            &serve.local_pool,
+            &serve.global_pool,
+            &mut kv,
+            prompts[0].len(),
+        )
+        .expect("admit prompt a");
+        let logits = serve
+            .step(&ctx, &mut kv, &prompts[0], LogitsSpan::LastRow)
+            .expect("prefill a");
+        let first = argmax_last(&ctx, &logits).expect("first token");
+        produced[0].push(first);
+        lanes.push((0, kv, first));
+    }
+    mixed_gate_decode_rounds(
+        &ctx,
+        &serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        3,
+    );
+
+    // Admissions b then c ride the live batch (sizes 1 and 2).
+    for case in 1..cases.len() {
+        let mut kv = serve.alloc_kv();
+        admit_tokens(
+            &serve.local_pool,
+            &serve.global_pool,
+            &mut kv,
+            prompts[case].len(),
+        )
+        .expect("admit prompt");
+        for (_, lane_kv, _) in &mut lanes {
+            admit_tokens(&serve.local_pool, &serve.global_pool, lane_kv, 1).expect("admit decode");
+        }
+        let tokens: Vec<u32> = lanes.iter().map(|(_, _, next)| *next).collect();
+        let (vocab, host);
+        {
+            let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+            let logits = serve
+                .mixed_prefill_decode_step(
+                    &ctx,
+                    &mut arena,
+                    &mut kv,
+                    &prompts[case],
+                    &mut kvs,
+                    &tokens,
+                )
+                .expect("mixed step");
+            vocab = logits.hidden_dim;
+            host = logits.to_host(&ctx).expect("logits D2H");
+        }
+        let mut retire: Vec<usize> = Vec::new();
+        for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
+            let token = mixed_gate_argmax(&host, row + 1, vocab);
+            produced[*req].push(token);
+            if produced[*req].len() >= budgets[*req] {
+                retire.push(row);
+            } else {
+                *next = token;
+            }
+        }
+        for row in retire.into_iter().rev() {
+            lanes.swap_remove(row);
+        }
+        let first = mixed_gate_argmax(&host, 0, vocab);
+        produced[case].push(first);
+        lanes.push((case, kv, first));
+        mixed_gate_decode_rounds(
+            &ctx,
+            &serve,
+            &mut arena,
+            &mut lanes,
+            &mut produced,
+            &budgets,
+            3,
+        );
+    }
+
+    // Drain everyone to their budgets.
+    mixed_gate_decode_rounds(
+        &ctx,
+        &serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        usize::MAX,
+    );
+    for (i, case) in cases.iter().enumerate() {
+        assert_eq!(
+            produced[i], serial[i],
+            "case {case}: mixed admission diverged from the serial path"
+        );
+        eprintln!("case {case}: {} tokens mixed == serial", serial[i].len());
+    }
+}
+
 /// One serving-path decode step for a single request: the batched decode
 /// entry at batch one on an eager arena. The graph path is anchored to this
 /// by the ragged determinism gate's replay-vs-eager comparison.

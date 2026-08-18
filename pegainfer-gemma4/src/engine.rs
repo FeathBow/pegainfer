@@ -116,7 +116,7 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                     };
                     attempts += 1;
                     let can_wait = !active.is_empty();
-                    match state.admit_and_prefill(item, can_wait) {
+                    match state.admit_and_prefill(item, can_wait, &mut active) {
                         Admitted::Active(request) => active.push(*request),
                         Admitted::Done => {}
                         Admitted::Requeue(item) => {
@@ -325,7 +325,12 @@ impl EngineState {
     /// and hand it to the decode batch. An admission refusal is a refusal to
     /// the client only when no active request could free the pages it needs;
     /// otherwise the request waits at the queue head.
-    fn admit_and_prefill(&mut self, item: Submitted, can_wait: bool) -> Admitted {
+    fn admit_and_prefill(
+        &mut self,
+        item: Submitted,
+        can_wait: bool,
+        active: &mut Vec<Active>,
+    ) -> Admitted {
         let (request, prefix) = item;
         let sink = request.token_tx.clone();
         if sink.is_closed() {
@@ -394,6 +399,16 @@ impl EngineState {
         }
         if !send_scheduled(&request, prompt_tokens) {
             return Admitted::Done;
+        }
+
+        // Mixed admission: with a live decode batch, the prompt rides its
+        // weight scan — one step prefills the newcomer and advances every
+        // active row.
+        if !active.is_empty() {
+            self.ready_decode_rows(active);
+            if !active.is_empty() {
+                return self.mixed_admission(request, kv, active);
+            }
         }
 
         let fail = |message: String| {
@@ -478,11 +493,10 @@ impl EngineState {
         }))
     }
 
-    /// One batched decode step: every active request advances a token,
-    /// sharing each layer's weight pass. A cancelled request and a request
-    /// the pools cannot grow for retire before the batch is built; a finished
-    /// one retires after its token lands.
-    fn decode_round(&mut self, active: &mut Vec<Active>) {
+    /// Retire every active request the next step cannot serve — a closed
+    /// sink, or a pool that cannot grow its KV by one token — and admit the
+    /// step's token for the rest.
+    fn ready_decode_rows(&self, active: &mut Vec<Active>) {
         let mut row = 0;
         while row < active.len() {
             let entry = &mut active[row];
@@ -506,6 +520,207 @@ impl EngineState {
             }
             row += 1;
         }
+    }
+
+    /// The mixed-admission tail of [`Self::admit_and_prefill`]: the admitted
+    /// prompt and the live decode batch share one step, then one sampler
+    /// call covers the newcomer's first token (logits row 0) and every
+    /// active row after it.
+    fn mixed_admission(
+        &mut self,
+        request: GenerateRequest,
+        mut kv: GemmaKv,
+        active: &mut Vec<Active>,
+    ) -> Admitted {
+        let sink = request.token_tx.clone();
+        let prompt_tokens = request.prompt_tokens.len();
+        let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
+            log::error!("{what} failed: {err:#}");
+            for entry in active.drain(..) {
+                let _ = entry.request.token_tx.send(TokenEvent::Error {
+                    message: format!("{what} failed: {err:#}"),
+                    prompt_tokens: entry.prompt_tokens,
+                    completion_tokens: entry.emitted,
+                });
+            }
+        };
+        let fail = |message: String| {
+            let _ = sink.send(TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens: 0,
+            });
+            Admitted::Done
+        };
+
+        let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
+        let logits = {
+            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            match self.serve.mixed_prefill_decode_step(
+                &self.ctx,
+                &mut self.arena,
+                &mut kv,
+                &request.prompt_tokens,
+                &mut kvs,
+                &decode_tokens,
+            ) {
+                Ok(logits) => logits,
+                Err(err) => {
+                    fail_batch(active, "mixed step", &err);
+                    return fail(format!("mixed step failed: {err:#}"));
+                }
+            }
+        };
+        if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
+            fail_batch(active, "mixed suppression", &err);
+            return fail(format!("mixed suppression failed: {err:#}"));
+        }
+
+        self.sample_nonce = self.sample_nonce.wrapping_add(1);
+        let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
+        let picked = {
+            let params: Vec<_> = std::iter::once(&request.params)
+                .chain(active.iter().map(|entry| &entry.request.params))
+                .collect();
+            let steps: Vec<u64> = std::iter::once(0u64)
+                .chain(active.iter().map(|entry| entry.emitted as u64))
+                .collect();
+            match pegainfer_sample::select_batch(
+                &self.ctx,
+                logits,
+                &params,
+                &steps,
+                call_seed,
+                &mut self.scratch,
+            ) {
+                Ok(picked) => picked,
+                Err(err) => {
+                    fail_batch(active, "mixed sampling", &err);
+                    return fail(format!("mixed sampling failed: {err:#}"));
+                }
+            }
+        };
+        let mut stops = vec![false; active.len() + 1];
+        stops[0] = !request.params.ignore_eos && self.policy.eos.contains(&picked[0]);
+        for (row, entry) in active.iter().enumerate() {
+            stops[row + 1] =
+                !entry.request.params.ignore_eos && self.policy.eos.contains(&picked[row + 1]);
+        }
+        let mut lp_requests: Vec<LogprobRequest> = Vec::new();
+        if request.logprobs > 0 && !stops[0] {
+            lp_requests.push(LogprobRequest {
+                row: 0,
+                picked: picked[0],
+                top_k: request.logprobs,
+            });
+        }
+        lp_requests.extend(
+            active
+                .iter()
+                .enumerate()
+                .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[row + 1])
+                .map(|(row, entry)| LogprobRequest {
+                    row: row + 1,
+                    picked: picked[row + 1],
+                    top_k: entry.request.logprobs,
+                }),
+        );
+        let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len() + 1];
+        if !lp_requests.is_empty() {
+            match pegainfer_sample::token_logprobs_batch(&self.ctx, logits, &lp_requests) {
+                Ok(scored) => {
+                    for (lp, scored) in lp_requests.iter().zip(scored) {
+                        logprobs[lp.row] = Some(scored);
+                    }
+                }
+                Err(err) => {
+                    fail_batch(active, "mixed logprobs", &err);
+                    return fail(format!("mixed logprobs failed: {err:#}"));
+                }
+            }
+        }
+
+        // Active rows: the decode-round event flow, one logits row up.
+        let mut retire: Vec<usize> = Vec::new();
+        for (row, entry) in active.iter_mut().enumerate() {
+            if stops[row + 1] {
+                let _ = entry.request.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: entry.prompt_tokens,
+                    completion_tokens: entry.emitted,
+                });
+                retire.push(row);
+                continue;
+            }
+            let token = picked[row + 1];
+            entry.emitted += 1;
+            if entry
+                .request
+                .token_tx
+                .send(TokenEvent::Token {
+                    id: token,
+                    logprob: logprobs[row + 1].take(),
+                })
+                .is_err()
+            {
+                retire.push(row);
+                continue;
+            }
+            if entry.emitted >= entry.request.max_tokens {
+                let _ = entry.request.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Length,
+                    prompt_tokens: entry.prompt_tokens,
+                    completion_tokens: entry.emitted,
+                });
+                retire.push(row);
+                continue;
+            }
+            entry.next = token;
+        }
+        for row in retire.into_iter().rev() {
+            active.swap_remove(row);
+        }
+
+        // The newcomer: its first token is logits row 0.
+        let finish = |reason: FinishReason, completion_tokens: usize| {
+            let _ = sink.send(TokenEvent::Finished {
+                finish_reason: reason,
+                prompt_tokens,
+                completion_tokens,
+            });
+            Admitted::Done
+        };
+        if stops[0] {
+            return finish(FinishReason::Stop, 0);
+        }
+        let next = picked[0];
+        if sink
+            .send(TokenEvent::Token {
+                id: next,
+                logprob: logprobs[0].take(),
+            })
+            .is_err()
+        {
+            return Admitted::Done;
+        }
+        if request.max_tokens <= 1 {
+            return finish(FinishReason::Length, 1);
+        }
+        Admitted::Active(Box::new(Active {
+            request,
+            kv,
+            next,
+            emitted: 1,
+            prompt_tokens,
+        }))
+    }
+
+    /// One batched decode step: every active request advances a token,
+    /// sharing each layer's weight pass. A cancelled request and a request
+    /// the pools cannot grow for retire before the batch is built; a finished
+    /// one retires after its token lands.
+    fn decode_round(&mut self, active: &mut Vec<Active>) {
+        self.ready_decode_rows(active);
         if active.is_empty() {
             return;
         }
