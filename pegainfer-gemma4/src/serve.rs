@@ -69,22 +69,33 @@ enum PrepRef<'a> {
         local_origins: &'a CudaSlice<i32>,
         global_tables: &'a GlobalTables,
     },
-    /// A mixed step's rows: the prompt occupies `[0, prefill_len)` and the
-    /// live decode batch the suffix. The prefix preps like a single prompt,
-    /// the suffix like a batched step at a row offset; the local plan the
-    /// caller passes is the ragged one covering every row, and the global
-    /// family reads its prefix through `global_prefill_plan` and its suffix
-    /// through the step tables.
+    /// A mixed step's rows: the admitted prompts occupy the row prefix as
+    /// segments and the live decode batch the suffix. Each segment preps
+    /// like a single prompt through its window of the concatenated plan
+    /// table, the suffix like a batched step at the total row offset; the
+    /// local plan the caller passes is the ragged one covering every row,
+    /// and the global family reads its prefix through `global_prefill_plan`
+    /// and its suffix through the step tables.
     Mixed {
-        prefill_len: usize,
-        prefill_start: usize,
-        prefill_origin: usize,
+        segs: &'a [MixSeg],
         local_origins: &'a CudaSlice<i32>,
         local_pages: &'a CudaSlice<i32>,
         local_indptr: &'a CudaSlice<i32>,
         global_tables: &'a GlobalTables,
         global_prefill_plan: &'a PrefillPagedPlan,
     },
+}
+
+/// One prompt segment of a mixed step: its row window in the stacked
+/// buffers, each family's offset into the concatenated plan table, and its
+/// coordinate pair (cache-relative origin, absolute start).
+struct MixSeg {
+    row_offset: usize,
+    rows: usize,
+    local_pages_offset: usize,
+    global_pages_offset: usize,
+    origin: usize,
+    start_pos: usize,
 }
 
 struct GemmaStepPlan {
@@ -985,46 +996,51 @@ impl GemmaServe {
                 )?;
             }
             PrepRef::Mixed {
-                prefill_len,
-                prefill_start,
-                prefill_origin,
+                segs,
                 local_origins,
                 local_pages,
                 local_indptr,
                 global_tables,
                 ..
             } => {
-                // Prefix as a single prompt — the ragged plan holds its
-                // pages at the front of the concatenated table — then the
-                // suffix as a batched step at the row offset.
-                scratch.q_states.seq_len = prefill_len;
-                scratch.k_states.seq_len = prefill_len;
-                scratch.v_states.seq_len = prefill_len;
-                scratch.q_prep.seq_len = prefill_len;
-                ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
-                    ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
-                    &scratch.v_states,
-                    &mut scratch.q_prep,
-                    0,
-                    self.local_pool.buffer(),
-                    &self.local_pool.layout().kernel_layout(),
-                    &layer.attention.q_norm,
-                    &layer.attention.k_norm,
-                    &self.sliding_cos,
-                    &self.sliding_sin,
-                    family_layer,
-                    local_plan.page_indices_d(),
-                    0,
-                    prefill_origin,
-                    prefill_start,
-                    self.cos_max_pos,
-                    geom.num_q_heads,
-                    geom.num_kv_heads,
-                    geom.head_dim,
-                    geom.rms_norm_eps,
-                )?;
+                // Each prompt segment preps as the suffix of a
+                // prefix-truncated view — shaping to `row_offset + rows`
+                // and offsetting by `row_offset` bounds the window on both
+                // sides — through its window of the concatenated plan
+                // table; then the decode suffix as a batched step at the
+                // total row offset.
+                let prefill_len: usize = segs.iter().map(|s| s.rows).sum();
+                for seg in segs {
+                    let end = seg.row_offset + seg.rows;
+                    scratch.q_states.seq_len = end;
+                    scratch.k_states.seq_len = end;
+                    scratch.v_states.seq_len = end;
+                    scratch.q_prep.seq_len = end;
+                    ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
+                        ctx,
+                        &scratch.q_states,
+                        &scratch.k_states,
+                        &scratch.v_states,
+                        &mut scratch.q_prep,
+                        seg.row_offset,
+                        self.local_pool.buffer(),
+                        &self.local_pool.layout().kernel_layout(),
+                        &layer.attention.q_norm,
+                        &layer.attention.k_norm,
+                        &self.sliding_cos,
+                        &self.sliding_sin,
+                        family_layer,
+                        local_plan.page_indices_d(),
+                        seg.local_pages_offset,
+                        seg.origin,
+                        seg.start_pos,
+                        self.cos_max_pos,
+                        geom.num_q_heads,
+                        geom.num_kv_heads,
+                        geom.head_dim,
+                        geom.rms_norm_eps,
+                    )?;
+                }
                 scratch.q_states.seq_len = seq_len;
                 scratch.k_states.seq_len = seq_len;
                 scratch.v_states.seq_len = seq_len;
@@ -1227,38 +1243,41 @@ impl GemmaServe {
                 scratch.attn.seq_len = seq_len;
             }
             PrepRef::Mixed {
-                prefill_len,
-                prefill_start,
+                segs,
                 global_tables,
                 global_prefill_plan,
                 ..
             } => {
                 let split = split.context("mixed global decode needs the split-KV state")?;
-                scratch.q_states.seq_len = prefill_len;
-                scratch.k_states.seq_len = prefill_len;
-                scratch.q_prep.seq_len = prefill_len;
-                ops::qk_norm_partial_rope_paged_prefill_hd512_into(
-                    ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
-                    &mut scratch.q_prep,
-                    0,
-                    self.global_pool.buffer(),
-                    &self.global_pool.layout().kernel_layout(),
-                    &layer.attention.q_norm,
-                    &layer.attention.k_norm,
-                    &self.global_cos,
-                    &self.global_sin,
-                    family_layer,
-                    global_prefill_plan.page_indices_d(),
-                    0,
-                    prefill_start,
-                    self.cos_max_pos,
-                    geom.num_q_heads,
-                    geom.num_kv_heads,
-                    geom.head_dim,
-                    geom.rms_norm_eps,
-                )?;
+                let prefill_len: usize = segs.iter().map(|s| s.rows).sum();
+                for seg in segs {
+                    let end = seg.row_offset + seg.rows;
+                    scratch.q_states.seq_len = end;
+                    scratch.k_states.seq_len = end;
+                    scratch.q_prep.seq_len = end;
+                    ops::qk_norm_partial_rope_paged_prefill_hd512_into(
+                        ctx,
+                        &scratch.q_states,
+                        &scratch.k_states,
+                        &mut scratch.q_prep,
+                        seg.row_offset,
+                        self.global_pool.buffer(),
+                        &self.global_pool.layout().kernel_layout(),
+                        &layer.attention.q_norm,
+                        &layer.attention.k_norm,
+                        &self.global_cos,
+                        &self.global_sin,
+                        family_layer,
+                        global_prefill_plan.page_indices_d(),
+                        seg.global_pages_offset,
+                        seg.start_pos,
+                        self.cos_max_pos,
+                        geom.num_q_heads,
+                        geom.num_kv_heads,
+                        geom.head_dim,
+                        geom.rms_norm_eps,
+                    )?;
+                }
                 scratch.q_states.seq_len = seq_len;
                 scratch.k_states.seq_len = seq_len;
                 scratch.q_prep.seq_len = seq_len;
@@ -1284,10 +1303,10 @@ impl GemmaServe {
                     geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
-                // The prompt's rows read through the per-prompt plan; the
-                // suffix through the native split entry at the pseudo-row
-                // offset — the same kernel and chunk plan as a pure decode
-                // step.
+                // The prompt rows read through the ragged prefill plan —
+                // one entry per segment — and the suffix through the native
+                // split entry at the pseudo-row offset, the same kernel and
+                // chunk plan as a pure decode step.
                 scratch.q_prep.seq_len = prefill_len;
                 scratch.attn.seq_len = prefill_len;
                 ops::batch_prefill_paged_hd512_into(
@@ -1662,16 +1681,17 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         arena: &'a mut StepArena,
-        prefill_kv: &mut GemmaKv,
-        prompt: &[u32],
+        prefills: &mut [(&mut GemmaKv, &[u32])],
         decode_kvs: &mut [&mut GemmaKv],
         decode_tokens: &[u32],
     ) -> Result<&'a mut HiddenStates> {
-        let prefill_len = prompt.len();
+        let prompts = prefills.len();
+        let prefill_len: usize = prefills.iter().map(|(_, p)| p.len()).sum();
         let batch = decode_kvs.len();
         anyhow::ensure!(
-            prefill_len > 0 && batch > 0,
-            "mixed step needs a prompt ({prefill_len}) and a live decode batch ({batch})"
+            prompts > 0 && prefill_len > 0 && batch > 0,
+            "mixed step needs prompt rows ({prompts} prompts, {prefill_len} tokens) \
+             and a live decode batch ({batch})"
         );
         anyhow::ensure!(
             decode_tokens.len() == batch,
@@ -1679,47 +1699,81 @@ impl GemmaServe {
             decode_tokens.len()
         );
         anyhow::ensure!(
-            batch < arena.max_rows,
+            batch + prompts <= arena.max_rows,
             "mixed step logits rows {} exceed the arena's {} row ceiling",
-            batch + 1,
+            batch + prompts,
             arena.max_rows
         );
         self.check_stream(ctx)?;
-        validate_tokens(&self.weights, self.local_geom.hidden_size, prompt)?;
+        for (_, prompt) in prefills.iter() {
+            validate_tokens(&self.weights, self.local_geom.hidden_size, prompt)?;
+        }
         validate_tokens(&self.weights, self.local_geom.hidden_size, decode_tokens)?;
         let rows = prefill_len + batch;
         let page = self.local_pool.layout().page_size;
+        let global_page = self.global_pool.layout().page_size;
 
-        // The prompt's entry first, then the decode rows — the ragged shape
-        // the local plan and the row buffers share. All entries derive from
-        // pre-advance state, the same way both pure steps plan.
-        let prefill_start = prefill_kv.local.seq_len();
-        let prefill_kv_len = prefill_start + prefill_len;
-        self.check_step_bounds(prefill_kv, prefill_kv_len)?;
-        let origin_tokens = prefill_kv.local.origin_pages() * page;
-        let rel_kv_len = prefill_kv_len
-            .checked_sub(origin_tokens)
-            .context("the resident window starts past the step's frontier")?;
-        let rel_start = prefill_start
-            .checked_sub(origin_tokens)
-            .context("the step starts before the resident window")?;
-        let prompt_row = prefill_kv.local.page_row();
-        anyhow::ensure!(
-            prompt_row.len() == rel_kv_len.div_ceil(page),
-            "local resident row of {} pages against {rel_kv_len} tokens",
-            prompt_row.len()
-        );
-        let prompt_rel_last = if rel_kv_len.is_multiple_of(page) {
-            page
-        } else {
-            rel_kv_len % page
-        };
-        let prefill_origin = prefill_kv.local.origin_pages();
-
-        let mut local_rows = vec![prompt_row];
-        let mut local_last = vec![prompt_rel_last];
-        let mut local_start = vec![rel_start];
-        let mut seq_lens = vec![prefill_len];
+        // Prompt entries first, then the decode rows — the ragged shape the
+        // plans, the row buffers and the segment table share. All entries
+        // derive from pre-advance state, the same way both pure steps plan.
+        let mut segs: Vec<MixSeg> = Vec::with_capacity(prompts);
+        let mut prefill_global_rows: Vec<Vec<i32>> = Vec::with_capacity(prompts);
+        let mut prefill_global_last = Vec::with_capacity(prompts);
+        let mut prefill_global_start = Vec::with_capacity(prompts);
+        let mut local_rows = Vec::with_capacity(prompts + batch);
+        let mut local_last = Vec::with_capacity(prompts + batch);
+        let mut local_start = Vec::with_capacity(prompts + batch);
+        let mut seq_lens = Vec::with_capacity(prompts + batch);
+        let mut row_cursor = 0usize;
+        let (mut local_pages_cursor, mut global_pages_cursor) = (0usize, 0usize);
+        for (kv, prompt) in prefills.iter() {
+            let start = kv.local.seq_len();
+            let kv_len = start + prompt.len();
+            self.check_step_bounds(kv, kv_len)?;
+            let origin_tokens = kv.local.origin_pages() * page;
+            let rel_kv_len = kv_len
+                .checked_sub(origin_tokens)
+                .context("the resident window starts past the step's frontier")?;
+            let rel_start = start
+                .checked_sub(origin_tokens)
+                .context("the step starts before the resident window")?;
+            let row = kv.local.page_row();
+            anyhow::ensure!(
+                row.len() == rel_kv_len.div_ceil(page),
+                "local resident row of {} pages against {rel_kv_len} tokens",
+                row.len()
+            );
+            let rel_last = if rel_kv_len.is_multiple_of(page) {
+                page
+            } else {
+                rel_kv_len % page
+            };
+            let global_desc = kv.global.desc_for_len(kv_len)?;
+            let global_row = kv.global.page_indices_i32();
+            anyhow::ensure!(
+                global_row.len() == kv_len.div_ceil(global_page),
+                "global resident row of {} pages against {kv_len} tokens",
+                global_row.len()
+            );
+            segs.push(MixSeg {
+                row_offset: row_cursor,
+                rows: prompt.len(),
+                local_pages_offset: local_pages_cursor,
+                global_pages_offset: global_pages_cursor,
+                origin: kv.local.origin_pages(),
+                start_pos: start,
+            });
+            row_cursor += prompt.len();
+            local_pages_cursor += row.len();
+            global_pages_cursor += global_row.len();
+            prefill_global_last.push(global_desc.last_page_len());
+            prefill_global_start.push(start);
+            prefill_global_rows.push(global_row);
+            local_rows.push(row);
+            local_last.push(rel_last);
+            local_start.push(rel_start);
+            seq_lens.push(prompt.len());
+        }
         let mut dec_pages_cat: Vec<i32> = Vec::new();
         let mut dec_indptr = vec![0i32];
         let mut positions = Vec::with_capacity(batch);
@@ -1775,15 +1829,16 @@ impl GemmaServe {
             self.local_geom.head_dim,
             0,
         )?;
-        let global_desc = prefill_kv.global.desc_for_len(prefill_kv_len)?;
-        let global_prefill_plan = PrefillPagedPlan::new(
+        let global_prefill_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             ctx,
-            &global_desc,
-            prefill_start,
-            prefill_len,
+            &prefill_global_rows,
+            &prefill_global_last,
+            &prefill_global_start,
+            &seq_lens[..prompts],
             self.global_geom.num_q_heads,
             self.global_geom.num_kv_heads,
             self.global_geom.head_dim,
+            0,
         )?;
         // Batch-local decode prep tables; transient because the arena's
         // slots stay dedicated to the graphed pure-decode steps.
@@ -1797,7 +1852,6 @@ impl GemmaServe {
             .map_err(|e| anyhow::anyhow!("mixed local indptr H2D failed: {e}"))?;
 
         // The global tables in both shapes, over the decode rows only.
-        let global_page = self.global_pool.layout().page_size;
         let mut global_pages_cat: Vec<i32> = Vec::new();
         let mut global_indptr = vec![0i32];
         let factor = self.global_split_factor;
@@ -1858,7 +1912,9 @@ impl GemmaServe {
         upload_prefix(ctx, origins_slot, &local_origins)?;
 
         let mut ids_host = Vec::with_capacity(rows);
-        ids_host.extend_from_slice(prompt);
+        for (_, prompt) in prefills.iter() {
+            ids_host.extend_from_slice(prompt);
+        }
         ids_host.extend_from_slice(decode_tokens);
         let ids = ctx
             .stream
@@ -1873,9 +1929,7 @@ impl GemmaServe {
             rows,
             &local_plan,
             PrepRef::Mixed {
-                prefill_len,
-                prefill_start,
-                prefill_origin,
+                segs: &segs,
                 local_origins: &*origins_slot,
                 local_pages: &local_pages_t,
                 local_indptr: &local_indptr_t,
@@ -1884,12 +1938,22 @@ impl GemmaServe {
             },
             Some(global_split),
         )?;
-        // The sampled rows — the prompt's last plus the decode suffix — are
-        // one contiguous range; compact them into the free ping-pong slot
-        // and run the batch + 1 rows through the LM head.
+        // Compact the sampled rows into the free ping-pong slot — each
+        // segment's last row, then the decode suffix as one range — and run
+        // the batch + prompts rows through the LM head.
         let (x, staging) = hidden_pair(&mut tower.hidden, src);
-        staging.seq_len = batch + 1;
-        ops::copy_hidden_token_range_into(ctx, x, prefill_len - 1, staging, 0, batch + 1)?;
+        staging.seq_len = batch + prompts;
+        for (j, seg) in segs.iter().enumerate() {
+            ops::copy_hidden_token_range_into(
+                ctx,
+                x,
+                seg.row_offset + seg.rows - 1,
+                staging,
+                j,
+                1,
+            )?;
+        }
+        ops::copy_hidden_token_range_into(ctx, x, prefill_len, staging, prompts, batch)?;
         logits_tail_into(
             ctx,
             &self.weights,
@@ -1899,22 +1963,22 @@ impl GemmaServe {
             head_normed,
             logits,
         )?;
-        logits.seq_len = batch + 1;
+        logits.seq_len = batch + prompts;
         // Append-then-attend, per request, the same way both pure steps
         // settle their frontiers.
-        #[cfg(test)]
-        if self.release_enabled {
-            prefill_kv
-                .local
-                .advance_and_release(prefill_len, self.sliding_window)?;
-        } else {
-            prefill_kv.local.advance(prefill_len);
+        for (kv, prompt) in prefills.iter_mut() {
+            #[cfg(test)]
+            if self.release_enabled {
+                kv.local
+                    .advance_and_release(prompt.len(), self.sliding_window)?;
+            } else {
+                kv.local.advance(prompt.len());
+            }
+            #[cfg(not(test))]
+            kv.local
+                .advance_and_release(prompt.len(), self.sliding_window)?;
+            kv.global.advance(prompt.len());
         }
-        #[cfg(not(test))]
-        prefill_kv
-            .local
-            .advance_and_release(prefill_len, self.sliding_window)?;
-        prefill_kv.global.advance(prefill_len);
         for kv in decode_kvs.iter_mut() {
             #[cfg(test)]
             if self.release_enabled {

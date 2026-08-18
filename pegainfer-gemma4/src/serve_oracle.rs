@@ -621,16 +621,26 @@ fn mixed_step_matches_serial_greedy() {
         3,
     );
 
-    // Admissions b then c ride the live batch (sizes 1 and 2).
-    for case in 1..cases.len() {
-        let mut kv = serve.alloc_kv();
+    // Admissions b and c ride the live batch TOGETHER: the k=2 step
+    // prefills both prompts as segments and samples both first tokens
+    // (logits rows 0..2) ahead of the incumbent rows.
+    {
+        let mut kv_b = serve.alloc_kv();
         admit_tokens(
             &serve.local_pool,
             &serve.global_pool,
-            &mut kv,
-            prompts[case].len(),
+            &mut kv_b,
+            prompts[1].len(),
         )
-        .expect("admit prompt");
+        .expect("admit prompt b");
+        let mut kv_c = serve.alloc_kv();
+        admit_tokens(
+            &serve.local_pool,
+            &serve.global_pool,
+            &mut kv_c,
+            prompts[2].len(),
+        )
+        .expect("admit prompt c");
         for (_, lane_kv, _) in &mut lanes {
             admit_tokens(&serve.local_pool, &serve.global_pool, lane_kv, 1).expect("admit decode");
         }
@@ -638,22 +648,19 @@ fn mixed_step_matches_serial_greedy() {
         let (vocab, host);
         {
             let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+            let mut prefills = [
+                (&mut kv_b, prompts[1].as_slice()),
+                (&mut kv_c, prompts[2].as_slice()),
+            ];
             let logits = serve
-                .mixed_prefill_decode_step(
-                    &ctx,
-                    &mut arena,
-                    &mut kv,
-                    &prompts[case],
-                    &mut kvs,
-                    &tokens,
-                )
-                .expect("mixed step");
+                .mixed_prefill_decode_step(&ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
+                .expect("k=2 mixed step");
             vocab = logits.hidden_dim;
             host = logits.to_host(&ctx).expect("logits D2H");
         }
         let mut retire: Vec<usize> = Vec::new();
         for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
-            let token = mixed_gate_argmax(&host, row + 1, vocab);
+            let token = mixed_gate_argmax(&host, row + 2, vocab);
             produced[*req].push(token);
             if produced[*req].len() >= budgets[*req] {
                 retire.push(row);
@@ -664,9 +671,12 @@ fn mixed_step_matches_serial_greedy() {
         for row in retire.into_iter().rev() {
             lanes.swap_remove(row);
         }
-        let first = mixed_gate_argmax(&host, 0, vocab);
-        produced[case].push(first);
-        lanes.push((case, kv, first));
+        let first_b = mixed_gate_argmax(&host, 0, vocab);
+        produced[1].push(first_b);
+        lanes.push((1, kv_b, first_b));
+        let first_c = mixed_gate_argmax(&host, 1, vocab);
+        produced[2].push(first_c);
+        lanes.push((2, kv_c, first_c));
         mixed_gate_decode_rounds(
             &ctx,
             &serve,
@@ -762,15 +772,9 @@ fn mixed_step_crosses_the_window_like_serial() {
             let (vocab, host);
             {
                 let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+                let mut prefills = [(&mut kv, long_prompt.as_slice())];
                 let logits = serve
-                    .mixed_prefill_decode_step(
-                        &ctx,
-                        &mut arena,
-                        &mut kv,
-                        &long_prompt,
-                        &mut kvs,
-                        &tokens,
-                    )
+                    .mixed_prefill_decode_step(&ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
                     .expect("mixed step");
                 vocab = logits.hidden_dim;
                 host = logits.to_host(&ctx).expect("logits D2H");

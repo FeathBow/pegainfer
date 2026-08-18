@@ -147,7 +147,7 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                     };
                     attempts += 1;
                     let can_wait = !active.is_empty();
-                    match state.admit_and_prefill(item, can_wait, &mut active) {
+                    match state.admit_and_prefill(item, can_wait, &mut active, &mut pending) {
                         Admitted::Active(request) => active.push(*request),
                         Admitted::Done => {}
                         Admitted::Requeue(item) => {
@@ -368,6 +368,64 @@ impl Drop for AsyncPrefillLane {
     }
 }
 
+/// The fail-closed request validation every admission path shares; `Err`
+/// carries the rejection message. The contract refuses every capability
+/// this engine does not implement — echo, a frontend-resolved prefix, P/D
+/// transfer metadata, a multi-partition placement — loudly, not silently.
+fn validate_request(request: &GenerateRequest, prefix_hit_tokens: usize) -> Result<(), String> {
+    let prompt_tokens = request.prompt_tokens.len();
+    if prompt_tokens == 0 {
+        return Err("empty prompt".into());
+    }
+    if request.max_tokens == 0 {
+        return Err("max_tokens must be positive".into());
+    }
+    let context_len = prompt_tokens.checked_add(request.max_tokens);
+    if context_len.is_none_or(|len| len > MAX_CONTEXT) {
+        return Err(format!(
+            "prompt {prompt_tokens} + max_tokens {} exceeds the serving ceiling {MAX_CONTEXT}",
+            request.max_tokens
+        ));
+    }
+    if request.lora_adapter.is_some() {
+        return Err("gemma4 has no LoRA support".into());
+    }
+    if request.echo {
+        return Err("gemma4 does not echo the prompt".into());
+    }
+    if prefix_hit_tokens > 0 {
+        return Err(format!(
+            "gemma4 resolves its own prefix cache; refusing a frontend resolution claiming \
+             {prefix_hit_tokens} cached tokens"
+        ));
+    }
+    if request.kv_transfer_params.is_some() {
+        return Err("gemma4 has no P/D transfer support; kv_transfer_params refused".into());
+    }
+    if let Some(rank) = request.data_parallel_rank {
+        if rank != 0 {
+            return Err(format!(
+                "gemma4 is single-partition; data_parallel_rank {rank} refused"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How many prompts one mixed step may absorb: bounded well below the
+/// sampler-row capacity so a burst still leaves decode rows headroom.
+const MIX_MAX_PROMPTS: usize = 4;
+
+/// The gathered step's prompt-row ceiling. Gathering amortizes only the
+/// step floor (~27 ms at 12B) while every live stream's inter-token gap
+/// pays the whole gathered step (~0.2 ms per row), so absorbing long
+/// prompts into one step trades a large certain loss for a small fixed
+/// win — measured at 16 coincident ~1900-token prompts, an unbounded
+/// gather tripled the stream's p99 gap for a sub-2% wall saving. Short
+/// bursts are where the floor dominates; the ceiling keeps the gather
+/// there, and a long prompt keeps its own step.
+const MIX_GATHER_ROWS: usize = 512;
+
 struct Active {
     request: GenerateRequest,
     kv: GemmaKv,
@@ -502,6 +560,7 @@ impl EngineState {
         item: Submitted,
         can_wait: bool,
         active: &mut Vec<Active>,
+        pending: &mut VecDeque<Submitted>,
     ) -> Admitted {
         let (request, prefix) = item;
         let sink = request.token_tx.clone();
@@ -521,40 +580,8 @@ impl EngineState {
             }
             Admitted::Done
         };
-        if prompt_tokens == 0 {
-            return reject("empty prompt".into());
-        }
-        if request.max_tokens == 0 {
-            return reject("max_tokens must be positive".into());
-        }
-        let context_len = prompt_tokens.checked_add(request.max_tokens);
-        if context_len.is_none_or(|len| len > MAX_CONTEXT) {
-            return reject(format!(
-                "prompt {prompt_tokens} + max_tokens {} exceeds the serving ceiling {MAX_CONTEXT}",
-                request.max_tokens
-            ));
-        }
-        if request.lora_adapter.is_some() {
-            return reject("gemma4 has no LoRA support".into());
-        }
-        if request.echo {
-            return reject("gemma4 does not echo the prompt".into());
-        }
-        if prefix.hit_tokens() > 0 {
-            return reject(format!(
-                "gemma4 has no prefix cache yet; refusing a resolution claiming {} cached tokens",
-                prefix.hit_tokens()
-            ));
-        }
-        if request.kv_transfer_params.is_some() {
-            return reject("gemma4 has no P/D transfer support; kv_transfer_params refused".into());
-        }
-        if let Some(rank) = request.data_parallel_rank {
-            if rank != 0 {
-                return reject(format!(
-                    "gemma4 is single-partition; data_parallel_rank {rank} refused"
-                ));
-            }
+        if let Err(message) = validate_request(&request, prefix.hit_tokens()) {
+            return reject(message);
         }
 
         let mut resumed = None;
@@ -614,13 +641,91 @@ impl EngineState {
             return self.launch_async_prefill(request, kv, resumed);
         }
 
-        // Mixed admission: with a live decode batch, the prompt rides its
-        // weight scan — one step prefills the newcomer and advances every
-        // active row.
+        // Mixed admission: with a live decode batch, prompts ride its
+        // weight scan — one step prefills every gathered newcomer and
+        // advances every active row.
         if !active.is_empty() {
             self.ready_decode_rows(active);
             if !active.is_empty() {
-                return self.mixed_admission(request, kv, active, resumed);
+                // Gather more admissible prompts into the same step. A
+                // pool-refused or over-budget candidate returns to the queue
+                // head and stops the gather — the engine loop's
+                // head-of-line-waits semantics — and an invalid one is
+                // rejected in place.
+                let mut newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)> =
+                    vec![(request, kv, resumed)];
+                let mut rows_budget = {
+                    let (_, kv, _) = &newcomers[0];
+                    prompt_tokens - kv.local.seq_len()
+                };
+                while newcomers.len() < MIX_MAX_PROMPTS
+                    && rows_budget < MIX_GATHER_ROWS
+                    && newcomers.len() + active.len() < MAX_CONCURRENCY
+                {
+                    let Some((cand, cand_prefix)) = pending.pop_front() else {
+                        break;
+                    };
+                    let cand_sink = cand.token_tx.clone();
+                    if cand_sink.is_closed() {
+                        continue;
+                    }
+                    if let Err(message) = validate_request(&cand, cand_prefix.hit_tokens()) {
+                        let n = cand.prompt_tokens.len();
+                        if send_scheduled(&cand, n, 0) {
+                            let _ = cand_sink.send(TokenEvent::Rejected {
+                                message,
+                                prompt_tokens: n,
+                                completion_tokens: 0,
+                            });
+                        }
+                        continue;
+                    }
+                    let cand_len = cand.prompt_tokens.len();
+                    if rows_budget + cand_len > MIX_GATHER_ROWS {
+                        pending.push_front((cand, cand_prefix));
+                        break;
+                    }
+                    let mut cand_resumed = None;
+                    let mut cand_kv = match self
+                        .prefix_cache
+                        .as_mut()
+                        .and_then(|cache| cache.resolve(&cand.prompt_tokens))
+                    {
+                        Some((entry, t)) => {
+                            match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
+                                Ok(kv) => {
+                                    cand_resumed = Some(entry.id);
+                                    kv
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "gemma4 prefix-cache restore failed (falling back): {err:#}"
+                                    );
+                                    self.serve.alloc_kv()
+                                }
+                            }
+                        }
+                        None => self.serve.alloc_kv(),
+                    };
+                    let new_tokens = cand_len - cand_kv.local.seq_len();
+                    if admit_tokens(
+                        &self.serve.local_pool,
+                        &self.serve.global_pool,
+                        &mut cand_kv,
+                        new_tokens,
+                    )
+                    .is_err()
+                    {
+                        pending.push_front((cand, cand_prefix));
+                        break;
+                    }
+                    if !send_scheduled(&cand, cand_len, cand_kv.local.seq_len()) {
+                        continue;
+                    }
+                    rows_budget += cand_len - cand_kv.local.seq_len();
+                    newcomers.push((cand, cand_kv, cand_resumed));
+                }
+                return self.mixed_admission(newcomers, active);
             }
         }
 
@@ -866,19 +971,18 @@ impl EngineState {
         }
     }
 
-    /// The mixed-admission tail of [`Self::admit_and_prefill`]: the admitted
-    /// prompt and the live decode batch share one step, then one sampler
-    /// call covers the newcomer's first token (logits row 0) and every
-    /// active row after it.
+    /// The mixed-admission tail of [`Self::admit_and_prefill`]: every
+    /// gathered prompt and the live decode batch share one step, then one
+    /// sampler call covers the newcomers' first tokens (logits rows `0..k`)
+    /// and every active row after them. Finished newcomers emit in place
+    /// and the rest join `active` directly, so the caller always receives
+    /// `Done`.
     fn mixed_admission(
         &mut self,
-        request: GenerateRequest,
-        mut kv: GemmaKv,
+        mut newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
         active: &mut Vec<Active>,
-        resumed: Option<u64>,
     ) -> Admitted {
-        let sink = request.token_tx.clone();
-        let prompt_tokens = request.prompt_tokens.len();
+        let k = newcomers.len();
         let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
             log::error!("{what} failed: {err:#}");
             for entry in active.drain(..) {
@@ -889,54 +993,69 @@ impl EngineState {
                 });
             }
         };
-        let fail = |message: String| {
-            let _ = sink.send(TokenEvent::Error {
-                message,
-                prompt_tokens,
-                completion_tokens: 0,
-            });
+        let fail_newcomers = |newcomers: &mut Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
+                              message: &str| {
+            for (request, _, _) in newcomers.drain(..) {
+                let _ = request.token_tx.send(TokenEvent::Error {
+                    message: message.to_string(),
+                    prompt_tokens: request.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+            }
             Admitted::Done
         };
 
         let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
-            let resume = kv.local.seq_len();
+            let mut prefills: Vec<(&mut GemmaKv, &[u32])> = newcomers
+                .iter_mut()
+                .map(|(request, kv, _)| {
+                    let resume = kv.local.seq_len();
+                    (kv, &request.prompt_tokens[resume..])
+                })
+                .collect();
             match self.serve.mixed_prefill_decode_step(
                 &self.ctx,
                 &mut self.arena,
-                &mut kv,
-                &request.prompt_tokens[resume..],
+                &mut prefills,
                 &mut kvs,
                 &decode_tokens,
             ) {
                 Ok(logits) => logits,
                 Err(err) => {
                     fail_batch(active, "mixed step", &err);
-                    return fail(format!("mixed step failed: {err:#}"));
+                    return fail_newcomers(&mut newcomers, &format!("mixed step failed: {err:#}"));
                 }
             }
         };
         if let Some(cache) = self.prefix_cache.as_mut() {
-            if let Some(entry) =
-                self.serve
-                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
-            {
-                cache.insert(entry, resumed);
+            for (request, kv, resumed) in &newcomers {
+                if let Some(entry) =
+                    self.serve
+                        .capture_checkpoint(&self.ctx, kv, request.prompt_tokens.clone())
+                {
+                    cache.insert(entry, *resumed);
+                }
             }
         }
         if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
             fail_batch(active, "mixed suppression", &err);
-            return fail(format!("mixed suppression failed: {err:#}"));
+            return fail_newcomers(
+                &mut newcomers,
+                &format!("mixed suppression failed: {err:#}"),
+            );
         }
 
         self.sample_nonce = self.sample_nonce.wrapping_add(1);
         let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
         let picked = {
-            let params: Vec<_> = std::iter::once(&request.params)
+            let params: Vec<_> = newcomers
+                .iter()
+                .map(|(request, _, _)| &request.params)
                 .chain(active.iter().map(|entry| &entry.request.params))
                 .collect();
-            let steps: Vec<u64> = std::iter::once(0u64)
+            let steps: Vec<u64> = std::iter::repeat_n(0u64, k)
                 .chain(active.iter().map(|entry| entry.emitted as u64))
                 .collect();
             match pegainfer_sample::select_batch(
@@ -950,36 +1069,45 @@ impl EngineState {
                 Ok(picked) => picked,
                 Err(err) => {
                     fail_batch(active, "mixed sampling", &err);
-                    return fail(format!("mixed sampling failed: {err:#}"));
+                    return fail_newcomers(
+                        &mut newcomers,
+                        &format!("mixed sampling failed: {err:#}"),
+                    );
                 }
             }
         };
-        let mut stops = vec![false; active.len() + 1];
-        stops[0] = !request.params.ignore_eos && self.policy.eos.contains(&picked[0]);
+        let mut stops = vec![false; active.len() + k];
+        for (j, (request, _, _)) in newcomers.iter().enumerate() {
+            stops[j] = !request.params.ignore_eos && self.policy.eos.contains(&picked[j]);
+        }
         for (row, entry) in active.iter().enumerate() {
-            stops[row + 1] =
-                !entry.request.params.ignore_eos && self.policy.eos.contains(&picked[row + 1]);
+            stops[row + k] =
+                !entry.request.params.ignore_eos && self.policy.eos.contains(&picked[row + k]);
         }
         let mut lp_requests: Vec<LogprobRequest> = Vec::new();
-        if request.logprobs > 0 && !stops[0] {
-            lp_requests.push(LogprobRequest {
-                row: 0,
-                picked: picked[0],
-                top_k: request.logprobs,
-            });
-        }
+        lp_requests.extend(
+            newcomers
+                .iter()
+                .enumerate()
+                .filter(|(j, (request, _, _))| request.logprobs > 0 && !stops[*j])
+                .map(|(j, (request, _, _))| LogprobRequest {
+                    row: j,
+                    picked: picked[j],
+                    top_k: request.logprobs,
+                }),
+        );
         lp_requests.extend(
             active
                 .iter()
                 .enumerate()
-                .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[row + 1])
+                .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[row + k])
                 .map(|(row, entry)| LogprobRequest {
-                    row: row + 1,
-                    picked: picked[row + 1],
+                    row: row + k,
+                    picked: picked[row + k],
                     top_k: entry.request.logprobs,
                 }),
         );
-        let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len() + 1];
+        let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len() + k];
         if !lp_requests.is_empty() {
             match pegainfer_sample::token_logprobs_batch(&self.ctx, logits, &lp_requests) {
                 Ok(scored) => {
@@ -989,46 +1117,55 @@ impl EngineState {
                 }
                 Err(err) => {
                     fail_batch(active, "mixed logprobs", &err);
-                    return fail(format!("mixed logprobs failed: {err:#}"));
+                    return fail_newcomers(
+                        &mut newcomers,
+                        &format!("mixed logprobs failed: {err:#}"),
+                    );
                 }
             }
         }
 
-        // Active rows: the decode-round event flow, one logits row up.
-        emit_decode_rows(active, &picked, &stops, &mut logprobs, 1);
+        // Active rows: the decode-round event flow, `k` logits rows up.
+        emit_decode_rows(active, &picked, &stops, &mut logprobs, k);
 
-        // The newcomer: its first token is logits row 0.
-        let finish = |reason: FinishReason, completion_tokens: usize| {
-            let _ = sink.send(TokenEvent::Finished {
-                finish_reason: reason,
+        // The newcomers: their first tokens are logits rows `0..k`.
+        for (j, (request, kv, _)) in newcomers.into_iter().enumerate() {
+            let prompt_tokens = request.prompt_tokens.len();
+            let finish = |reason: FinishReason, completion_tokens: usize| {
+                let _ = request.token_tx.send(TokenEvent::Finished {
+                    finish_reason: reason,
+                    prompt_tokens,
+                    completion_tokens,
+                });
+            };
+            if stops[j] {
+                finish(FinishReason::Stop, 0);
+                continue;
+            }
+            let next = picked[j];
+            if request
+                .token_tx
+                .send(TokenEvent::Token {
+                    id: next,
+                    logprob: logprobs[j].take(),
+                })
+                .is_err()
+            {
+                continue;
+            }
+            if request.max_tokens <= 1 {
+                finish(FinishReason::Length, 1);
+                continue;
+            }
+            active.push(Active {
+                request,
+                kv,
+                next,
+                emitted: 1,
                 prompt_tokens,
-                completion_tokens,
             });
-            Admitted::Done
-        };
-        if stops[0] {
-            return finish(FinishReason::Stop, 0);
         }
-        let next = picked[0];
-        if sink
-            .send(TokenEvent::Token {
-                id: next,
-                logprob: logprobs[0].take(),
-            })
-            .is_err()
-        {
-            return Admitted::Done;
-        }
-        if request.max_tokens <= 1 {
-            return finish(FinishReason::Length, 1);
-        }
-        Admitted::Active(Box::new(Active {
-            request,
-            kv,
-            next,
-            emitted: 1,
-            prompt_tokens,
-        }))
+        Admitted::Done
     }
 
     /// One batched decode step: every active request advances a token,
