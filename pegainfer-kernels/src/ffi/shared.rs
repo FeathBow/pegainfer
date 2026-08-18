@@ -1156,6 +1156,7 @@ unsafe extern "C" {
         page_indices: *const i32,
         page_indices_len: i32,
         page_indptr: *const i32,
+        page_origins: *const i32,
         positions: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,

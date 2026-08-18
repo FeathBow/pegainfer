@@ -279,6 +279,7 @@ fn paged_decode_prep_matches_closed_form() {
     let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
     let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
     let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
+    let origins_zero_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32; 2]).expect("origins H2D");
     let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
 
     qk_norm_partial_rope_paged_decode_hd512_into(
@@ -296,6 +297,7 @@ fn paged_decode_prep_matches_closed_form() {
         layer,
         &pages_d,
         &indptr_d,
+        &origins_zero_d,
         &positions_d,
         8, // cos_max_pos
         NUM_Q_HEADS,
@@ -632,6 +634,7 @@ fn decode_prep_row_offset_serves_only_the_suffix() {
     let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
     let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
     let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
+    let origins_zero_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32; 2]).expect("origins H2D");
     let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
 
     let run = |offset: usize, q_host: &[bf16], k_host: &[bf16]| {
@@ -656,6 +659,7 @@ fn decode_prep_row_offset_serves_only_the_suffix() {
             layer,
             &pages_d,
             &indptr_d,
+            &origins_zero_d,
             &positions_d,
             8,
             NUM_Q_HEADS,
@@ -740,6 +744,7 @@ fn split_read_row_offset_serves_only_the_suffix() {
     let indptr: [i32; 3] = [0, 2, 3];
     let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
     let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
+    let origins_zero_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32; 2]).expect("origins H2D");
     let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
     qk_norm_partial_rope_paged_decode_hd512_into(
         ctx,
@@ -756,6 +761,7 @@ fn split_read_row_offset_serves_only_the_suffix() {
         layer,
         &pages_d,
         &indptr_d,
+        &origins_zero_d,
         &positions_d,
         8,
         NUM_Q_HEADS,

@@ -310,6 +310,10 @@ const GLOBAL_SPLIT_CHUNK_TOKENS: usize = 256;
 struct GlobalTables {
     pages: CudaSlice<i32>,
     indptr: CudaSlice<i32>,
+    /// Per-row window-start pages for the prep. Pure decode rows read their
+    /// whole row from page 0, so this stays zero-filled; a per-token prep
+    /// may compress a row's window to the single page holding its position.
+    origins: CudaSlice<i32>,
     positions: CudaSlice<i32>,
     pseudo_pages: CudaSlice<i32>,
     pseudo_indptr: CudaSlice<i32>,
@@ -561,6 +565,10 @@ impl GemmaServe {
                     .stream
                     .alloc_zeros(max_rows + 1)
                     .map_err(alloc("global indptr"))?,
+                origins: ctx
+                    .stream
+                    .alloc_zeros(max_rows)
+                    .map_err(alloc("global origins"))?,
                 positions: ctx
                     .stream
                     .alloc_zeros(max_rows)
@@ -1198,6 +1206,7 @@ impl GemmaServe {
                     family_layer,
                     &global_tables.pages,
                     &global_tables.indptr,
+                    &global_tables.origins,
                     &global_tables.positions,
                     self.cos_max_pos,
                     geom.num_q_heads,
@@ -1296,6 +1305,7 @@ impl GemmaServe {
                     family_layer,
                     &global_tables.pages,
                     &global_tables.indptr,
+                    &global_tables.origins,
                     &global_tables.positions,
                     self.cos_max_pos,
                     geom.num_q_heads,

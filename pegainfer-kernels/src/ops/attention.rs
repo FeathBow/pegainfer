@@ -3645,6 +3645,7 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     layer: usize,
     page_indices: &CudaSlice<i32>,
     page_indptr: &CudaSlice<i32>,
+    page_origins: &CudaSlice<i32>,
     positions: &CudaSlice<i32>,
     cos_max_pos: usize,
     num_q_heads: usize,
@@ -3712,11 +3713,12 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
         sin_cache.len
     );
     anyhow::ensure!(
-        positions.len() >= batch && page_indptr.len() > batch,
-        "hd512 paged decode prep metadata lens (positions {}, indptr {}) do not \
-         cover batch {batch}",
+        positions.len() >= batch && page_indptr.len() > batch && page_origins.len() >= batch,
+        "hd512 paged decode prep metadata lens (positions {}, indptr {}, origins {}) do \
+         not cover batch {batch}",
         positions.len(),
-        page_indptr.len()
+        page_indptr.len(),
+        page_origins.len()
     );
     let page_indices_len = crate::ops::checked_i32(
         page_indices.len(),
@@ -3752,6 +3754,7 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
     let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
     let (ip_ptr, _gip) = page_indptr.device_ptr(&ctx.stream);
+    let (po_ptr, _gpo) = page_origins.device_ptr(&ctx.stream);
     let (ps_ptr, _gps) = positions.device_ptr(&ctx.stream);
 
     let result = unsafe {
@@ -3769,6 +3772,7 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
             pi_ptr as *const i32,
             page_indices_len,
             ip_ptr as *const i32,
+            po_ptr as *const i32,
             ps_ptr as *const i32,
             num_q_heads_i32,
             num_kv_heads_i32,

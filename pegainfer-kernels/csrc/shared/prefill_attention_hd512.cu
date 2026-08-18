@@ -55,8 +55,11 @@ __device__ __forceinline__ int64_t paged_kv_offset_hd512(
 }
 
 // PER_TOKEN_META = true is the batched-decode form: token t is its own
-// request, so its absolute position and its page-table window
-// (page_indices + page_indptr[t]) ride per-token arrays.
+// request, so its absolute position, its page-table window
+// (page_indices + page_indptr[t]) and its window's first absolute page
+// (page_origins[t]) ride per-token arrays. The global family never
+// front-releases, so callers may compress a row's window to the single
+// page holding its position by setting origin = pos / page_size.
 template <bool PER_TOKEN_META>
 __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
     const __nv_bfloat16* __restrict__ q_batch,      // [q_dim, seq_len]
@@ -81,7 +84,8 @@ __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
     int num_pages,                                  // pool capacity in pages
     int64_t stride_page,
     const int* __restrict__ positions,              // [seq_len] absolute (per-token form)
-    const int* __restrict__ page_indptr             // [seq_len + 1] into page_indices
+    const int* __restrict__ page_indptr,            // [seq_len + 1] into page_indices
+    const int* __restrict__ page_origins            // [seq_len] window-start pages (per-token form)
 ) {
     // seq_len is mapped onto grid.x (limit ~2^31) and the head index onto
     // grid.y so prompts longer than the 65535 grid.y limit still launch.
@@ -137,9 +141,10 @@ __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
             pages = csr_page_row_checked(
                 page_indices, page_indices_len, page_indptr, token, &row_len);
         }
-        // The global family never releases its front, so a page's absolute
-        // index is its row index.
-        int row = resident_row_checked(pos, page_size, 0);
+        // The global family never releases its front; a per-token origin
+        // only compresses the row's window (single page per row).
+        int origin = PER_TOKEN_META ? page_origins[token] : 0;
+        int row = resident_row_checked(pos, page_size, origin);
         if (row >= row_len) __trap();
         page_id = pages[row];
         if (page_id < 0 || page_id >= num_pages) __trap();
@@ -361,6 +366,7 @@ int qk_norm_partial_rope_paged_prefill_hd512_cuda(
         num_pages,
         stride_page,
         nullptr,
+        nullptr,
         nullptr
     );
     cudaError_t err = cudaGetLastError();
@@ -454,6 +460,7 @@ int qk_norm_partial_rope_paged_decode_hd512_cuda(
     const int* page_indices,
     int page_indices_len,
     const int* page_indptr,
+    const int* page_origins,
     const int* positions,
     int num_q_heads,
     int num_kv_heads,
@@ -478,7 +485,7 @@ int qk_norm_partial_rope_paged_decode_hd512_cuda(
         cos_cache == nullptr || sin_cache == nullptr ||
         q_batch_out == nullptr || kv_data == nullptr ||
         page_indices == nullptr || page_indptr == nullptr ||
-        positions == nullptr) {
+        page_origins == nullptr || positions == nullptr) {
         pegainfer_ffi_set_last_error(
             "qk_norm_partial_rope_paged_decode_hd512_cuda: null pointer argument");
         return -1;
@@ -516,7 +523,8 @@ int qk_norm_partial_rope_paged_decode_hd512_cuda(
         num_pages,
         stride_page,
         positions,
-        page_indptr
+        page_indptr,
+        page_origins
     );
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
