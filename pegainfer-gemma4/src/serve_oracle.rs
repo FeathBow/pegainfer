@@ -831,6 +831,125 @@ fn mixed_step_crosses_the_window_like_serial() {
     }
 }
 
+/// The prefix cache's GPU halves, gated bit-level: two arms run the same
+/// kernel sequence — prefill turn 1, then a suffix step and greedy decode —
+/// and differ only in that the cache arm captures after turn 1, drops its
+/// KV entirely (returning the original pages for reuse), and restores from
+/// the cache-owned copies. Suffix logits must match to the bit and greedy
+/// tokens exactly, for a short entry (origin 0) and one past the window
+/// (released front); a divergence below the window floor must miss.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+fn prefix_restore_matches_cold_path() {
+    use crate::prefix_cache::PrefixCache;
+    let (ctx, serve, dir) = stack_with(2048, 512);
+    let window = Gemma4Config::from_file(&dir)
+        .expect("config")
+        .sliding_window;
+    let mut arena = serve.alloc_step_arena(&ctx, 1, false).expect("step arena");
+    let budget = 16usize;
+
+    for (name, turn1_len) in [("short", 200usize), ("long", 1500)] {
+        let turn1: Vec<u32> = (0..turn1_len as u32)
+            .map(|i| 1000 + (i * 37) % 50000)
+            .collect();
+        let mut turn2 = turn1.clone();
+        turn2.extend((0..64u32).map(|i| 2000 + i * 13));
+
+        let (ref_bits, ref_tokens) = {
+            let mut kv = serve.alloc_kv();
+            admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, turn1.len())
+                .expect("admit t1");
+            serve
+                .step(&ctx, &mut kv, &turn1, LogitsSpan::LastRow)
+                .expect("prefill t1");
+            suffix_and_greedy(&serve, &ctx, &mut arena, &mut kv, &turn2, budget)
+        };
+
+        let (warm_bits, warm_tokens) = {
+            let mut cache = PrefixCache::new(2, window);
+            {
+                let mut kv = serve.alloc_kv();
+                admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, turn1.len())
+                    .expect("admit t1");
+                serve
+                    .step(&ctx, &mut kv, &turn1, LogitsSpan::LastRow)
+                    .expect("prefill t1");
+                let entry = serve
+                    .capture_checkpoint(&ctx, &kv, turn1.clone())
+                    .expect("capture");
+                cache.insert(entry);
+            }
+            // A divergence below the window floor must miss.
+            if name == "long" {
+                let mut early = turn2.clone();
+                early[8] = 7;
+                assert!(
+                    cache.resolve(&early).is_none(),
+                    "{name}: early divergence must not resolve"
+                );
+            }
+            let (entry, t) = cache.resolve(&turn2).expect("hit");
+            assert_eq!(t, turn1.len(), "{name}: resume point");
+            let mut kv = serve
+                .restore_from_checkpoint(&ctx, entry, t)
+                .expect("restore");
+            suffix_and_greedy(&serve, &ctx, &mut arena, &mut kv, &turn2, budget)
+        };
+
+        assert_eq!(
+            warm_bits, ref_bits,
+            "{name}: restored suffix logits diverged from the uncached arm"
+        );
+        assert_eq!(
+            warm_tokens, ref_tokens,
+            "{name}: restored greedy tokens diverged from the uncached arm"
+        );
+        eprintln!(
+            "{name}: resume {} of {}, suffix logits bit-equal, {} greedy tokens equal",
+            turn1.len(),
+            turn2.len(),
+            ref_tokens.len()
+        );
+    }
+}
+
+/// Admit and prefill `prompt`'s unseen suffix, then decode `budget` greedy
+/// tokens on the serving path; returns the suffix logits row's bits and the
+/// tokens.
+fn suffix_and_greedy(
+    serve: &GemmaServe,
+    ctx: &DeviceContext,
+    arena: &mut StepArena,
+    kv: &mut GemmaKv,
+    prompt: &[u32],
+    budget: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let start = kv.local.seq_len();
+    admit_tokens(
+        &serve.local_pool,
+        &serve.global_pool,
+        kv,
+        prompt.len() - start,
+    )
+    .expect("admit suffix");
+    let logits = serve
+        .step(ctx, kv, &prompt[start..], LogitsSpan::LastRow)
+        .expect("suffix prefill");
+    let host = logits.to_host(ctx).expect("D2H");
+    let vocab = logits.hidden_dim;
+    let last = &host[(logits.seq_len - 1) * vocab..logits.seq_len * vocab];
+    let bits: Vec<u32> = last.iter().map(|v| v.to_bits()).collect();
+    let mut next = u32::try_from(argmax(last)).expect("token id");
+    let mut tokens = vec![next];
+    for _ in 1..budget {
+        let row = decode_serving(serve, ctx, arena, kv, next).expect("decode");
+        next = u32::try_from(argmax(&row)).expect("token id");
+        tokens.push(next);
+    }
+    (bits, tokens)
+}
+
 /// One serving-path decode step for a single request: the batched decode
 /// entry at batch one on an eager arena. The graph path is anchored to this
 /// by the ragged determinism gate's replay-vs-eager comparison.

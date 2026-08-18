@@ -31,6 +31,24 @@ impl SlidingLocalKv {
         }
     }
 
+    /// Rebuild a state from a prefix-cache restore: `resident` covers the
+    /// window pages `[origin_pages, ceil(frontier/page))`, exactly the
+    /// shape a request that prefilled to `frontier` and released its
+    /// out-of-window front would hold.
+    pub(crate) fn restore(
+        pool: KvPool,
+        resident: Vec<KvReservation>,
+        origin_pages: usize,
+        frontier: usize,
+    ) -> Self {
+        Self {
+            pool,
+            resident: resident.into(),
+            origin_pages,
+            frontier,
+        }
+    }
+
     pub(crate) fn seq_len(&self) -> usize {
         self.frontier
     }

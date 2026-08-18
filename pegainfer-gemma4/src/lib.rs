@@ -20,6 +20,8 @@ mod kv;
 #[allow(dead_code)]
 mod layer;
 #[cfg(feature = "gemma4")]
+mod prefix_cache;
+#[cfg(feature = "gemma4")]
 #[allow(dead_code)]
 mod serve;
 #[cfg(all(test, feature = "gemma4"))]

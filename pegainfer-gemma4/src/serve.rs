@@ -111,6 +111,45 @@ fn upload_prefix<T: cudarc::driver::DeviceRepr>(
         .map_err(|err| anyhow::anyhow!("step metadata H2D failed: {err}"))
 }
 
+/// Enqueue device-to-device copies of whole pool pages (`src[i] -> dst[i]`)
+/// on `ctx.stream`. A page is one contiguous `page_stride`-element span;
+/// source and destination live in the same buffer, which is why this
+/// reaches for the raw driver copy instead of cudarc's safe API.
+fn copy_pool_pages(
+    ctx: &DeviceContext,
+    buffer: &CudaSlice<bf16>,
+    layout: &pegainfer_core::kv_pool::KvLayout,
+    src: &[i32],
+    dst: &[i32],
+) -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    anyhow::ensure!(
+        src.len() == dst.len(),
+        "page copy list mismatch: {} src vs {} dst",
+        src.len(),
+        dst.len()
+    );
+    let page_bytes = layout.page_stride * std::mem::size_of::<bf16>();
+    let (base, _guard) = buffer.device_ptr(&ctx.stream);
+    for (&s, &d) in src.iter().zip(dst) {
+        let src_ptr = base + s as u64 * page_bytes as u64;
+        let dst_ptr = base + d as u64 * page_bytes as u64;
+        let rc = unsafe {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                dst_ptr,
+                src_ptr,
+                page_bytes,
+                ctx.stream.cu_stream(),
+            )
+        };
+        anyhow::ensure!(
+            rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "page D2D copy failed: {rc:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The attention path's working set. Both families run the same tower over
 /// the same rows, so one set serves both: each buffer is allocated at the
 /// wider family's width and reshaped per layer.
@@ -534,6 +573,162 @@ impl GemmaServe {
             local: SlidingLocalKv::new(self.local_pool.clone()),
             global: self.global_pool.alloc(),
         }
+    }
+
+    /// Copy a request's post-prefill KV into cache-owned pages — the
+    /// capture half of the conversation-tail prefix cache. Returns `None`
+    /// when either pool cannot spare the pages: capture is strictly
+    /// best-effort and never competes with an admission. Stream order makes
+    /// the copies safe — the prompt's KV writes were enqueued on
+    /// `ctx.stream` before this call, and the copies enqueue after them on
+    /// the same stream.
+    pub(crate) fn capture_checkpoint(
+        &self,
+        ctx: &DeviceContext,
+        kv: &GemmaKv,
+        token_ids: Vec<u32>,
+    ) -> Option<crate::prefix_cache::CachedKv> {
+        // Slack guard: cache pages must never push either pool to the edge,
+        // or the saved prefill time resurfaces as refused admissions.
+        const POOL_SLACK_PAGES: usize = 128;
+        let global_src = kv.global.page_indices_i32();
+        let (local_avail, global_avail) = (
+            self.local_pool.available_pages(),
+            self.global_pool.available_pages(),
+        );
+        if local_avail < kv.local.held_pages() + POOL_SLACK_PAGES
+            || global_avail < global_src.len() + POOL_SLACK_PAGES
+        {
+            return None;
+        }
+        let global_pages = self.global_pool.try_reserve(global_src.len())?;
+        let mut local_pages = Vec::with_capacity(kv.local.held_pages());
+        for _ in 0..kv.local.held_pages() {
+            local_pages.push(self.local_pool.try_reserve(1)?);
+        }
+        let mut global_dst = Vec::with_capacity(global_src.len());
+        global_pages.extend_page_indices_i32(&mut global_dst);
+        let local_src = kv.local.page_row();
+        let mut local_dst = Vec::with_capacity(local_pages.len());
+        for reservation in &local_pages {
+            reservation.extend_page_indices_i32(&mut local_dst);
+        }
+        let copy = copy_pool_pages(
+            ctx,
+            self.global_pool.buffer(),
+            self.global_pool.layout(),
+            &global_src,
+            &global_dst,
+        )
+        .and_then(|()| {
+            copy_pool_pages(
+                ctx,
+                self.local_pool.buffer(),
+                self.local_pool.layout(),
+                &local_src,
+                &local_dst,
+            )
+        });
+        if let Err(err) = copy {
+            log::warn!("gemma4 prefix-cache capture failed: {err:#}");
+            return None;
+        }
+        Some(crate::prefix_cache::CachedKv::new(
+            token_ids,
+            global_pages,
+            local_pages,
+            kv.local.origin_pages(),
+        ))
+    }
+
+    /// Rebuild a request KV from a cached conversation tail — the restore
+    /// half. The result is shaped exactly like a request that prefilled
+    /// `[0, t)` itself and already released its out-of-window pages, so
+    /// every downstream path (suffix prefill from `seq_len`, decode,
+    /// release) proceeds unchanged. Any failure aborts the whole restore —
+    /// both families or neither — and the caller falls back to a full
+    /// prefill.
+    pub(crate) fn restore_from_checkpoint(
+        &self,
+        ctx: &DeviceContext,
+        entry: &crate::prefix_cache::CachedKv,
+        t: usize,
+    ) -> Result<GemmaKv> {
+        anyhow::ensure!(
+            t > 0 && t <= entry.token_ids.len(),
+            "restore point {t} outside entry of {} tokens",
+            entry.token_ids.len()
+        );
+        let page = self.local_pool.layout().page_size;
+        // The release law's origin at frontier `t`; resolve guaranteed it
+        // does not precede the captured window's origin.
+        let origin_t = if t > self.sliding_window {
+            (t - self.sliding_window) / page
+        } else {
+            0
+        };
+        anyhow::ensure!(
+            origin_t >= entry.local_origin,
+            "restore point {t} precedes the captured window (origin {origin_t} vs {})",
+            entry.local_origin
+        );
+        let t_pages = t.div_ceil(page);
+        let local_take = t_pages - origin_t;
+        let local_skip = origin_t - entry.local_origin;
+        anyhow::ensure!(
+            local_skip + local_take <= entry.local_pages.len(),
+            "restore window slice [{local_skip}, {}) outside {} cached pages",
+            local_skip + local_take,
+            entry.local_pages.len()
+        );
+
+        let mut global = self.global_pool.alloc();
+        global.ensure_capacity(t)?;
+        let global_dst = global.page_indices_i32();
+        let mut global_src = Vec::new();
+        entry.global_pages.extend_page_indices_i32(&mut global_src);
+        global_src.truncate(global_dst.len());
+        anyhow::ensure!(
+            global_dst.len() == global_src.len(),
+            "restore page count mismatch: {} cached vs {} allocated",
+            global_src.len(),
+            global_dst.len()
+        );
+        let mut resident = Vec::with_capacity(local_take);
+        for _ in 0..local_take {
+            resident.push(
+                self.local_pool
+                    .try_reserve(1)
+                    .context("restore: local pool out of pages")?,
+            );
+        }
+        let mut local_src = Vec::with_capacity(local_take);
+        for reservation in entry.local_pages.iter().skip(local_skip).take(local_take) {
+            reservation.extend_page_indices_i32(&mut local_src);
+        }
+        let mut local_dst = Vec::with_capacity(local_take);
+        for reservation in &resident {
+            reservation.extend_page_indices_i32(&mut local_dst);
+        }
+        copy_pool_pages(
+            ctx,
+            self.global_pool.buffer(),
+            self.global_pool.layout(),
+            &global_src,
+            &global_dst,
+        )?;
+        copy_pool_pages(
+            ctx,
+            self.local_pool.buffer(),
+            self.local_pool.layout(),
+            &local_src,
+            &local_dst,
+        )?;
+        global.advance(t);
+        Ok(GemmaKv {
+            local: SlidingLocalKv::restore(self.local_pool.clone(), resident, origin_t, t),
+            global,
+        })
     }
 
     /// The eviction gate runs the same request twice, once with the front

@@ -27,6 +27,7 @@ use crate::forward::MULTIMODAL_PLACEHOLDER_IDS;
 use crate::kv::GemmaKv;
 use crate::kv::PAGE_SIZE;
 use crate::kv::admit_tokens;
+use crate::prefix_cache::PrefixCache;
 use crate::serve::GemmaServe;
 use crate::serve::LogitsSpan;
 use crate::serve::StepArena;
@@ -266,6 +267,9 @@ struct EngineState {
     serve: GemmaServe,
     arena: StepArena,
     scratch: SampleScratch,
+    /// Conversation-tail prefix cache; `None` unless
+    /// `PEGAINFER_PREFIX_CACHE=K` opted in at startup.
+    prefix_cache: Option<PrefixCache>,
     policy: GenerationPolicy,
     /// The value written into a suppressed slot, resident on the device so a
     /// step never stages a host scalar.
@@ -299,9 +303,27 @@ impl EngineState {
         // pools add the padding page they reserve.
         let context_pages = MAX_CONTEXT.div_ceil(PAGE_SIZE);
         let window_pages = weights.config.sliding_window.div_ceil(PAGE_SIZE) + 1;
-        let local_pages = context_pages + (MAX_CONCURRENCY - 1) * window_pages + 1;
-        let global_pages = MAX_CONCURRENCY * context_pages + 1;
-        let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, local_pages, global_pages)?;
+        // The cache brings its own page budget so cached entries never eat
+        // serving headroom.
+        let cache_entries = crate::prefix_cache::prefix_cache_cap().unwrap_or(0);
+        let sliding_window = weights.config.sliding_window;
+        let local_pages =
+            context_pages + (MAX_CONCURRENCY - 1) * window_pages + 1 + cache_entries * window_pages;
+        let global_pages =
+            MAX_CONCURRENCY * context_pages + 1 + cache_entries * (context_pages / 2);
+        let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, local_pages, global_pages)
+            .map_err(|err| {
+                if cache_entries > 0 {
+                    err.context(format!(
+                        "PEGAINFER_PREFIX_CACHE={cache_entries} grew the pools to \
+                         {local_pages} local / {global_pages} global pages"
+                    ))
+                } else {
+                    err
+                }
+            })?;
+        let prefix_cache =
+            crate::prefix_cache::prefix_cache_cap().map(|k| PrefixCache::new(k, sliding_window));
         let scratch = SampleScratch::new(&ctx, vocab, MAX_CONCURRENCY)?;
         let mut arena = serve.alloc_step_arena(&ctx, MAX_CONCURRENCY, graph_enabled)?;
         serve.precapture_decode_graphs(&ctx, &mut arena)?;
@@ -314,6 +336,7 @@ impl EngineState {
             serve,
             arena,
             scratch,
+            prefix_cache,
             policy,
             blocked,
             base_seed,
@@ -385,17 +408,43 @@ impl EngineState {
             }
         }
 
-        let mut kv = self.serve.alloc_kv();
-        if let Err(err) = admit_tokens(
-            &self.serve.local_pool,
-            &self.serve.global_pool,
-            &mut kv,
-            prompt_tokens,
-        ) {
-            if can_wait {
-                return Admitted::Requeue(Box::new((request, prefix)));
+        let mut kv = match self
+            .prefix_cache
+            .as_mut()
+            .and_then(|cache| cache.resolve(&request.prompt_tokens))
+        {
+            Some((entry, t)) => match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
+                Ok(kv) => kv,
+                Err(err) => {
+                    log::warn!("gemma4 prefix-cache restore failed (falling back): {err:#}");
+                    self.serve.alloc_kv()
+                }
+            },
+            None => self.serve.alloc_kv(),
+        };
+        loop {
+            let new_tokens = prompt_tokens - kv.local.seq_len();
+            match admit_tokens(
+                &self.serve.local_pool,
+                &self.serve.global_pool,
+                &mut kv,
+                new_tokens,
+            ) {
+                Ok(()) => break,
+                Err(err) => {
+                    if self
+                        .prefix_cache
+                        .as_mut()
+                        .is_some_and(PrefixCache::evict_lru)
+                    {
+                        continue;
+                    }
+                    if can_wait {
+                        return Admitted::Requeue(Box::new((request, prefix)));
+                    }
+                    return reject(format!("admission refused: {err:#}"));
+                }
             }
-            return reject(format!("admission refused: {err:#}"));
         }
         if !send_scheduled(&request, prompt_tokens) {
             return Admitted::Done;
@@ -419,15 +468,24 @@ impl EngineState {
             });
             Admitted::Done
         };
+        let resume = kv.local.seq_len();
         let mut logits = match self.serve.step(
             &self.ctx,
             &mut kv,
-            &request.prompt_tokens,
+            &request.prompt_tokens[resume..],
             LogitsSpan::LastRow,
         ) {
             Ok(logits) => logits,
             Err(err) => return fail(format!("{err:#}")),
         };
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            if let Some(entry) =
+                self.serve
+                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+            {
+                cache.insert(entry);
+            }
+        }
         if let Err(err) =
             suppress_logits(&self.ctx, &self.blocked, &mut logits, &self.policy.suppress)
         {
@@ -556,11 +614,12 @@ impl EngineState {
         let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            let resume = kv.local.seq_len();
             match self.serve.mixed_prefill_decode_step(
                 &self.ctx,
                 &mut self.arena,
                 &mut kv,
-                &request.prompt_tokens,
+                &request.prompt_tokens[resume..],
                 &mut kvs,
                 &decode_tokens,
             ) {
@@ -571,6 +630,14 @@ impl EngineState {
                 }
             }
         };
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            if let Some(entry) =
+                self.serve
+                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+            {
+                cache.insert(entry);
+            }
+        }
         if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
             fail_batch(active, "mixed suppression", &err);
             return fail(format!("mixed suppression failed: {err:#}"));
