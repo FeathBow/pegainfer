@@ -592,6 +592,9 @@ impl GemmaServe {
         // or the saved prefill time resurfaces as refused admissions.
         const POOL_SLACK_PAGES: usize = 128;
         let global_src = kv.global.page_indices_i32();
+        if global_src.len() > crate::prefix_cache::entry_global_pages(self.cos_max_pos) {
+            return None;
+        }
         let (local_avail, global_avail) = (
             self.local_pool.available_pages(),
             self.global_pool.available_pages(),

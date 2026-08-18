@@ -62,6 +62,13 @@ pub(crate) struct PrefixCache {
     clock: u64,
 }
 
+/// Global-family pages budgeted per cache entry — half the serving
+/// context. Capture refuses a longer prompt, so the cache can never hold
+/// more than the share of the pool its entries paid for at startup.
+pub(crate) fn entry_global_pages(max_context: usize) -> usize {
+    max_context.div_ceil(PAGE_SIZE) / 2
+}
+
 /// The fail-closed gate: `PEGAINFER_PREFIX_CACHE=K` enables a K-entry
 /// cache; unset or unparsable-as-positive disables it entirely.
 pub(crate) fn prefix_cache_cap() -> Option<usize> {

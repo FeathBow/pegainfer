@@ -309,8 +309,9 @@ impl EngineState {
         let sliding_window = weights.config.sliding_window;
         let local_pages =
             context_pages + (MAX_CONCURRENCY - 1) * window_pages + 1 + cache_entries * window_pages;
-        let global_pages =
-            MAX_CONCURRENCY * context_pages + 1 + cache_entries * (context_pages / 2);
+        let global_pages = MAX_CONCURRENCY * context_pages
+            + 1
+            + cache_entries * crate::prefix_cache::entry_global_pages(MAX_CONTEXT);
         let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, local_pages, global_pages)
             .map_err(|err| {
                 if cache_entries > 0 {

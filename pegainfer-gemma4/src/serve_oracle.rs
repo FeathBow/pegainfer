@@ -842,7 +842,7 @@ fn mixed_step_crosses_the_window_like_serial() {
 #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
 fn prefix_restore_matches_cold_path() {
     use crate::prefix_cache::PrefixCache;
-    let (ctx, serve, dir) = stack_with(2048, 512);
+    let (ctx, serve, dir) = stack_with(4096, 512);
     let window = Gemma4Config::from_file(&dir)
         .expect("config")
         .sliding_window;
@@ -912,6 +912,24 @@ fn prefix_restore_matches_cold_path() {
             ref_tokens.len()
         );
     }
+
+    // Past the per-entry allotment (half the serving context) the capture
+    // must refuse — the cache can never hold more of the pool than its
+    // entries paid for.
+    let over: Vec<u32> = (0..2100u32).map(|i| 1000 + (i * 37) % 50000).collect();
+    let mut kv = serve.alloc_kv();
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, over.len()).expect("admit over");
+    serve
+        .step(&ctx, &mut kv, &over, LogitsSpan::LastRow)
+        .expect("prefill over");
+    assert!(
+        serve.capture_checkpoint(&ctx, &kv, over.clone()).is_none(),
+        "a prompt past the per-entry allotment must not capture"
+    );
+    eprintln!(
+        "over: {} tokens refused capture at the allotment",
+        over.len()
+    );
 }
 
 /// Admit and prefill `prompt`'s unseen suffix, then decode `budget` greedy
