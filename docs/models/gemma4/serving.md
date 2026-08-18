@@ -1,12 +1,12 @@
 # Gemma 4 serving
 
-**TL;DR:** The engine schedules per iteration: up to 16 requests hold decode slots, each prompt prefills whole at a step boundary, and every active request advances one token per batched step. Prompt plus output past 8192 tokens is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B). **This needs a 48 GiB card**: the engine sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it. A row's output moves with the bucket widths it decodes at, but not with what its companions contain. An opt-in conversation prefix cache (`PEGAINFER_PREFIX_CACHE=K`) resumes multi-turn prompts at the cost of a pre-allocated page budget.
+**TL;DR:** The engine schedules per iteration: up to 16 requests hold decode slots, each prompt prefills whole at a step boundary, and every active request advances one token per batched step. Prompt plus output past 8192 tokens is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B). **This needs a 48 GiB card**: the engine sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it. A row's output moves with the bucket widths it decodes at, but not with what its companions contain. An opt-in conversation prefix cache (`PEGAINFER_PREFIX_CACHE=K`) resumes multi-turn prompts at the cost of a pre-allocated page budget, and an opt-in overlap lane (`PEGAINFER_ASYNC_PREFILL=green:NN`) trades prefill latency for decode-tail protection under long-prompt admissions.
 
 Last touched: 2026-08
 
 ## What a step is
 
-The engine thread runs one loop. Each turn it admits whatever the pools can hold, up to the slot ceiling. With streams in flight, each admitted prompt shares one mixed step with them — the prompt's rows sit in the step's row prefix while every active request advances its token in the suffix; a prompt that arrives with nothing active prefills alone as its own step. Between admissions, every active request advances exactly one token in a single batched decode step that shares the weight pass. A request that arrives while all slots are taken waits at the head of the queue. It is refused only when nothing is active — when there is no other request whose pages could free up, the pools genuinely cannot hold it and saying so is the honest answer.
+The engine thread runs one loop. Each turn it admits whatever the pools can hold, up to the slot ceiling. With streams in flight, each admitted prompt shares one mixed step with them — the prompt's rows sit in the step's row prefix while every active request advances its token in the suffix; a prompt that arrives with nothing active prefills alone as its own step. With the opt-in overlap lane enabled (below), an admission into a live batch prefills asynchronously on its own stream instead of sharing the mixed step. Between admissions, every active request advances exactly one token in a single batched decode step that shares the weight pass. A request that arrives while all slots are taken waits at the head of the queue. It is refused only when nothing is active — when there is no other request whose pages could free up, the pools genuinely cannot hold it and saying so is the honest answer.
 
 Rows retire independently. Requests in one batch have their own frontiers, their own page tables and, for the sliding family, their own released window front, so a short request finishing does not disturb the rows that continue.
 
@@ -80,6 +80,14 @@ When a request's prefill completes, the engine copies its prompt-state pages —
 The cache brings its own page budget, added to the pool lines above at startup. A prompt longer than half the serving context (4096 tokens today) is not captured — that bound is what keeps the cache's pool share equal to what its entries paid for. A new turn's capture supersedes its conversation's older entry, capacity evicts LRU, and an admission that cannot reserve pages evicts cache entries before waiting.
 
 At `PEGAINFER_PREFIX_CACHE=16` the idle footprint measured **39242 MiB** against the 33034 MiB baseline — the difference is the pre-allocated cache budget.
+
+## The async prefill lane (opt-in)
+
+`PEGAINFER_ASYNC_PREFILL` (unset by default) moves a live-batch admission's prefill onto its own stream, so decode steps keep replaying while the prompt computes. `green:NN` pins the lane to roughly NN% of the SMs via a Green Context — the cap is the mechanism: a `shared` lane's full-width prefill grids starve decode steps, and is kept only for comparison. An unrecognized value or an unviable SM partition refuses to start rather than silently degrading.
+
+One prefill is in flight at most; further arrivals wait while decode keeps stepping, a prompt arriving with nothing active takes the sync path, a restored prefix-cache hit prefills only its unseen suffix, and the sliding window's front release is deferred to the join so no page can be re-allocated under in-flight reads.
+
+Measured (a streaming request, then sixteen ~1900-token prompts admitted at once; two runs per arm): the stream's worst inter-token gap under the flood drops from 387-452 ms — one mixed step at that prompt length — to 75-76 ms with `green:35`, p99 385-432 → 39-40 ms, while the flood's own TTFT p50 grows 3.3-3.7 → 9.8-10.3 s and its wall about 2.4×. The quiet stream and idle footprint are unchanged, so an idle lane costs nothing. That trade is the positioning: a high-concurrency, decode-tail-sensitive profile, not a default — at light load the capped lane only costs TTFT.
 
 ## Measured behaviour
 
