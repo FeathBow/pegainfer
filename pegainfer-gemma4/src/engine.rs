@@ -641,45 +641,7 @@ impl EngineState {
         }
 
         // Active rows: the decode-round event flow, one logits row up.
-        let mut retire: Vec<usize> = Vec::new();
-        for (row, entry) in active.iter_mut().enumerate() {
-            if stops[row + 1] {
-                let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
-                    prompt_tokens: entry.prompt_tokens,
-                    completion_tokens: entry.emitted,
-                });
-                retire.push(row);
-                continue;
-            }
-            let token = picked[row + 1];
-            entry.emitted += 1;
-            if entry
-                .request
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: token,
-                    logprob: logprobs[row + 1].take(),
-                })
-                .is_err()
-            {
-                retire.push(row);
-                continue;
-            }
-            if entry.emitted >= entry.request.max_tokens {
-                let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Length,
-                    prompt_tokens: entry.prompt_tokens,
-                    completion_tokens: entry.emitted,
-                });
-                retire.push(row);
-                continue;
-            }
-            entry.next = token;
-        }
-        for row in retire.into_iter().rev() {
-            active.swap_remove(row);
-        }
+        emit_decode_rows(active, &picked, &stops, &mut logprobs, 1);
 
         // The newcomer: its first token is logits row 0.
         let finish = |reason: FinishReason, completion_tokens: usize| {
@@ -794,45 +756,60 @@ impl EngineState {
             }
         }
 
-        let mut retire: Vec<usize> = Vec::new();
-        for (row, entry) in active.iter_mut().enumerate() {
-            if stops[row] {
-                let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
-                    prompt_tokens: entry.prompt_tokens,
-                    completion_tokens: entry.emitted,
-                });
-                retire.push(row);
-                continue;
-            }
-            let token = picked[row];
-            entry.emitted += 1;
-            if entry
-                .request
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: token,
-                    logprob: logprobs[row].take(),
-                })
-                .is_err()
-            {
-                retire.push(row);
-                continue;
-            }
-            if entry.emitted >= entry.request.max_tokens {
-                let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Length,
-                    prompt_tokens: entry.prompt_tokens,
-                    completion_tokens: entry.emitted,
-                });
-                retire.push(row);
-                continue;
-            }
-            entry.next = token;
+        emit_decode_rows(active, &picked, &stops, &mut logprobs, 0);
+    }
+}
+
+/// Deliver one decode step's outcome to every active row and retire the
+/// finished ones — the event flow both the pure decode round and the mixed
+/// admission share; `row_base` is the row's offset into the step's logits
+/// (the mixed step's row 0 is the newcomer). A stop token retires the
+/// request without being emitted; a send failure retires a cancelled one.
+fn emit_decode_rows(
+    active: &mut Vec<Active>,
+    picked: &[u32],
+    stops: &[bool],
+    logprobs: &mut [Option<TokenLogprob>],
+    row_base: usize,
+) {
+    let mut retire: Vec<usize> = Vec::new();
+    for (row, entry) in active.iter_mut().enumerate() {
+        if stops[row + row_base] {
+            let _ = entry.request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: entry.prompt_tokens,
+                completion_tokens: entry.emitted,
+            });
+            retire.push(row);
+            continue;
         }
-        for row in retire.into_iter().rev() {
-            active.swap_remove(row);
+        let token = picked[row + row_base];
+        entry.emitted += 1;
+        if entry
+            .request
+            .token_tx
+            .send(TokenEvent::Token {
+                id: token,
+                logprob: logprobs[row + row_base].take(),
+            })
+            .is_err()
+        {
+            retire.push(row);
+            continue;
         }
+        if entry.emitted >= entry.request.max_tokens {
+            let _ = entry.request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: entry.prompt_tokens,
+                completion_tokens: entry.emitted,
+            });
+            retire.push(row);
+            continue;
+        }
+        entry.next = token;
+    }
+    for row in retire.into_iter().rev() {
+        active.swap_remove(row);
     }
 }
 
