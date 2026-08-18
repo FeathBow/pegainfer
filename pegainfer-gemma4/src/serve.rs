@@ -69,6 +69,22 @@ enum PrepRef<'a> {
         local_origins: &'a CudaSlice<i32>,
         global_tables: &'a GlobalTables,
     },
+    /// A mixed step's rows: the prompt occupies `[0, prefill_len)` and the
+    /// live decode batch the suffix. The prefix preps like a single prompt,
+    /// the suffix like a batched step at a row offset; the local plan the
+    /// caller passes is the ragged one covering every row, and the global
+    /// family reads its prefix through `global_prefill_plan` and its suffix
+    /// through the step tables.
+    Mixed {
+        prefill_len: usize,
+        prefill_start: usize,
+        prefill_origin: usize,
+        local_origins: &'a CudaSlice<i32>,
+        local_pages: &'a CudaSlice<i32>,
+        local_indptr: &'a CudaSlice<i32>,
+        global_tables: &'a GlobalTables,
+        global_prefill_plan: &'a PrefillPagedPlan,
+    },
 }
 
 struct GemmaStepPlan {
@@ -725,6 +741,74 @@ impl GemmaServe {
                     geom.rms_norm_eps,
                 )?;
             }
+            PrepRef::Mixed {
+                prefill_len,
+                prefill_start,
+                prefill_origin,
+                local_origins,
+                local_pages,
+                local_indptr,
+                global_tables,
+                ..
+            } => {
+                // Prefix as a single prompt — the ragged plan holds its
+                // pages at the front of the concatenated table — then the
+                // suffix as a batched step at the row offset.
+                scratch.q_states.seq_len = prefill_len;
+                scratch.k_states.seq_len = prefill_len;
+                scratch.v_states.seq_len = prefill_len;
+                scratch.q_prep.seq_len = prefill_len;
+                ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
+                    ctx,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &scratch.v_states,
+                    &mut scratch.q_prep,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.sliding_cos,
+                    &self.sliding_sin,
+                    family_layer,
+                    local_plan.page_indices_d(),
+                    prefill_origin,
+                    prefill_start,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+                scratch.q_states.seq_len = seq_len;
+                scratch.k_states.seq_len = seq_len;
+                scratch.v_states.seq_len = seq_len;
+                scratch.q_prep.seq_len = seq_len;
+                ops::qkv_norm_rope_paged_decode_hd256_plain_into(
+                    ctx,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &scratch.v_states,
+                    &mut scratch.q_prep,
+                    prefill_len,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.sliding_cos,
+                    &self.sliding_sin,
+                    family_layer,
+                    local_pages,
+                    local_indptr,
+                    local_origins,
+                    &global_tables.positions,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+            }
         }
 
         let window_left = i32::try_from(self.sliding_window - 1).expect("window fits i32");
@@ -886,6 +970,115 @@ impl GemmaServe {
                     &mut split.tmp_v,
                     &mut split.tmp_s,
                     factor * seq_len * split.cap,
+                    &mut scratch.attn,
+                    geom.num_q_heads / factor,
+                    1.0,
+                )?;
+                scratch.q_prep.hidden_dim = q_dim;
+                scratch.q_prep.seq_len = seq_len;
+                scratch.attn.hidden_dim = q_dim;
+                scratch.attn.seq_len = seq_len;
+            }
+            PrepRef::Mixed {
+                prefill_len,
+                prefill_start,
+                global_tables,
+                global_prefill_plan,
+                ..
+            } => {
+                let split = split.context("mixed global decode needs the split-KV state")?;
+                scratch.q_states.seq_len = prefill_len;
+                scratch.k_states.seq_len = prefill_len;
+                scratch.q_prep.seq_len = prefill_len;
+                ops::qk_norm_partial_rope_paged_prefill_hd512_into(
+                    ctx,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &mut scratch.q_prep,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.global_cos,
+                    &self.global_sin,
+                    family_layer,
+                    global_prefill_plan.page_indices_d(),
+                    prefill_start,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+                scratch.q_states.seq_len = seq_len;
+                scratch.k_states.seq_len = seq_len;
+                scratch.q_prep.seq_len = seq_len;
+                ops::qk_norm_partial_rope_paged_decode_hd512_into(
+                    ctx,
+                    &scratch.q_states,
+                    &scratch.k_states,
+                    &mut scratch.q_prep,
+                    prefill_len,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.global_cos,
+                    &self.global_sin,
+                    family_layer,
+                    &global_tables.pages,
+                    &global_tables.indptr,
+                    &global_tables.positions,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+                // The prompt's rows read through the per-prompt plan; the
+                // suffix through the native split entry at the pseudo-row
+                // offset — the same kernel and chunk plan as a pure decode
+                // step.
+                scratch.q_prep.seq_len = prefill_len;
+                scratch.attn.seq_len = prefill_len;
+                ops::batch_prefill_paged_hd512_into(
+                    ctx,
+                    &scratch.q_prep,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    family_layer,
+                    global_prefill_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                    1.0,
+                )?;
+                let batch = seq_len - prefill_len;
+                let factor = self.global_split_factor;
+                scratch.q_prep.hidden_dim = q_dim / factor;
+                scratch.q_prep.seq_len = factor * seq_len;
+                scratch.attn.hidden_dim = q_dim / factor;
+                scratch.attn.seq_len = factor * seq_len;
+                let meta = ops::Hd512DecodeMetadata::new(
+                    &global_tables.pseudo_pages,
+                    &global_tables.pseudo_indptr,
+                    &global_tables.pseudo_last,
+                    &split.request_indices_d,
+                    &split.kv_tile_indices_d,
+                    &split.chunk_size_d,
+                );
+                ops::paged_attention_batch_decode_split_kv_hd512_into(
+                    ctx,
+                    &scratch.q_prep,
+                    factor * prefill_len,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    family_layer,
+                    &meta,
+                    &split.o_indptr_d,
+                    &split.valid_mask_d,
+                    &mut split.tmp_v,
+                    &mut split.tmp_s,
+                    factor * batch * split.cap,
                     &mut scratch.attn,
                     geom.num_q_heads / factor,
                     1.0,
@@ -1424,53 +1617,24 @@ impl GemmaServe {
             .map_err(|e| anyhow::anyhow!("mixed step ids H2D failed: {e}"))?;
         let mut tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, rows)?;
         tower.open(rows)?;
-        ops::embedding_batch(ctx, &self.weights.embed_tokens, &ids, &mut tower.hidden[0])?;
-        ops::scale_bf16_in_place(
+        let src = self.run_tower(
             ctx,
-            &mut tower.hidden[0],
-            embed_scale_bf16(self.local_geom.hidden_size),
+            &mut tower,
+            &ids,
+            rows,
+            &local_plan,
+            PrepRef::Mixed {
+                prefill_len,
+                prefill_start,
+                prefill_origin,
+                local_origins: &*origins_slot,
+                local_pages: &local_pages_t,
+                local_indptr: &local_indptr_t,
+                global_tables: &*global_tables,
+                global_prefill_plan: &global_prefill_plan,
+            },
+            Some(global_split),
         )?;
-        let mut src = 0usize;
-        for (index, kind) in self.weights.config.layer_types.iter().enumerate() {
-            let layer = &self.weights.layers[index];
-            let family_layer = self.family_index[index];
-            match kind {
-                LayerKind::Sliding => {
-                    self.local_layer_mixed(
-                        ctx,
-                        &mut tower,
-                        layer,
-                        family_layer,
-                        prefill_len,
-                        prefill_origin,
-                        prefill_start,
-                        rows,
-                        &local_plan,
-                        &local_pages_t,
-                        &local_indptr_t,
-                        origins_slot,
-                        &global_tables.positions,
-                        src,
-                    )?;
-                }
-                LayerKind::Global => {
-                    self.global_layer_mixed(
-                        ctx,
-                        &mut tower,
-                        layer,
-                        family_layer,
-                        prefill_len,
-                        prefill_start,
-                        rows,
-                        &global_prefill_plan,
-                        global_tables,
-                        global_split,
-                        src,
-                    )?;
-                }
-            }
-            src ^= 1;
-        }
         // The sampled rows — the prompt's last plus the decode suffix — are
         // one contiguous range; compact them into the free ping-pong slot
         // and run the batch + 1 rows through the LM head.
@@ -1514,303 +1678,6 @@ impl GemmaServe {
             kv.global.advance(1);
         }
         Ok(logits)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn local_layer_mixed(
-        &self,
-        ctx: &DeviceContext,
-        tower: &mut TowerScratch,
-        layer: &Gemma4Layer,
-        family_layer: usize,
-        prefill_len: usize,
-        prefill_origin: usize,
-        prefill_start: usize,
-        rows: usize,
-        local_plan: &PrefillPagedPlan,
-        local_pages: &CudaSlice<i32>,
-        local_indptr: &CudaSlice<i32>,
-        local_origins: &CudaSlice<i32>,
-        positions: &CudaSlice<i32>,
-        src: usize,
-    ) -> Result<()> {
-        let geom = &self.local_geom;
-        let q_dim = geom.num_q_heads * geom.head_dim;
-        let kv_dim = geom.num_kv_heads * geom.head_dim;
-        let v_proj = layer
-            .attention
-            .v_proj
-            .as_ref()
-            .context("local layer requires v_proj")?;
-        let TowerScratch {
-            attn: scratch,
-            epilogue,
-            hidden,
-        } = tower;
-        scratch.set(geom, rows);
-        let (x, out) = hidden_pair(hidden, src);
-
-        ops::rms_norm_batch_into(
-            ctx,
-            x,
-            &layer.input_layernorm,
-            geom.rms_norm_eps,
-            &mut scratch.normed_x,
-        );
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.q_proj,
-            0,
-            q_dim,
-            &scratch.normed_x,
-            &mut scratch.q_states,
-        )?;
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.k_proj,
-            0,
-            kv_dim,
-            &scratch.normed_x,
-            &mut scratch.k_states,
-        )?;
-        ops::gemm_rows_into_checked(
-            ctx,
-            v_proj,
-            0,
-            kv_dim,
-            &scratch.normed_x,
-            &mut scratch.v_states,
-        )?;
-
-        // Prefill segment as prefix views: the ragged plan holds the
-        // prompt's pages at the front of the concatenated table, which is
-        // the prefill prep's contract.
-        scratch.q_states.seq_len = prefill_len;
-        scratch.k_states.seq_len = prefill_len;
-        scratch.v_states.seq_len = prefill_len;
-        scratch.q_prep.seq_len = prefill_len;
-        ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
-            ctx,
-            &scratch.q_states,
-            &scratch.k_states,
-            &scratch.v_states,
-            &mut scratch.q_prep,
-            self.local_pool.buffer(),
-            &self.local_pool.layout().kernel_layout(),
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.sliding_cos,
-            &self.sliding_sin,
-            family_layer,
-            local_plan.page_indices_d(),
-            prefill_origin,
-            prefill_start,
-            self.cos_max_pos,
-            geom.num_q_heads,
-            geom.num_kv_heads,
-            geom.head_dim,
-            geom.rms_norm_eps,
-        )?;
-        scratch.q_states.seq_len = rows;
-        scratch.k_states.seq_len = rows;
-        scratch.v_states.seq_len = rows;
-        scratch.q_prep.seq_len = rows;
-        ops::qkv_norm_rope_paged_decode_hd256_plain_into(
-            ctx,
-            &scratch.q_states,
-            &scratch.k_states,
-            &scratch.v_states,
-            &mut scratch.q_prep,
-            prefill_len,
-            self.local_pool.buffer(),
-            &self.local_pool.layout().kernel_layout(),
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.sliding_cos,
-            &self.sliding_sin,
-            family_layer,
-            local_pages,
-            local_indptr,
-            local_origins,
-            positions,
-            self.cos_max_pos,
-            geom.num_q_heads,
-            geom.num_kv_heads,
-            geom.head_dim,
-            geom.rms_norm_eps,
-        )?;
-
-        let window_left = i32::try_from(self.sliding_window - 1).expect("window fits i32");
-        ops::batch_prefill_paged_window_hd256_into(
-            ctx,
-            &scratch.q_prep,
-            self.local_pool.buffer(),
-            &self.local_pool.layout().kernel_layout(),
-            family_layer,
-            local_plan,
-            &mut scratch.attn,
-            geom.num_q_heads,
-            1.0,
-            window_left,
-        )?;
-        attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn global_layer_mixed(
-        &self,
-        ctx: &DeviceContext,
-        tower: &mut TowerScratch,
-        layer: &Gemma4Layer,
-        family_layer: usize,
-        prefill_len: usize,
-        prefill_start: usize,
-        rows: usize,
-        global_plan: &PrefillPagedPlan,
-        global_tables: &GlobalTables,
-        split: &mut SplitKvState,
-        src: usize,
-    ) -> Result<()> {
-        let geom = &self.global_geom;
-        let q_dim = geom.num_q_heads * geom.head_dim;
-        let kv_dim = geom.num_kv_heads * geom.head_dim;
-        anyhow::ensure!(
-            layer.attention.v_proj.is_none(),
-            "global layer must not carry a v_proj; V is the k_proj fork"
-        );
-        let TowerScratch {
-            attn: scratch,
-            epilogue,
-            hidden,
-        } = tower;
-        scratch.set(geom, rows);
-        let (x, out) = hidden_pair(hidden, src);
-
-        ops::rms_norm_batch_into(
-            ctx,
-            x,
-            &layer.input_layernorm,
-            geom.rms_norm_eps,
-            &mut scratch.normed_x,
-        );
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.q_proj,
-            0,
-            q_dim,
-            &scratch.normed_x,
-            &mut scratch.q_states,
-        )?;
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.k_proj,
-            0,
-            kv_dim,
-            &scratch.normed_x,
-            &mut scratch.k_states,
-        )?;
-
-        scratch.q_states.seq_len = prefill_len;
-        scratch.k_states.seq_len = prefill_len;
-        scratch.q_prep.seq_len = prefill_len;
-        ops::qk_norm_partial_rope_paged_prefill_hd512_into(
-            ctx,
-            &scratch.q_states,
-            &scratch.k_states,
-            &mut scratch.q_prep,
-            self.global_pool.buffer(),
-            &self.global_pool.layout().kernel_layout(),
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.global_cos,
-            &self.global_sin,
-            family_layer,
-            global_plan.page_indices_d(),
-            prefill_start,
-            self.cos_max_pos,
-            geom.num_q_heads,
-            geom.num_kv_heads,
-            geom.head_dim,
-            geom.rms_norm_eps,
-        )?;
-        scratch.q_states.seq_len = rows;
-        scratch.k_states.seq_len = rows;
-        scratch.q_prep.seq_len = rows;
-        ops::qk_norm_partial_rope_paged_decode_hd512_into(
-            ctx,
-            &scratch.q_states,
-            &scratch.k_states,
-            &mut scratch.q_prep,
-            prefill_len,
-            self.global_pool.buffer(),
-            &self.global_pool.layout().kernel_layout(),
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.global_cos,
-            &self.global_sin,
-            family_layer,
-            &global_tables.pages,
-            &global_tables.indptr,
-            &global_tables.positions,
-            self.cos_max_pos,
-            geom.num_q_heads,
-            geom.num_kv_heads,
-            geom.head_dim,
-            geom.rms_norm_eps,
-        )?;
-
-        // The prompt's rows read through the per-prompt plan; the decode
-        // suffix reads through the native split entry — the same kernel and
-        // chunk plan as a pure decode step.
-        scratch.q_prep.seq_len = prefill_len;
-        scratch.attn.seq_len = prefill_len;
-        ops::batch_prefill_paged_hd512_into(
-            ctx,
-            &scratch.q_prep,
-            self.global_pool.buffer(),
-            &self.global_pool.layout().kernel_layout(),
-            family_layer,
-            global_plan,
-            &mut scratch.attn,
-            geom.num_q_heads,
-            1.0,
-        )?;
-        let batch = rows - prefill_len;
-        let factor = self.global_split_factor;
-        scratch.q_prep.hidden_dim = q_dim / factor;
-        scratch.q_prep.seq_len = factor * rows;
-        scratch.attn.hidden_dim = q_dim / factor;
-        scratch.attn.seq_len = factor * rows;
-        let meta = ops::Hd512DecodeMetadata::new(
-            &global_tables.pseudo_pages,
-            &global_tables.pseudo_indptr,
-            &global_tables.pseudo_last,
-            &split.request_indices_d,
-            &split.kv_tile_indices_d,
-            &split.chunk_size_d,
-        );
-        ops::paged_attention_batch_decode_split_kv_hd512_into(
-            ctx,
-            &scratch.q_prep,
-            factor * prefill_len,
-            self.global_pool.buffer(),
-            &self.global_pool.layout().kernel_layout(),
-            family_layer,
-            &meta,
-            &split.o_indptr_d,
-            &split.valid_mask_d,
-            &mut split.tmp_v,
-            &mut split.tmp_s,
-            factor * batch * split.cap,
-            &mut scratch.attn,
-            geom.num_q_heads / factor,
-            1.0,
-        )?;
-        scratch.q_prep.hidden_dim = q_dim;
-        scratch.q_prep.seq_len = rows;
-        scratch.attn.hidden_dim = q_dim;
-        scratch.attn.seq_len = rows;
-        attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
     }
 
     /// Host-side preparation a decode step and its capture share: checks,
