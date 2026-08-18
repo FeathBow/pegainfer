@@ -532,3 +532,126 @@ fn batched_decode_prep_matches_closed_form() {
     }
     assert_pool(&got, &exp);
 }
+
+/// The row-offset suffix contract: with `row_offset = 1` over three rows,
+/// the decode prep must leave the prefix row of `q_out` untouched, and its
+/// suffix outputs and pool writes must equal a zero-offset run over the
+/// same two suffix rows.
+#[test]
+fn decode_prep_row_offset_serves_only_the_suffix() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let batch = 2usize;
+    let positions: [i32; 2] = [3, 3];
+    let origins: [i32; 2] = [1, 0];
+    let pages_cat: [i32; 3] = [7, 3, 5];
+    let indptr: [i32; 3] = [0, 1, 3];
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
+
+    // Shared suffix bytes: the offset arm's rows [1..3) are byte-identical
+    // to the zero-offset arm's rows [0..2); its prefix row is filler the
+    // prep must neither read through nor overwrite.
+    let suffix = |base: f32, heads: usize| -> Vec<bf16> {
+        let mut host = Vec::new();
+        for t in 0..batch {
+            for h in 0..heads {
+                host.extend(vec![bf16::from_f32(signed(base, h, t)); HD]);
+            }
+        }
+        host
+    };
+    let with_prefix = |sfx: &[bf16], heads: usize| -> Vec<bf16> {
+        let mut host = vec![bf16::from_f32(FILLER); heads * HD];
+        host.extend_from_slice(sfx);
+        host
+    };
+    let (qs, ks, vs) = (
+        suffix(Q_BASE, NUM_Q_HEADS),
+        suffix(K_BASE, NUM_KV_HEADS),
+        suffix(V_BASE, NUM_KV_HEADS),
+    );
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, COS_MAX_POS, HD);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+    let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
+    let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
+    let origins_d: CudaSlice<i32> = ctx.stream.clone_htod(&origins).expect("origins H2D");
+    let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
+
+    let run = |offset: usize, q_host: &[bf16], k_host: &[bf16], v_host: &[bf16]| {
+        let rows = offset + batch;
+        let q = HiddenStates::from_host(ctx, q_host, Q_DIM, rows).expect("q H2D");
+        let k = HiddenStates::from_host(ctx, k_host, KV_DIM, rows).expect("k H2D");
+        let v = HiddenStates::from_host(ctx, v_host, KV_DIM, rows).expect("v H2D");
+        let sentinel = vec![bf16::from_f32(SENTINEL); Q_DIM * rows];
+        let mut q_out = HiddenStates::from_host(ctx, &sentinel, Q_DIM, rows).expect("q_out H2D");
+        let pool: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros(layout.page_stride * POOL_PAGES)
+            .expect("pool alloc");
+        qkv_norm_rope_paged_decode_hd256_plain_into(
+            ctx,
+            &q,
+            &k,
+            &v,
+            &mut q_out,
+            offset,
+            &pool,
+            &layout,
+            &qn,
+            &kn,
+            &cos_dev,
+            &sin_dev,
+            layer,
+            &pages_d,
+            &indptr_d,
+            &origins_d,
+            &positions_d,
+            COS_MAX_POS,
+            NUM_Q_HEADS,
+            NUM_KV_HEADS,
+            HD,
+            EPS,
+        )
+        .expect("decode prep launch");
+        let out: Vec<u32> = q_out
+            .to_host(ctx)
+            .expect("q_out D2H")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
+        let pool_bits: Vec<u16> = pool_host.iter().map(|x| x.to_bits()).collect();
+        (out, pool_bits)
+    };
+
+    let (out_a, pool_a) = run(
+        1,
+        &with_prefix(&qs, NUM_Q_HEADS),
+        &with_prefix(&ks, NUM_KV_HEADS),
+        &with_prefix(&vs, NUM_KV_HEADS),
+    );
+    let (out_b, pool_b) = run(0, &qs, &ks, &vs);
+
+    let sentinel_bits = bf16::from_f32(SENTINEL).to_f32().to_bits();
+    assert!(
+        out_a[..Q_DIM].iter().all(|&b| b == sentinel_bits),
+        "the prefix row of q_out must stay untouched"
+    );
+    assert_eq!(
+        out_a[Q_DIM..],
+        out_b[..],
+        "suffix q_out rows must match the zero-offset run bit for bit"
+    );
+    assert_eq!(
+        pool_a, pool_b,
+        "pool writes must match the zero-offset run bit for bit"
+    );
+}

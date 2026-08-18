@@ -697,6 +697,140 @@ fn mixed_step_matches_serial_greedy() {
     }
 }
 
+/// A mixed admission whose prompt crosses the 1024-token sliding window —
+/// the window front releases inside the same step that live lanes decode
+/// in — must be token-exact against a serial admission with the same batch
+/// composition everywhere else: both arms share the opening rounds and the
+/// batch-2 rounds after admission, and differ only in the admission itself
+/// (one mixed step versus a plain prefill plus one live decode round).
+/// Synthetic ids suffice: the gate is a self-A/B over window arithmetic.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+fn mixed_step_crosses_the_window_like_serial() {
+    let (ctx, serve, _dir) = stack_with(2048, 512);
+    let partner: Vec<u32> = (0..40u32).map(|i| 1000 + i * 31).collect();
+    let long_prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 37) % 50000).collect();
+    let budgets = [24usize, 20];
+
+    let run_arm = |mixed: bool| -> Vec<Vec<u32>> {
+        let mut arena = serve.alloc_step_arena(&ctx, 2, false).expect("step arena");
+        let mut lanes: Vec<(usize, GemmaKv, u32)> = Vec::new();
+        let mut produced: Vec<Vec<u32>> = vec![Vec::new(); 2];
+
+        {
+            let mut kv = serve.alloc_kv();
+            admit_tokens(
+                &serve.local_pool,
+                &serve.global_pool,
+                &mut kv,
+                partner.len(),
+            )
+            .expect("admit partner");
+            let logits = serve
+                .step(&ctx, &mut kv, &partner, LogitsSpan::LastRow)
+                .expect("prefill partner");
+            let first = argmax_last(&ctx, &logits).expect("first token");
+            produced[0].push(first);
+            lanes.push((0, kv, first));
+        }
+        mixed_gate_decode_rounds(
+            &ctx,
+            &serve,
+            &mut arena,
+            &mut lanes,
+            &mut produced,
+            &budgets,
+            3,
+        );
+
+        let mut kv = serve.alloc_kv();
+        admit_tokens(
+            &serve.local_pool,
+            &serve.global_pool,
+            &mut kv,
+            long_prompt.len(),
+        )
+        .expect("admit long prompt");
+        let first = if mixed {
+            // The long prompt rides the live lane; its prefill crosses the
+            // window inside the mixed step.
+            for (_, lane_kv, _) in &mut lanes {
+                admit_tokens(&serve.local_pool, &serve.global_pool, lane_kv, 1)
+                    .expect("admit decode");
+            }
+            let tokens: Vec<u32> = lanes.iter().map(|(_, _, next)| *next).collect();
+            let (vocab, host);
+            {
+                let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+                let logits = serve
+                    .mixed_prefill_decode_step(
+                        &ctx,
+                        &mut arena,
+                        &mut kv,
+                        &long_prompt,
+                        &mut kvs,
+                        &tokens,
+                    )
+                    .expect("mixed step");
+                vocab = logits.hidden_dim;
+                host = logits.to_host(&ctx).expect("logits D2H");
+            }
+            assert!(
+                kv.local.origin_pages() > 0,
+                "the mixed prefill must have released its window front (origin {})",
+                kv.local.origin_pages()
+            );
+            for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
+                let token = mixed_gate_argmax(&host, row + 1, vocab);
+                produced[*req].push(token);
+                *next = token;
+            }
+            mixed_gate_argmax(&host, 0, vocab)
+        } else {
+            let logits = serve
+                .step(&ctx, &mut kv, &long_prompt, LogitsSpan::LastRow)
+                .expect("prefill long prompt");
+            let first = argmax_last(&ctx, &logits).expect("first token");
+            mixed_gate_decode_rounds(
+                &ctx,
+                &serve,
+                &mut arena,
+                &mut lanes,
+                &mut produced,
+                &budgets,
+                1,
+            );
+            first
+        };
+        produced[1].push(first);
+        lanes.push((1, kv, first));
+
+        mixed_gate_decode_rounds(
+            &ctx,
+            &serve,
+            &mut arena,
+            &mut lanes,
+            &mut produced,
+            &budgets,
+            usize::MAX,
+        );
+        produced
+    };
+
+    let serial = run_arm(false);
+    let produced = run_arm(true);
+    for (i, name) in ["partner", "newcomer"].iter().enumerate() {
+        assert_eq!(
+            produced[i], serial[i],
+            "{name}: window-crossing mixed admission diverged from the serial path"
+        );
+        eprintln!(
+            "{name}: {} tokens mixed crossing == serial",
+            serial[i].len()
+        );
+    }
+}
+
 /// One serving-path decode step for a single request: the batched decode
 /// entry at batch one on an eager arena. The graph path is anchored to this
 /// by the ragged determinism gate's replay-vs-eager comparison.
