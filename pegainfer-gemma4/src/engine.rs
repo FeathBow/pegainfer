@@ -147,7 +147,13 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                     };
                     attempts += 1;
                     let can_wait = !active.is_empty();
-                    match state.admit_and_prefill(item, can_wait, &mut active, &mut pending) {
+                    match state.admit_and_prefill(
+                        item,
+                        can_wait,
+                        &mut active,
+                        &mut pending,
+                        &mut attempts,
+                    ) {
                         Admitted::Active(request) => active.push(*request),
                         Admitted::Done => {}
                         Admitted::Requeue(item) => {
@@ -561,6 +567,7 @@ impl EngineState {
         can_wait: bool,
         active: &mut Vec<Active>,
         pending: &mut VecDeque<Submitted>,
+        attempts: &mut usize,
     ) -> Admitted {
         let (request, prefix) = item;
         let sink = request.token_tx.clone();
@@ -651,25 +658,26 @@ impl EngineState {
                 // pool-refused or over-budget candidate returns to the queue
                 // head and stops the gather — the engine loop's
                 // head-of-line-waits semantics — and an invalid one is
-                // rejected in place. Every popped candidate counts against
-                // the scan bound, rejected or not, so a queue of dead
-                // submissions cannot stall the decode round.
+                // rejected in place. Every popped candidate consumes the
+                // turn's shared admission budget, gathered or not, so a
+                // queue of dead submissions cannot stall the decode round.
+                // The row pricing runs after the prefix-cache resolve: a
+                // warm candidate costs the step only its unseen suffix.
                 let mut newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)> =
                     vec![(request, kv, resumed)];
                 let mut rows_budget = {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
-                let mut scanned = 0usize;
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && rows_budget < MIX_GATHER_ROWS
                     && newcomers.len() + active.len() < MAX_CONCURRENCY
-                    && scanned < MAX_CONCURRENCY
+                    && *attempts < MAX_CONCURRENCY
                 {
                     let Some((cand, cand_prefix)) = pending.pop_front() else {
                         break;
                     };
-                    scanned += 1;
+                    *attempts += 1;
                     let cand_sink = cand.token_tx.clone();
                     if cand_sink.is_closed() {
                         continue;
@@ -686,10 +694,6 @@ impl EngineState {
                         continue;
                     }
                     let cand_len = cand.prompt_tokens.len();
-                    if rows_budget + cand_len > MIX_GATHER_ROWS {
-                        pending.push_front((cand, cand_prefix));
-                        break;
-                    }
                     let mut cand_resumed = None;
                     let mut cand_kv = match self
                         .prefix_cache
@@ -713,6 +717,10 @@ impl EngineState {
                         None => self.serve.alloc_kv(),
                     };
                     let new_tokens = cand_len - cand_kv.local.seq_len();
+                    if rows_budget + new_tokens > MIX_GATHER_ROWS {
+                        pending.push_front((cand, cand_prefix));
+                        break;
+                    }
                     if admit_tokens(
                         &self.serve.local_pool,
                         &self.serve.global_pool,
@@ -727,7 +735,7 @@ impl EngineState {
                     if !send_scheduled(&cand, cand_len, cand_kv.local.seq_len()) {
                         continue;
                     }
-                    rows_budget += cand_len - cand_kv.local.seq_len();
+                    rows_budget += new_tokens;
                     newcomers.push((cand, cand_kv, cand_resumed));
                 }
                 return self.mixed_admission(newcomers, active);
@@ -1535,6 +1543,90 @@ mod lane_tests {
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
     fn the_green_lane_engine_lifecycle_completes() {
         lane_lifecycle_script("green:35");
+    }
+
+    /// The production gather against one live engine, interleavings pinned:
+    /// the streamer's budget outlasts the script and its sink drops last,
+    /// so the decode batch is never empty and every admission takes the
+    /// gather path. Dead and invalid submissions queued ahead of a valid
+    /// prompt drain within the shared admission budget without wedging the
+    /// engine; a warm prefix-cache hit whose rendered prompt exceeds the
+    /// gather ceiling but whose unseen suffix does not still resolves and
+    /// completes; and every survivor finishes its full budget.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
+    fn the_gather_engine_lifecycle_completes() {
+        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
+        // so no other thread reads the environment concurrently.
+        unsafe {
+            std::env::set_var("PEGAINFER_PREFIX_CACHE", "4");
+        }
+        let handle = super::start(Path::new(&dir), &EngineLoadOptions::default());
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("PEGAINFER_PREFIX_CACHE");
+        }
+        let handle = handle.expect("engine start");
+
+        let mut streamer = submit(&handle, ids(40, 0), 1024);
+        let mut seen = 0;
+        while seen < 2 {
+            match streamer.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Token { .. }) => seen += 1,
+                Some(TokenEvent::Error { message, .. }) => panic!("streamer: {message}"),
+                Some(_) => {}
+                None => panic!("streamer closed early"),
+            }
+        }
+
+        // Dead and invalid submissions ahead of a valid prompt: the gather
+        // drains them against the shared budget and the valid one lands.
+        drop(submit(&handle, ids(50, 1), 4));
+        drop(submit(&handle, ids(50, 2), 4));
+        let mut invalid_rx = submit(&handle, Vec::new(), 4);
+        let mut valid_rx = submit(&handle, ids(60, 3), 4);
+        loop {
+            match invalid_rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Rejected { message, .. }) => {
+                    assert!(message.contains("empty prompt"), "unexpected: {message}");
+                    break;
+                }
+                Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
+                    panic!("an empty prompt must be rejected")
+                }
+                Some(_) => {}
+                None => panic!("invalid submission lost its rejection"),
+            }
+        }
+        let valid = drain(&mut valid_rx, "valid after the corpses");
+        assert_eq!((valid.tokens, valid.finish), (4, FinishReason::Length));
+
+        // Warm gather: a captured long conversation resumes with a short
+        // suffix while a short primary sits ahead in the same intake — the
+        // rendered prompt is far past the gather ceiling, its unseen suffix
+        // far under it.
+        let long_prompt = ids(1600, 7);
+        let mut long_rx = submit(&handle, long_prompt.clone(), 4);
+        let long_done = drain(&mut long_rx, "long prefill");
+        assert_eq!(
+            (long_done.tokens, long_done.finish),
+            (4, FinishReason::Length)
+        );
+        let mut warm_prompt = long_prompt;
+        warm_prompt.extend(ids(60, 11));
+        let mut head_rx = submit(&handle, ids(60, 13), 4);
+        let mut warm_rx = submit(&handle, warm_prompt, 4);
+        let head = drain(&mut head_rx, "gather head");
+        assert_eq!((head.tokens, head.finish), (4, FinishReason::Length));
+        let warm = drain(&mut warm_rx, "warm gathered suffix");
+        assert_eq!((warm.tokens, warm.finish), (4, FinishReason::Length));
+        assert_eq!(
+            warm.cached, 1600,
+            "the warm admission must resume at the captured frontier"
+        );
+
+        drop(streamer);
     }
 
     #[test]
