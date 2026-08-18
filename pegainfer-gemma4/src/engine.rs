@@ -745,12 +745,15 @@ impl EngineState {
     ) -> Admitted {
         let lane = self.lane.as_mut().expect("gated by the caller");
         debug_assert!(lane.inflight.is_none());
+        // A restored prefix is already in the KV: the lane prefills only the
+        // unseen suffix, exactly like the sync and mixed paths.
+        let resume = kv.local.seq_len();
         let launched = {
             let _guard = unsafe {
                 pegainfer_core::tensor::StreamOverrideGuard::activate(lane.stream.stream)
             };
             self.serve
-                .prefill_into_logits(&self.ctx, &mut kv, &request.prompt_tokens)
+                .prefill_into_logits(&self.ctx, &mut kv, &request.prompt_tokens[resume..])
         };
         let recorded = launched.and_then(|pass| {
             lane.stream
@@ -796,6 +799,21 @@ impl EngineState {
             mut pass,
             resumed,
         } = inflight;
+        // The frontier after any prefill equals the prompt length; a lane
+        // pass that processed the wrong suffix cannot pass this gate.
+        if kv.local.seq_len() != request.prompt_tokens.len() {
+            log::error!(
+                "gemma4 async prefill frontier {} != prompt {}",
+                kv.local.seq_len(),
+                request.prompt_tokens.len()
+            );
+            let _ = request.token_tx.send(TokenEvent::Error {
+                message: "async prefill frontier mismatch".into(),
+                prompt_tokens: request.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+            return;
+        }
         if let Err(err) = self.serve.release_prefill_window(&mut kv) {
             let _ = request.token_tx.send(TokenEvent::Error {
                 message: format!("prefill window release failed: {err:#}"),
