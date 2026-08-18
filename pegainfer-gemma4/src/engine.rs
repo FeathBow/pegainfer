@@ -456,6 +456,17 @@ fn parse_mix_chunk_tokens(raw: &str) -> Result<Option<usize>> {
 /// there, and a long prompt keeps its own step.
 const MIX_GATHER_ROWS: usize = 512;
 
+/// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
+/// holds the token its final segment sampled until the walker graduates.
+struct Walker {
+    request: GenerateRequest,
+    kv: GemmaKv,
+    resumed: Option<u64>,
+    offset: usize,
+    first: Option<(u32, Option<TokenLogprob>)>,
+    failed: bool,
+}
+
 /// One newcomer row of a mixed step's logits head, ahead of the active
 /// rows: its sampling params, its logprob request (0 = none), and whether
 /// its pick may stop it — a mid-walk segment's row is sampled and
@@ -1103,23 +1114,16 @@ impl EngineState {
     /// walkers in admission order on top of the live decode batch — the
     /// streams advance one token per round instead of waiting out whole
     /// prompts. Each round samples every segment's last row; only a
-    /// walker's final segment's row is kept as its first token. A drained
-    /// roster finishes the remaining tails on the plain path, one whole
-    /// scan each; walkers join the batch together when the walk ends.
+    /// walker's final segment's row is kept as its first token, and that
+    /// walker graduates into the decode batch at the round boundary. A
+    /// drained roster finishes the remaining tails on the plain path, one
+    /// whole scan each.
     fn mixed_walk(
         &mut self,
         chunk: usize,
         newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
         active: &mut Vec<Active>,
     ) -> Admitted {
-        struct Walker {
-            request: GenerateRequest,
-            kv: GemmaKv,
-            resumed: Option<u64>,
-            offset: usize,
-            first: Option<(u32, Option<TokenLogprob>)>,
-            failed: bool,
-        }
         let mut walkers: Vec<Walker> = newcomers
             .into_iter()
             .map(|(request, kv, resumed)| Walker {
@@ -1139,6 +1143,17 @@ impl EngineState {
             for w in &mut walkers {
                 if !w.failed && w.request.token_tx.is_closed() {
                     w.failed = true;
+                }
+            }
+            // A finished walker graduates at the round boundary instead of
+            // idling out the other walkers.
+            let mut i = 0;
+            while i < walkers.len() {
+                if !walkers[i].failed && walkers[i].first.is_some() {
+                    let w = walkers.remove(i);
+                    self.graduate_walker(w, active);
+                } else {
+                    i += 1;
                 }
             }
             if !walkers
@@ -1323,70 +1338,62 @@ impl EngineState {
             }
         }
 
-        // Every walker's first token came from its final segment; capture
-        // and join the batch exactly like the whole-prompt form.
-        for w in walkers {
-            if w.failed {
-                continue;
-            }
-            let Walker {
-                request,
-                kv,
-                resumed,
-                first,
-                ..
-            } = w;
-            let prompt_tokens = request.prompt_tokens.len();
-            let Some((next, logprob)) = first else {
-                let _ = request.token_tx.send(TokenEvent::Error {
-                    message: "the walk produced no first token".into(),
-                    prompt_tokens,
-                    completion_tokens: 0,
-                });
-                continue;
-            };
-            if let Some(cache) = self.prefix_cache.as_mut() {
-                if let Some(entry) =
-                    self.serve
-                        .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
-                {
-                    cache.insert(entry, resumed);
-                }
-            }
-            // The stop token retires the request without being emitted,
-            // the same contract as every other admission path.
-            if !request.params.ignore_eos && self.policy.eos.contains(&next) {
-                let _ = request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
-                    prompt_tokens,
-                    completion_tokens: 0,
-                });
-                continue;
-            }
-            if request
-                .token_tx
-                .send(TokenEvent::Token { id: next, logprob })
-                .is_err()
-            {
-                continue;
-            }
-            if request.max_tokens <= 1 {
-                let _ = request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Length,
-                    prompt_tokens,
-                    completion_tokens: 1,
-                });
-                continue;
-            }
-            active.push(Active {
-                request,
-                kv,
-                next,
-                emitted: 1,
-                prompt_tokens,
-            });
-        }
         Admitted::Done
+    }
+
+    /// One finished walker joins the batch at its round boundary: capture
+    /// its prompt state, then emit or retire its first token exactly like
+    /// the whole-prompt form.
+    fn graduate_walker(&mut self, w: Walker, active: &mut Vec<Active>) {
+        let Walker {
+            request,
+            kv,
+            resumed,
+            first,
+            ..
+        } = w;
+        let prompt_tokens = request.prompt_tokens.len();
+        let (next, logprob) = first.expect("graduation follows a final segment");
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            if let Some(entry) =
+                self.serve
+                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+            {
+                cache.insert(entry, resumed);
+            }
+        }
+        // The stop token retires the request without being emitted, the
+        // same contract as every other admission path.
+        if !request.params.ignore_eos && self.policy.eos.contains(&next) {
+            let _ = request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens,
+                completion_tokens: 0,
+            });
+            return;
+        }
+        if request
+            .token_tx
+            .send(TokenEvent::Token { id: next, logprob })
+            .is_err()
+        {
+            return;
+        }
+        if request.max_tokens <= 1 {
+            let _ = request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens,
+                completion_tokens: 1,
+            });
+            return;
+        }
+        active.push(Active {
+            request,
+            kv,
+            next,
+            emitted: 1,
+            prompt_tokens,
+        });
     }
 
     /// Retire every active request the next step cannot serve — a closed
