@@ -651,20 +651,25 @@ impl EngineState {
                 // pool-refused or over-budget candidate returns to the queue
                 // head and stops the gather — the engine loop's
                 // head-of-line-waits semantics — and an invalid one is
-                // rejected in place.
+                // rejected in place. Every popped candidate counts against
+                // the scan bound, rejected or not, so a queue of dead
+                // submissions cannot stall the decode round.
                 let mut newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)> =
                     vec![(request, kv, resumed)];
                 let mut rows_budget = {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
+                let mut scanned = 0usize;
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && rows_budget < MIX_GATHER_ROWS
                     && newcomers.len() + active.len() < MAX_CONCURRENCY
+                    && scanned < MAX_CONCURRENCY
                 {
                     let Some((cand, cand_prefix)) = pending.pop_front() else {
                         break;
                     };
+                    scanned += 1;
                     let cand_sink = cand.token_tx.clone();
                     if cand_sink.is_closed() {
                         continue;
