@@ -539,6 +539,8 @@ fn batched_decode_prep_matches_closed_form() {
 /// same two suffix rows.
 #[test]
 fn decode_prep_row_offset_serves_only_the_suffix() {
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
@@ -552,8 +554,6 @@ fn decode_prep_row_offset_serves_only_the_suffix() {
     let origins: [i32; 2] = [1, 0];
     let pages_cat: [i32; 3] = [7, 3, 5];
     let indptr: [i32; 3] = [0, 1, 3];
-    const SENTINEL: f32 = 777.0;
-    const FILLER: f32 = 9.25;
 
     // Shared suffix bytes: the offset arm's rows [1..3) are byte-identical
     // to the zero-offset arm's rows [0..2); its prefix row is filler the

@@ -591,6 +591,8 @@ fn prefill_rejects_undersized_kv_pool() {
 /// a zero-offset run over the same two suffix rows.
 #[test]
 fn decode_prep_row_offset_serves_only_the_suffix() {
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
@@ -603,8 +605,6 @@ fn decode_prep_row_offset_serves_only_the_suffix() {
     let positions: [i32; 2] = [3, 1];
     let pages_cat: [i32; 3] = [3, 7, 5];
     let indptr: [i32; 3] = [0, 2, 3];
-    const SENTINEL: f32 = 777.0;
-    const FILLER: f32 = 9.25;
 
     // Per-row distinct suffix bytes shared between the arms; the offset
     // arm's prefix row is filler the prep must neither read nor overwrite.
@@ -692,6 +692,8 @@ fn decode_prep_row_offset_serves_only_the_suffix() {
 /// query heads over the single KV head keep the GQA group dispatchable.
 #[test]
 fn split_read_row_offset_serves_only_the_suffix() {
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
@@ -701,8 +703,6 @@ fn split_read_row_offset_serves_only_the_suffix() {
     let batch = 2usize;
     let read_heads = 8usize;
     let read_dim = read_heads * HD;
-    const SENTINEL: f32 = 777.0;
-    const FILLER: f32 = 9.25;
 
     // Populate the pool through the zero-offset prep: request 0 writes
     // position 3 into page 7, request 1 writes position 1 into page 5.
