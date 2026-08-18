@@ -430,8 +430,10 @@ impl EngineState {
         base_seed: u64,
         graph_enabled: bool,
     ) -> Result<Self> {
-        // Refuse an unservable global GQA shape before the multi-GiB load.
+        // Refuse an unservable global GQA shape or a bad lane mode before
+        // the multi-GiB load.
         crate::serve::global_split_factor(&crate::config::Gemma4Config::from_file(dir)?)?;
+        let lane_mode = async_prefill_mode()?;
         let (weights, _) = Gemma4Weights::from_safetensors(dir, device)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
@@ -473,7 +475,7 @@ impl EngineState {
             .stream
             .clone_htod(&[bf16::NEG_INFINITY])
             .map_err(|err| anyhow::anyhow!("allocating the suppression sentinel failed: {err}"))?;
-        let lane = match async_prefill_mode()? {
+        let lane = match lane_mode {
             AsyncPrefillMode::Off => None,
             mode => Some(AsyncPrefillLane::new(&ctx, mode)?),
         };
