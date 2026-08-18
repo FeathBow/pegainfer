@@ -831,6 +831,109 @@ fn mixed_step_crosses_the_window_like_serial() {
     }
 }
 
+/// The overlap-safe prefill under a lane-stream override must be bit-equal
+/// to the sync step: identical row-0 logits, the same released-window
+/// shape after the deferred release, and greedy decode over the
+/// lane-written KV matching the sync arm token for token — for a short
+/// prompt and one crossing the sliding window.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+fn overlapped_prefill_matches_the_sync_step() {
+    let (ctx, serve, _dir) = stack_with(2048, 512);
+    let mut arena = serve.alloc_step_arena(&ctx, 1, false).expect("step arena");
+    let budgets = [13usize];
+    for (name, len) in [("short", 40usize), ("crossing", 1500)] {
+        let prompt: Vec<u32> = (0..len as u32).map(|i| 1000 + (i * 37) % 50000).collect();
+
+        let mut kv_sync = serve.alloc_kv();
+        admit_tokens(
+            &serve.local_pool,
+            &serve.global_pool,
+            &mut kv_sync,
+            prompt.len(),
+        )
+        .expect("admit sync");
+        let logits_sync = serve
+            .step(&ctx, &mut kv_sync, &prompt, LogitsSpan::LastRow)
+            .expect("sync prefill");
+        let bits_sync: Vec<u32> = logits_sync
+            .to_host(&ctx)
+            .expect("sync logits D2H")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+
+        let mut kv_lane = serve.alloc_kv();
+        admit_tokens(
+            &serve.local_pool,
+            &serve.global_pool,
+            &mut kv_lane,
+            prompt.len(),
+        )
+        .expect("admit lane");
+        let lane = crate::green_ctx::PrefillLaneStream::shared().expect("lane stream");
+        let pass = {
+            let _guard =
+                unsafe { pegainfer_core::tensor::StreamOverrideGuard::activate(lane.stream) };
+            serve
+                .prefill_into_logits(&ctx, &mut kv_lane, &prompt)
+                .expect("lane prefill")
+        };
+        let sync = unsafe { cudarc::driver::sys::cuStreamSynchronize(lane.stream) };
+        assert_eq!(
+            sync,
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "{name}: lane stream drain"
+        );
+        serve
+            .release_prefill_window(&mut kv_lane)
+            .expect("deferred release");
+        let bits_lane: Vec<u32> = pass
+            .logits
+            .to_host(&ctx)
+            .expect("lane logits D2H")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+
+        assert_eq!(
+            bits_lane, bits_sync,
+            "{name}: overlapped prefill logits diverged from the sync step"
+        );
+        assert_eq!(
+            (kv_lane.local.origin_pages(), kv_lane.local.seq_len()),
+            (kv_sync.local.origin_pages(), kv_sync.local.seq_len()),
+            "{name}: released-window shape diverged"
+        );
+
+        let mut tokens = [Vec::new(), Vec::new()];
+        for (slot, kv) in [kv_sync, kv_lane].into_iter().enumerate() {
+            let first = argmax_last(&ctx, &logits_sync).expect("first token");
+            let mut lanes = vec![(0usize, kv, first)];
+            let mut produced: Vec<Vec<u32>> = vec![vec![first]];
+            mixed_gate_decode_rounds(
+                &ctx,
+                &serve,
+                &mut arena,
+                &mut lanes,
+                &mut produced,
+                &budgets,
+                usize::MAX,
+            );
+            tokens[slot] = produced.swap_remove(0);
+        }
+        assert_eq!(
+            tokens[1], tokens[0],
+            "{name}: greedy decode over the lane-written KV diverged"
+        );
+        eprintln!(
+            "{name}: {} prompt tokens, logits bit-equal, {} greedy tokens equal",
+            prompt.len(),
+            tokens[0].len()
+        );
+    }
+}
+
 /// The prefix cache's GPU halves, gated bit-level: two arms run the same
 /// kernel sequence — prefill turn 1, then a suffix step and greedy decode —
 /// and differ only in that the cache arm captures after turn 1, drops its

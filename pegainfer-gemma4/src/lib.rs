@@ -14,6 +14,8 @@ mod engine;
 #[allow(dead_code)]
 mod forward;
 #[cfg(feature = "gemma4")]
+mod green_ctx;
+#[cfg(feature = "gemma4")]
 #[allow(dead_code)]
 mod kv;
 #[cfg(feature = "gemma4")]

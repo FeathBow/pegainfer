@@ -81,9 +81,10 @@ impl SlidingLocalKv {
         self.resident.extend(pages);
     }
 
-    /// Move the frontier without releasing anything. Only the eviction A/B
-    /// takes this path; serving goes through [`Self::advance_and_release`].
-    #[cfg(test)]
+    /// Move the frontier without releasing anything: the overlapped
+    /// prefill defers its release to join time, and the eviction A/B pins
+    /// the footprint. Everything else goes through
+    /// [`Self::advance_and_release`].
     pub(crate) fn advance(&mut self, count: usize) {
         self.frontier += count;
     }

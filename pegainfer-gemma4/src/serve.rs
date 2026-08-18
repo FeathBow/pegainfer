@@ -203,6 +203,49 @@ impl AttnScratch {
 /// The tower's whole working set for one step: attention buffers, epilogue
 /// buffers, and the hidden pair the layers alternate between so no layer
 /// writes the buffer it is reading.
+/// Order `ctx.stream` producers (plan uploads, token-id H2D, buffer
+/// allocations) before the override stream consumes them. No-op without an
+/// override.
+fn fence_producers_before_override(ctx: &DeviceContext) -> Result<()> {
+    use cudarc::driver::sys;
+    if !pegainfer_core::tensor::has_stream_override() {
+        return Ok(());
+    }
+    let override_stream = pegainfer_core::tensor::active_cu_stream(ctx);
+    let producer = ctx.stream.cu_stream();
+    unsafe {
+        let mut event: sys::CUevent = std::ptr::null_mut();
+        let create = sys::cuEventCreate(
+            &raw mut event,
+            sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+        );
+        anyhow::ensure!(
+            create == sys::CUresult::CUDA_SUCCESS,
+            "cuEventCreate (producer fence) failed: {create:?}"
+        );
+        let record = sys::cuEventRecord(event, producer);
+        let wait = if record == sys::CUresult::CUDA_SUCCESS {
+            sys::cuStreamWaitEvent(override_stream, event, 0)
+        } else {
+            record
+        };
+        let destroy = sys::cuEventDestroy_v2(event);
+        anyhow::ensure!(
+            record == sys::CUresult::CUDA_SUCCESS,
+            "cuEventRecord (producer fence) failed: {record:?}"
+        );
+        anyhow::ensure!(
+            wait == sys::CUresult::CUDA_SUCCESS,
+            "cuStreamWaitEvent (producer fence) failed: {wait:?}"
+        );
+        anyhow::ensure!(
+            destroy == sys::CUresult::CUDA_SUCCESS,
+            "cuEventDestroy (producer fence) failed: {destroy:?}"
+        );
+    }
+    Ok(())
+}
+
 struct TowerScratch {
     attn: AttnScratch,
     epilogue: EpilogueScratch,
@@ -2076,6 +2119,100 @@ impl GemmaServe {
         kv.global.advance(seq_len);
         Ok(logits)
     }
+
+    /// Whole-prompt prefill left in flight on the active stream — the
+    /// overlap-safe form of [`GemmaServe::step`] at `LogitsSpan::LastRow`.
+    /// Every host-side producer (plan upload, token-id H2D, buffer
+    /// allocation) runs on `ctx.stream` before one producer fence;
+    /// everything after is kernel work over buffers the returned pass owns,
+    /// so the caller may launch it under a stream override and leave it in
+    /// flight while decode steps continue on `ctx.stream`. The
+    /// append-then-attend window release is deferred to
+    /// [`GemmaServe::release_prefill_window`] at join time — a page
+    /// released here could be re-allocated to a decoding request's frontier
+    /// and written on `ctx.stream` while the in-flight layers still read
+    /// it.
+    pub(crate) fn prefill_into_logits(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut GemmaKv,
+        tokens: &[u32],
+    ) -> Result<PrefillPass> {
+        let seq_len = tokens.len();
+        anyhow::ensure!(seq_len > 0, "prefill needs at least one token");
+        self.check_stream(ctx)?;
+        let weights = &self.weights;
+        validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
+        let start_pos = kv.local.seq_len();
+        self.check_step_bounds(kv, start_pos + seq_len)?;
+        let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
+        let mut tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, seq_len)?;
+        let ids = ctx
+            .stream
+            .clone_htod(tokens)
+            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
+        let mut last = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
+        let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
+        let mut logits = HiddenStates::zeros(ctx, weights.embed_tokens.rows, 1)?;
+        fence_producers_before_override(ctx)?;
+        let src = self.run_tower(
+            ctx,
+            &mut tower,
+            &ids,
+            seq_len,
+            &plan.local_plan,
+            PrepRef::Single {
+                start_pos: plan.start_pos,
+                local_page_origin: plan.local_page_origin,
+                global_plan: &plan.global_plan,
+            },
+            None,
+        )?;
+        let hidden = &tower.hidden[src];
+        ops::copy_hidden_token_range_into(ctx, hidden, seq_len - 1, &mut last, 0, 1)?;
+        logits_tail_into(
+            ctx,
+            weights,
+            &last,
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+            &mut normed,
+            &mut logits,
+        )?;
+        kv.local.advance(seq_len);
+        kv.global.advance(seq_len);
+        Ok(PrefillPass {
+            logits,
+            _tower: tower,
+            _plan: plan,
+            _ids: ids,
+            _last: last,
+            _normed: normed,
+        })
+    }
+
+    /// The deferred append-then-attend release for an overlapped prefill:
+    /// call once its completion event has fired, before the request joins
+    /// the decode batch.
+    pub(crate) fn release_prefill_window(&self, kv: &mut GemmaKv) -> Result<()> {
+        #[cfg(test)]
+        if !self.release_enabled {
+            return Ok(());
+        }
+        kv.local.advance_and_release(0, self.sliding_window)
+    }
+}
+
+/// Everything an overlapped prefill keeps alive while its kernels are in
+/// flight on the lane stream: dropping any of it before the completion
+/// event fires would free device memory the pass still reads.
+pub(crate) struct PrefillPass {
+    pub(crate) logits: HiddenStates,
+    _tower: TowerScratch,
+    _plan: GemmaStepPlan,
+    _ids: CudaSlice<u32>,
+    _last: HiddenStates,
+    _normed: HiddenStates,
 }
 
 #[path = "serve_oracle.rs"]

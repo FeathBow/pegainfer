@@ -94,7 +94,28 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                         }
                     }
                 }
-                if active.is_empty() && pending.is_empty() {
+                // Join a finished overlapped prefill: poll while other work
+                // exists, block on the lane when it is the only work left.
+                let lane_ready = match state.lane.as_mut() {
+                    Some(lane) if lane.inflight.is_some() => {
+                        let lane_is_only_work = active.is_empty() && pending.is_empty();
+                        if lane_is_only_work {
+                            lane.drain_or_abort();
+                        }
+                        lane_is_only_work || lane.inflight_complete()
+                    }
+                    _ => false,
+                };
+                if lane_ready {
+                    state.join_async_prefill(&mut active);
+                }
+                if active.is_empty()
+                    && pending.is_empty()
+                    && state
+                        .lane
+                        .as_ref()
+                        .is_none_or(|lane| lane.inflight.is_none())
+                {
                     if disconnected {
                         break 'engine;
                     }
@@ -112,6 +133,15 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                 // token however deep it is.
                 let mut attempts = 0;
                 while attempts < MAX_CONCURRENCY && active.len() < MAX_CONCURRENCY {
+                    // With the lane busy, arrivals wait in `pending` while
+                    // decode keeps stepping.
+                    if state
+                        .lane
+                        .as_ref()
+                        .is_some_and(|lane| lane.inflight.is_some())
+                    {
+                        break;
+                    }
                     let Some(item) = pending.pop_front() else {
                         break;
                     };
@@ -230,6 +260,114 @@ type Submitted = pegainfer_frontend::engine::SubmittedRequest;
 
 /// One in-flight request between decode steps: its KV, the token that feeds
 /// the next step, and its progress counters.
+/// Overlapped admission: with the lane on, a prompt arriving into a live
+/// decode batch prefills on its own stream while decode steps keep
+/// replaying on `ctx.stream` — the admission costs the streams a slowdown
+/// instead of a mixed step per prompt. `shared` lets the prefill grids
+/// compete for every SM; `green:NN` pins the lane to NN% of them, which is
+/// what actually protects decode ITL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsyncPrefillMode {
+    Off,
+    Shared,
+    Green(u32),
+}
+
+fn async_prefill_mode() -> Result<AsyncPrefillMode> {
+    match std::env::var("PEGAINFER_ASYNC_PREFILL") {
+        Ok(raw) => parse_async_prefill_mode(&raw),
+        Err(_) => Ok(AsyncPrefillMode::Off),
+    }
+}
+
+fn parse_async_prefill_mode(raw: &str) -> Result<AsyncPrefillMode> {
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "0" | "false" | "off" => Ok(AsyncPrefillMode::Off),
+        "shared" => Ok(AsyncPrefillMode::Shared),
+        other => match other.strip_prefix("green:").and_then(|p| p.parse().ok()) {
+            Some(pct) if (1..=99).contains(&pct) => Ok(AsyncPrefillMode::Green(pct)),
+            _ => anyhow::bail!(
+                "PEGAINFER_ASYNC_PREFILL={raw:?} not recognized (off | shared | green:NN, 1..=99)"
+            ),
+        },
+    }
+}
+
+/// One in-flight overlapped prefill, parked until the lane's completion
+/// event fires: the request, its KV, and the pass owning every device
+/// buffer the in-flight kernels still read.
+struct InflightPrefill {
+    request: GenerateRequest,
+    kv: GemmaKv,
+    pass: crate::serve::PrefillPass,
+    /// The cache entry this request resumed from, if any — its stale
+    /// ancestor at capture time.
+    resumed: Option<u64>,
+}
+
+/// The overlap lane: a dedicated prefill stream and a reusable completion
+/// event. At most one prefill is in flight; while it runs, later arrivals
+/// wait in the queue and decode keeps stepping — which is the point.
+struct AsyncPrefillLane {
+    stream: crate::green_ctx::PrefillLaneStream,
+    event: cudarc::driver::CudaEvent,
+    inflight: Option<InflightPrefill>,
+}
+
+impl AsyncPrefillLane {
+    fn new(ctx: &DeviceContext, mode: AsyncPrefillMode) -> Result<Self> {
+        let stream = match mode {
+            AsyncPrefillMode::Off => anyhow::bail!("async prefill lane built with mode Off"),
+            AsyncPrefillMode::Shared => crate::green_ctx::PrefillLaneStream::shared()?,
+            AsyncPrefillMode::Green(pct) => {
+                crate::green_ctx::PrefillLaneStream::green(ctx.device_ordinal, pct)?
+            }
+        };
+        let event = ctx
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow::anyhow!("prefill completion event create failed: {e}"))?;
+        Ok(Self {
+            stream,
+            event,
+            inflight: None,
+        })
+    }
+
+    /// True once the in-flight prefill's event has fired. An unexpected
+    /// query error aborts: the pass's buffers may still be in use and no
+    /// safe recovery exists.
+    fn inflight_complete(&self) -> bool {
+        debug_assert!(self.inflight.is_some());
+        let query = unsafe { cudarc::driver::sys::cuEventQuery(self.event.cu_event()) };
+        match query {
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS => true,
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => false,
+            other => {
+                log::error!("FATAL: cuEventQuery(prefill) failed ({other:?}); aborting");
+                std::process::abort();
+            }
+        }
+    }
+
+    /// Block until the lane stream is drained; abort on failure rather
+    /// than let the pass's buffers be reused under in-flight kernels.
+    fn drain_or_abort(&self) {
+        let sync = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.stream.stream) };
+        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            log::error!("FATAL: cuStreamSynchronize(prefill) failed ({sync:?}); aborting");
+            std::process::abort();
+        }
+    }
+}
+
+impl Drop for AsyncPrefillLane {
+    fn drop(&mut self) {
+        self.drain_or_abort();
+    }
+}
+
 struct Active {
     request: GenerateRequest,
     kv: GemmaKv,
@@ -279,6 +417,9 @@ struct EngineState {
     /// mixed into the per-call seed; a request's own `params.seed` replays
     /// via (seed, step) regardless of it.
     sample_nonce: u64,
+    /// The overlap lane; `None` unless `PEGAINFER_ASYNC_PREFILL` opted in
+    /// at startup.
+    lane: Option<AsyncPrefillLane>,
 }
 
 impl EngineState {
@@ -332,6 +473,10 @@ impl EngineState {
             .stream
             .clone_htod(&[bf16::NEG_INFINITY])
             .map_err(|err| anyhow::anyhow!("allocating the suppression sentinel failed: {err}"))?;
+        let lane = match async_prefill_mode()? {
+            AsyncPrefillMode::Off => None,
+            mode => Some(AsyncPrefillLane::new(&ctx, mode)?),
+        };
         Ok(Self {
             ctx,
             serve,
@@ -342,6 +487,7 @@ impl EngineState {
             blocked,
             base_seed,
             sample_nonce: 0,
+            lane,
         })
     }
 
@@ -457,6 +603,15 @@ impl EngineState {
             return Admitted::Done;
         }
 
+        // Overlapped admission: the prefill launches onto the lane stream
+        // and this call returns immediately — decode steps continue while it
+        // runs. A prompt arriving with nothing active stays on the sync
+        // path: there is nothing to protect, and full-SM speed wins the head
+        // of every refill burst.
+        if self.lane.is_some() && !active.is_empty() {
+            return self.launch_async_prefill(request, kv, resumed);
+        }
+
         // Mixed admission: with a live decode batch, the prompt rides its
         // weight scan — one step prefills the newcomer and advances every
         // active row.
@@ -493,9 +648,29 @@ impl EngineState {
                 cache.insert(entry, resumed);
             }
         }
-        if let Err(err) =
-            suppress_logits(&self.ctx, &self.blocked, &mut logits, &self.policy.suppress)
-        {
+        self.first_token_flow(request, kv, &mut logits)
+    }
+
+    /// Suppress, sample and emit a prefill's first token from logits row 0,
+    /// then finish the request or hand it to the decode batch — the shared
+    /// tail of a sync admission and an overlapped-prefill join.
+    fn first_token_flow(
+        &mut self,
+        request: GenerateRequest,
+        kv: GemmaKv,
+        logits: &mut HiddenStates,
+    ) -> Admitted {
+        let sink = request.token_tx.clone();
+        let prompt_tokens = request.prompt_tokens.len();
+        let fail = |message: String| {
+            let _ = sink.send(TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens: 0,
+            });
+            Admitted::Done
+        };
+        if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
             return fail(format!("{err:#}"));
         }
 
@@ -503,7 +678,7 @@ impl EngineState {
         let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
         let next = match pegainfer_sample::select_batch(
             &self.ctx,
-            &logits,
+            logits,
             &[&request.params],
             &[0],
             call_seed,
@@ -530,7 +705,7 @@ impl EngineState {
         let logprob = if request.logprobs > 0 {
             match pegainfer_sample::token_logprobs_batch(
                 &self.ctx,
-                &logits,
+                logits,
                 &[LogprobRequest {
                     row: 0,
                     picked: next,
@@ -556,6 +731,90 @@ impl EngineState {
             emitted: 1,
             prompt_tokens,
         }))
+    }
+
+    /// Launch one whole-prompt prefill onto the lane stream and record the
+    /// completion event. On a launch error the lane stream is drained
+    /// before the KV reservation drops, so no returned page can still be
+    /// written by a stale kernel.
+    fn launch_async_prefill(
+        &mut self,
+        request: GenerateRequest,
+        mut kv: GemmaKv,
+        resumed: Option<u64>,
+    ) -> Admitted {
+        let lane = self.lane.as_mut().expect("gated by the caller");
+        debug_assert!(lane.inflight.is_none());
+        let launched = {
+            let _guard = unsafe {
+                pegainfer_core::tensor::StreamOverrideGuard::activate(lane.stream.stream)
+            };
+            self.serve
+                .prefill_into_logits(&self.ctx, &mut kv, &request.prompt_tokens)
+        };
+        let recorded = launched.and_then(|pass| {
+            lane.stream
+                .record_event(lane.event.cu_event())
+                .map(|()| pass)
+        });
+        match recorded {
+            Ok(pass) => {
+                lane.inflight = Some(InflightPrefill {
+                    request,
+                    kv,
+                    pass,
+                    resumed,
+                });
+                Admitted::Done
+            }
+            Err(err) => {
+                log::error!("gemma4 async prefill launch failed: {err:#}");
+                lane.drain_or_abort();
+                let _ = request.token_tx.send(TokenEvent::Error {
+                    message: format!("prefill failed: {err:#}"),
+                    prompt_tokens: request.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                Admitted::Done
+            }
+        }
+    }
+
+    /// Join a completed overlapped prefill: run the deferred window
+    /// release, capture into the prefix cache, and take the first-token
+    /// flow the sync path uses.
+    fn join_async_prefill(&mut self, active: &mut Vec<Active>) {
+        let Some(lane) = self.lane.as_mut() else {
+            return;
+        };
+        let Some(inflight) = lane.inflight.take() else {
+            return;
+        };
+        let InflightPrefill {
+            request,
+            mut kv,
+            mut pass,
+            resumed,
+        } = inflight;
+        if let Err(err) = self.serve.release_prefill_window(&mut kv) {
+            let _ = request.token_tx.send(TokenEvent::Error {
+                message: format!("prefill window release failed: {err:#}"),
+                prompt_tokens: request.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+            return;
+        }
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            if let Some(entry) =
+                self.serve
+                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+            {
+                cache.insert(entry, resumed);
+            }
+        }
+        if let Admitted::Active(entry) = self.first_token_flow(request, kv, &mut pass.logits) {
+            active.push(*entry);
+        }
     }
 
     /// Retire every active request the next step cannot serve — a closed
@@ -920,5 +1179,43 @@ mod gate {
 
         let past_the_row = suppress_logits(&ctx, &blocked, &mut logits, &[vocab as u32]);
         assert!(past_the_row.is_err(), "an id past the row must be refused");
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::AsyncPrefillMode;
+    use super::parse_async_prefill_mode;
+
+    #[test]
+    fn async_prefill_mode_parses_or_refuses() {
+        for off in ["", "0", "false", "off", " OFF "] {
+            assert_eq!(
+                parse_async_prefill_mode(off).unwrap(),
+                AsyncPrefillMode::Off
+            );
+        }
+        assert_eq!(
+            parse_async_prefill_mode("shared").unwrap(),
+            AsyncPrefillMode::Shared
+        );
+        assert_eq!(
+            parse_async_prefill_mode("green:35").unwrap(),
+            AsyncPrefillMode::Green(35)
+        );
+        for bad in [
+            "1",
+            "true",
+            "on",
+            "green",
+            "green:0",
+            "green:100",
+            "green:x",
+        ] {
+            assert!(
+                parse_async_prefill_mode(bad).is_err(),
+                "{bad:?} must refuse, not silently degrade"
+            );
+        }
     }
 }
