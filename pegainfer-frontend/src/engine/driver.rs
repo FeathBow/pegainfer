@@ -125,7 +125,7 @@ mod tests {
         }
 
         fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()> {
-            if self.fatal_next_step {
+            if self.fatal_next_step && !(self.queued.is_empty() && self.running.is_empty()) {
                 anyhow::bail!("injected fatal");
             }
             for (id, max_tokens) in self.queued.drain(..) {
