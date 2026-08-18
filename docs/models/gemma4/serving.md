@@ -6,7 +6,7 @@ Last touched: 2026-08
 
 ## What a step is
 
-The engine thread runs one loop. Each turn it admits whatever the pools can hold, up to the slot ceiling, and prefills each admitted prompt as its own step; then every active request advances exactly one token in a single batched step that shares the weight pass. A request that arrives while all slots are taken waits at the head of the queue. It is refused only when nothing is active — when there is no other request whose pages could free up, the pools genuinely cannot hold it and saying so is the honest answer.
+The engine thread runs one loop. Each turn it admits whatever the pools can hold, up to the slot ceiling. With streams in flight, each admitted prompt shares one mixed step with them — the prompt's rows sit in the step's row prefix while every active request advances its token in the suffix; a prompt that arrives with nothing active prefills alone as its own step. Between admissions, every active request advances exactly one token in a single batched decode step that shares the weight pass. A request that arrives while all slots are taken waits at the head of the queue. It is refused only when nothing is active — when there is no other request whose pages could free up, the pools genuinely cannot hold it and saying so is the honest answer.
 
 Rows retire independently. Requests in one batch have their own frontiers, their own page tables and, for the sliding family, their own released window front, so a short request finishing does not disturb the rows that continue.
 
