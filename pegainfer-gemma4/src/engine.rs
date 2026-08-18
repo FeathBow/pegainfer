@@ -246,14 +246,14 @@ enum Admitted {
     Requeue(Box<Submitted>),
 }
 
-fn send_scheduled(request: &GenerateRequest, prompt_tokens: usize) -> bool {
+fn send_scheduled(request: &GenerateRequest, prompt_tokens: usize, cached_tokens: usize) -> bool {
     request
         .token_tx
         .send(TokenEvent::Scheduled {
             queued_at_unix_s: request.queued_at_unix_s.unwrap_or_else(unix_now_s),
             scheduled_at_unix_s: unix_now_s(),
             prompt_tokens,
-            cached_tokens: 0,
+            cached_tokens,
         })
         .is_ok()
 }
@@ -364,7 +364,7 @@ impl EngineState {
         // Scheduled is paired with whatever ends the request, so a refusal
         // emits it first rather than leaving the client with no lifecycle.
         let reject = |message: String| {
-            if send_scheduled(&request, prompt_tokens) {
+            if send_scheduled(&request, prompt_tokens, 0) {
                 let _ = sink.send(TokenEvent::Rejected {
                     message,
                     prompt_tokens,
@@ -447,7 +447,9 @@ impl EngineState {
                 }
             }
         }
-        if !send_scheduled(&request, prompt_tokens) {
+        // A restored prefix is what the bridge reports as cached: the
+        // resumed KV's frontier is exactly the token count served from it.
+        if !send_scheduled(&request, prompt_tokens, kv.local.seq_len()) {
             return Admitted::Done;
         }
 
