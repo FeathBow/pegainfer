@@ -680,7 +680,10 @@ impl EngineState {
         // full transient.
         let transient_pages = match mix_chunk {
             Some(chunk) if matches!(lane_mode, AsyncPrefillMode::Off) => {
-                window_pages + chunk.div_ceil(PAGE_SIZE)
+                // A round's rows split across walkers, and every walker's
+                // reservation rounds up to its own page — so the budget
+                // carries one page of rounding per extra walker.
+                window_pages + chunk.div_ceil(PAGE_SIZE) + (MIX_MAX_PROMPTS - 1)
             }
             _ => context_pages,
         };
