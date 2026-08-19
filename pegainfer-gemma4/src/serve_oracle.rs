@@ -265,6 +265,10 @@ fn longctx_waypoints_match_hf() {
         window_manifest["revision"], golden["revision"],
         "the window fixture was dumped from a different revision than the golden one"
     );
+    assert_eq!(
+        manifest["transformers"], window_manifest["transformers"],
+        "a borrowed floor is only meaningful under the donor's own reference release"
+    );
     let window_fixture =
         safetensors::SafeTensors::deserialize(&window_bytes).expect("parse window fixture");
     let (_, _, donor_positions, _, donor_tolerance, donor_top1) =
