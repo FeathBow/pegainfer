@@ -2172,27 +2172,50 @@ mod lane_tests {
         rx
     }
 
-    /// The chunked pool provisions one shared segment transient, so no
-    /// walker may park pages ahead of its rounds: with the knob set before
-    /// load — the reduced production pool — twelve streams at full window
-    /// plus three near-context prompts walking 2048-row segments must all
-    /// finish. Parked first quanta across the walkers exhausted this pool.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
-    fn the_gathered_transient_leaves_headroom() {
+    /// Load an engine with the chunk knob set ahead of the load — the pool
+    /// is sized by it — while the other serving knobs are cleared for the
+    /// duration, so the outside environment cannot change the pool or the
+    /// admission route under the test.
+    fn walk_test_state(chunk: &str) -> super::EngineState {
         let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
         let policy = super::generation_policy(&dir).expect("policy");
+        let knobs = [
+            "PEGAINFER_ASYNC_PREFILL",
+            "PEGAINFER_PREFIX_CACHE",
+            "PEGAINFER_MIX_CHUNK_TOKENS",
+        ];
+        let saved: Vec<Option<String>> = knobs.iter().map(|k| std::env::var(k).ok()).collect();
         // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
         // so no other thread reads the environment concurrently.
         unsafe {
-            std::env::set_var("PEGAINFER_MIX_CHUNK_TOKENS", "2048");
+            std::env::remove_var("PEGAINFER_ASYNC_PREFILL");
+            std::env::remove_var("PEGAINFER_PREFIX_CACHE");
+            std::env::set_var("PEGAINFER_MIX_CHUNK_TOKENS", chunk);
         }
         let state = super::EngineState::load(&dir, 0, policy, 0x5EED, true);
         // SAFETY: as above.
         unsafe {
-            std::env::remove_var("PEGAINFER_MIX_CHUNK_TOKENS");
+            for (k, v) in knobs.iter().zip(saved) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
         }
-        let mut state = state.expect("engine state");
+        state.expect("engine state")
+    }
+
+    /// The chunked pool provisions one shared segment transient, so no
+    /// walker may park pages ahead of its rounds: with the knob set before
+    /// load — the reduced production pool, asserted against the provision
+    /// arithmetic — twelve streams at full window plus three near-context
+    /// prompts entering one gather must all finish. Parked first quanta
+    /// across the walkers exhausted this pool.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
+    fn the_gathered_transient_leaves_headroom() {
+        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        let mut state = walk_test_state("2048");
         assert_eq!(state.mix_chunk, Some(2048), "the knob preceded the load");
         let window = crate::config::Gemma4Config::from_file(&dir)
             .expect("config")
@@ -2243,21 +2266,14 @@ mod lane_tests {
             &mut pending,
             &mut attempts,
         ) {
-            super::Admitted::Active(entry) => active.push(*entry),
             super::Admitted::Done => {}
-            super::Admitted::Requeue(_) => panic!("first long prompt requeued"),
+            _ => panic!("the gathered walk must land every walker in the batch"),
         }
-        while let Some(item) = pending.pop_front() {
-            let mut attempts = 0usize;
-            match state.admit_and_prefill(item, false, &mut active, &mut pending, &mut attempts) {
-                super::Admitted::Active(entry) => active.push(*entry),
-                super::Admitted::Done => {}
-                super::Admitted::Requeue(item) => {
-                    pending.push_front(*item);
-                    state.decode_round(&mut active);
-                }
-            }
-        }
+        assert!(
+            pending.is_empty(),
+            "all three newcomers must enter one gather"
+        );
+        assert_eq!(active.len(), 15, "streams plus every walker keep decoding");
         while !active.is_empty() {
             state.decode_round(&mut active);
         }
@@ -2273,24 +2289,31 @@ mod lane_tests {
         }
     }
 
-    /// One shared walk against the engine's own serial path: three fixture
+    /// One shared walk against the engine's own serial path, on the reduced
+    /// production pool with the 64-row production floor: three tiled
     /// prompts get their reference sequences from single-request episodes
-    /// through the plain admission path — same suppression, same sampler —
-    /// then a rider decodes while the other two walk 24-token segments in
-    /// one gathered episode (boundary rounds carry a final and a non-final
-    /// segment), both walk again from an idle roster (the whole-scan tail
-    /// path), and a walker cancelled before the first round is dropped
-    /// without touching its partner or the rider. Every surviving
-    /// request's greedy sequence must match its reference whole.
+    /// through the production admission path, then a rider decodes while
+    /// the other two enter one gathered walk (boundary rounds carry a
+    /// final and a non-final segment), both walk again from an idle roster
+    /// (the segment-by-segment tail path), and a walker cancelled before
+    /// the first round is dropped without touching its partner or the
+    /// rider. Every surviving request's greedy sequence must match its
+    /// reference whole. The direct `mixed_walk` calls in the later phases
+    /// stage what the production loop cannot pin deterministically — a
+    /// drained roster and a mid-walk disconnect — with the production
+    /// zero-ahead reservation shape: nothing is admitted before the walk.
     #[test]
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
     fn the_gathered_walk_matches_the_serial_path() {
-        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
-        let policy = super::generation_policy(&dir).expect("policy");
-        let mut state =
-            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        let prompts = walk_fixture_prompts();
+        let mut state = walk_test_state("64");
+        assert_eq!(state.mix_chunk, Some(64), "the knob preceded the load");
+        let seeds = walk_fixture_prompts();
         let cases = ["a", "b", "c"];
+        let lens = [180usize, 150, 190];
+        let prompts: Vec<Vec<u32>> = lens
+            .iter()
+            .map(|&n| seeds[0].iter().cycle().copied().take(n).collect())
+            .collect();
         let budgets = [24usize, 17, 21];
 
         let serial: Vec<Vec<u32>> = prompts
@@ -2306,49 +2329,33 @@ mod lane_tests {
             );
         }
 
-        let (req_a, mut rx_a) = walk_request(prompts[0].clone(), budgets[0]);
-        let mut pending = std::collections::VecDeque::new();
-        let mut attempts = 0usize;
+        // Rider live, walkers b and c entering one production gather.
         let mut active: Vec<super::Active> = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        let mut rx_a = headroom_admit(
+            &mut state,
+            prompts[0].clone(),
+            budgets[0],
+            &mut active,
+            &mut pending,
+        );
+        assert_eq!(active.len(), 1, "the rider holds a decode slot");
+
+        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), budgets[1]);
+        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), budgets[2]);
+        pending.push_back((req_c, pegainfer_frontend::engine::KvPrefix::none()));
+        let mut attempts = 0usize;
         match state.admit_and_prefill(
-            (req_a, pegainfer_frontend::engine::KvPrefix::none()),
+            (req_b, pegainfer_frontend::engine::KvPrefix::none()),
             false,
             &mut active,
             &mut pending,
             &mut attempts,
         ) {
-            super::Admitted::Active(entry) => active.push(*entry),
-            _ => panic!("rider admission must hand back an active lane"),
+            super::Admitted::Done => {}
+            _ => panic!("the gathered walk must land every walker in the batch"),
         }
-
-        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), budgets[1]);
-        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), budgets[2]);
-        let mut kv_b = state.serve.alloc_kv();
-        let mut kv_c = state.serve.alloc_kv();
-        crate::kv::admit_tokens(
-            &state.serve.local_pool,
-            &state.serve.global_pool,
-            &mut kv_b,
-            prompts[1].len(),
-        )
-        .expect("admit walker b");
-        crate::kv::admit_tokens(
-            &state.serve.local_pool,
-            &state.serve.global_pool,
-            &mut kv_c,
-            prompts[2].len(),
-        )
-        .expect("admit walker c");
-        state.ready_decode_rows(&mut active);
-        let admitted = state.mixed_walk(
-            24,
-            vec![(req_b, kv_b, None), (req_c, kv_c, None)],
-            &mut active,
-        );
-        assert!(
-            matches!(admitted, super::Admitted::Done),
-            "the walk returns Done"
-        );
+        assert!(pending.is_empty(), "both walkers must enter one gather");
         assert_eq!(active.len(), 3, "rider plus both walkers keep decoding");
         while !active.is_empty() {
             state.decode_round(&mut active);
@@ -2365,27 +2372,15 @@ mod lane_tests {
             eprintln!("case {case}: {} tokens gathered == serial", serial[i].len());
         }
 
+        // The same walk from an idle roster — the tails feed segment by
+        // segment through the drained-roster path, nothing admitted ahead.
         let (req_a2, mut rx_a2) = walk_request(prompts[0].clone(), budgets[0]);
         let (req_b2, mut rx_b2) = walk_request(prompts[1].clone(), budgets[1]);
-        let mut kv_a2 = state.serve.alloc_kv();
-        let mut kv_b2 = state.serve.alloc_kv();
-        crate::kv::admit_tokens(
-            &state.serve.local_pool,
-            &state.serve.global_pool,
-            &mut kv_a2,
-            prompts[0].len(),
-        )
-        .expect("admit idle walker a");
-        crate::kv::admit_tokens(
-            &state.serve.local_pool,
-            &state.serve.global_pool,
-            &mut kv_b2,
-            prompts[1].len(),
-        )
-        .expect("admit idle walker b");
+        let kv_a2 = state.serve.alloc_kv();
+        let kv_b2 = state.serve.alloc_kv();
         let mut active2: Vec<super::Active> = Vec::new();
         let admitted2 = state.mixed_walk(
-            24,
+            64,
             vec![(req_a2, kv_a2, None), (req_b2, kv_b2, None)],
             &mut active2,
         );
@@ -2408,6 +2403,9 @@ mod lane_tests {
             );
         }
 
+        // A walker whose client disconnected before the first round is
+        // dropped without consuming rounds — while a rider decodes through
+        // them — and the survivors still match the serial path.
         let (req_c3, mut rx_c3) = walk_request(prompts[2].clone(), budgets[2]);
         let mut pending3 = std::collections::VecDeque::new();
         let mut attempts3 = 0usize;
@@ -2425,25 +2423,11 @@ mod lane_tests {
         let (req_a3, rx_a3) = walk_request(prompts[0].clone(), budgets[0]);
         let (req_b3, mut rx_b3) = walk_request(prompts[1].clone(), budgets[1]);
         drop(rx_a3);
-        let mut kv_a3 = state.serve.alloc_kv();
-        let mut kv_b3 = state.serve.alloc_kv();
-        crate::kv::admit_tokens(
-            &state.serve.local_pool,
-            &state.serve.global_pool,
-            &mut kv_a3,
-            prompts[0].len(),
-        )
-        .expect("admit cancelled walker");
-        crate::kv::admit_tokens(
-            &state.serve.local_pool,
-            &state.serve.global_pool,
-            &mut kv_b3,
-            prompts[1].len(),
-        )
-        .expect("admit surviving walker");
+        let kv_a3 = state.serve.alloc_kv();
+        let kv_b3 = state.serve.alloc_kv();
         state.ready_decode_rows(&mut active3);
         let admitted3 = state.mixed_walk(
-            24,
+            64,
             vec![(req_a3, kv_a3, None), (req_b3, kv_b3, None)],
             &mut active3,
         );
