@@ -786,34 +786,35 @@ impl EngineState {
             None => self.serve.alloc_kv(),
         };
         // The lane prefills whole on its own stream, so a lane-bound
-        // admission still reserves everything; with the chunk knob set the
-        // walk owns the scan and one segment's quantum is the reservation.
+        // admission still reserves everything up front. A chunked
+        // admission reserves nothing here: every segment admits its own
+        // pages right before it is written, so no walker parks a quantum
+        // — parked first segments across several walkers would exhaust
+        // the one shared segment transient the pool provisions.
         let lane_takes = self.lane.is_some() && !active.is_empty();
-        loop {
-            let new_tokens = prompt_tokens - kv.local.seq_len();
-            let reserve_tokens = match self.mix_chunk {
-                Some(chunk) if !lane_takes => new_tokens.min(chunk),
-                _ => new_tokens,
-            };
-            match admit_tokens(
-                &self.serve.local_pool,
-                &self.serve.global_pool,
-                &mut kv,
-                reserve_tokens,
-            ) {
-                Ok(()) => break,
-                Err(err) => {
-                    if self
-                        .prefix_cache
-                        .as_mut()
-                        .is_some_and(PrefixCache::evict_lru)
-                    {
-                        continue;
+        if self.mix_chunk.is_none() || lane_takes {
+            loop {
+                let new_tokens = prompt_tokens - kv.local.seq_len();
+                match admit_tokens(
+                    &self.serve.local_pool,
+                    &self.serve.global_pool,
+                    &mut kv,
+                    new_tokens,
+                ) {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if self
+                            .prefix_cache
+                            .as_mut()
+                            .is_some_and(PrefixCache::evict_lru)
+                        {
+                            continue;
+                        }
+                        if can_wait {
+                            return Admitted::Requeue(Box::new((request, prefix)));
+                        }
+                        return reject(format!("admission refused: {err:#}"));
                     }
-                    if can_wait {
-                        return Admitted::Requeue(Box::new((request, prefix)));
-                    }
-                    return reject(format!("admission refused: {err:#}"));
                 }
             }
         }
@@ -860,10 +861,7 @@ impl EngineState {
                 // its pages across many rounds while the live rows keep
                 // growing toward their windows.
                 let context_pages = MAX_CONTEXT.div_ceil(crate::kv::PAGE_SIZE);
-                let mut transient_pages = match self.mix_chunk {
-                    Some(chunk) => rows_budget.min(chunk).div_ceil(PAGE_SIZE),
-                    None => rows_budget.div_ceil(PAGE_SIZE),
-                };
+                let mut transient_pages = rows_budget.div_ceil(PAGE_SIZE);
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
                     && newcomers.len() + active.len() < MAX_CONCURRENCY
@@ -912,19 +910,20 @@ impl EngineState {
                         None => self.serve.alloc_kv(),
                     };
                     let new_tokens = cand_len - cand_kv.local.seq_len();
-                    // Chunked mode walks the gather in shared segments that
-                    // pace themselves, so the row ceiling does not apply and
-                    // a candidate reserves only its first round's quantum —
-                    // each later round admits its own segment, so a walker
-                    // never holds more than window plus segment. The
-                    // transient provision bounds whatever is reserved here,
-                    // chunked or not.
-                    let reserve_tokens = match self.mix_chunk {
-                        Some(chunk) => new_tokens.min(chunk),
-                        None => new_tokens,
-                    };
-                    let cand_pages = reserve_tokens.div_ceil(PAGE_SIZE);
-                    if (self.mix_chunk.is_none() && rows_budget + new_tokens > MIX_GATHER_ROWS)
+                    if self.mix_chunk.is_some() {
+                        // A chunked candidate reserves nothing: its segments
+                        // admit their own pages inside the walk, so parked
+                        // walkers hold no quantum and the shared segment
+                        // transient stays sufficient however many gather.
+                        if !send_scheduled(&cand, cand_len, cand_kv.local.seq_len()) {
+                            continue;
+                        }
+                        rows_budget += new_tokens;
+                        newcomers.push((cand, cand_kv, cand_resumed));
+                        continue;
+                    }
+                    let cand_pages = new_tokens.div_ceil(PAGE_SIZE);
+                    if rows_budget + new_tokens > MIX_GATHER_ROWS
                         || transient_pages + cand_pages > context_pages
                     {
                         pending.push_front((cand, cand_prefix));
@@ -934,7 +933,7 @@ impl EngineState {
                         &self.serve.local_pool,
                         &self.serve.global_pool,
                         &mut cand_kv,
-                        reserve_tokens,
+                        new_tokens,
                     )
                     .is_err()
                     {
@@ -2157,36 +2156,65 @@ mod lane_tests {
         rx
     }
 
-    /// The gather may reserve at most one full context of transient pages,
-    /// chunked or not: the local pool provisions exactly one, and a walk
-    /// holds its reservation across many rounds while the live rows keep
-    /// growing toward their windows. Ten one-page streams plus four
-    /// near-context prompts must all finish — the unbounded gather took
-    /// all four reservations at once and starved the streams' next pages
-    /// mid-walk.
+    /// The chunked pool provisions one shared segment transient, so no
+    /// walker may park pages ahead of its rounds: with the knob set before
+    /// load — the reduced production pool — twelve streams at full window
+    /// plus three near-context prompts walking 2048-row segments must all
+    /// finish. Parked first quanta across the walkers exhausted this pool.
     #[test]
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
     fn the_gathered_transient_leaves_headroom() {
         let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
         let policy = super::generation_policy(&dir).expect("policy");
-        let mut state =
-            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        state.mix_chunk = Some(64);
+        // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
+        // so no other thread reads the environment concurrently.
+        unsafe {
+            std::env::set_var("PEGAINFER_MIX_CHUNK_TOKENS", "2048");
+        }
+        let state = super::EngineState::load(&dir, 0, policy, 0x5EED, true);
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("PEGAINFER_MIX_CHUNK_TOKENS");
+        }
+        let mut state = state.expect("engine state");
+        assert_eq!(state.mix_chunk, Some(2048), "the knob preceded the load");
+        let window = crate::config::Gemma4Config::from_file(&dir)
+            .expect("config")
+            .sliding_window;
+        let window_pages = window.div_ceil(crate::kv::PAGE_SIZE) + 1;
+        let provisioned = window_pages
+            + 2048usize.div_ceil(crate::kv::PAGE_SIZE)
+            + (super::MIX_MAX_PROMPTS - 1)
+            + (super::MAX_CONCURRENCY - 1) * window_pages;
+        assert_eq!(
+            state.serve.local_pool.available_pages(),
+            provisioned,
+            "the pool was sized by the reduced chunked provision"
+        );
+
         let prompts = walk_fixture_prompts();
-        let short: Vec<u32> = prompts[0].iter().copied().take(8).collect();
+        let stream_prompt: Vec<u32> = prompts[0].iter().cycle().copied().take(1500).collect();
         let long: Vec<u32> = prompts[0].iter().cycle().copied().take(5900).collect();
 
         let mut active: Vec<super::Active> = Vec::new();
         let mut pending = std::collections::VecDeque::new();
-        let mut stream_rx: Vec<TokenStreamReceiver> = (0..10)
-            .map(|_| headroom_admit(&mut state, short.clone(), 400, &mut active, &mut pending))
+        let mut stream_rx: Vec<TokenStreamReceiver> = (0..12)
+            .map(|_| {
+                headroom_admit(
+                    &mut state,
+                    stream_prompt.clone(),
+                    60,
+                    &mut active,
+                    &mut pending,
+                )
+            })
             .collect();
-        assert_eq!(active.len(), 10, "every stream holds a decode slot");
+        assert_eq!(active.len(), 12, "every stream holds a decode slot");
 
         let mut long_rx: Vec<TokenStreamReceiver> = Vec::new();
         let (first_long, first_rx) = walk_request(long.clone(), 2);
         long_rx.push(first_rx);
-        for _ in 0..3 {
+        for _ in 0..2 {
             let (request, rx) = walk_request(long.clone(), 2);
             pending.push_back((request, pegainfer_frontend::engine::KvPrefix::none()));
             long_rx.push(rx);
@@ -2225,7 +2253,7 @@ mod lane_tests {
         for (i, rx) in stream_rx.iter_mut().enumerate() {
             let mut produced = Vec::new();
             walk_drain(rx, &format!("stream {i}"), &mut produced);
-            assert_eq!(produced.len(), 400, "stream {i} reached its budget");
+            assert_eq!(produced.len(), 60, "stream {i} reached its budget");
         }
     }
 
