@@ -456,18 +456,6 @@ fn parse_mix_chunk_tokens(raw: &str) -> Result<Option<usize>> {
 /// there, and a long prompt keeps its own step.
 const MIX_GATHER_ROWS: usize = 512;
 
-/// Admit the pages `take` more tokens need, unless the walker already
-/// accounts for them — a walker reserved ahead of its frontier skips the
-/// call, because the ledger treats holding more than the frontier's
-/// account as an error to surface, not a surplus to spend.
-fn admit_walk_segment(serve: &GemmaServe, kv: &mut GemmaKv, take: usize) -> Result<()> {
-    let want = (kv.local.seq_len() + take).div_ceil(PAGE_SIZE);
-    if want <= kv.local.origin_pages() + kv.local.held_pages() {
-        return Ok(());
-    }
-    admit_tokens(&serve.local_pool, &serve.global_pool, kv, take)
-}
-
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
 /// holds the token its final segment sampled until the walker graduates.
 struct Walker {
@@ -663,12 +651,14 @@ impl EngineState {
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
         policy.check_against_vocab(vocab)?;
-        // Pool budget for a batch. A prefilling request holds every page of
-        // its prompt until that step releases, so the local pool carries one
-        // full-context transient on top of the window-capped steady footprint
-        // of the other active requests; the global family never releases, so
-        // it stays linear in context for each request's whole lifetime. Both
-        // pools add the padding page they reserve.
+        // Pool budget for a batch. Whole-prompt admissions hold every page
+        // of their prompt until the step releases, so without the chunk knob
+        // the local pool carries one full-context transient on top of the
+        // window-capped steady footprint of the other active requests; with
+        // it, every scan is bounded and the transient shrinks to window plus
+        // segment. The global family never releases, so it stays linear in
+        // context for each request's whole lifetime. Both pools add the
+        // padding page they reserve.
         let context_pages = MAX_CONTEXT.div_ceil(PAGE_SIZE);
         let window_pages = weights.config.sliding_window.div_ceil(PAGE_SIZE) + 1;
         // The cache brings its own page budget so cached entries never eat
@@ -854,14 +844,14 @@ impl EngineState {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
-                // The local pool provisions exactly one full-context
-                // transient on top of the other rows' window-capped
-                // footprint, so the gather's upfront reservations may
-                // never total more than that one transient — a walk holds
-                // its pages across many rounds while the live rows keep
-                // growing toward their windows.
-                let context_pages = MAX_CONTEXT.div_ceil(crate::kv::PAGE_SIZE);
-                let mut transient_pages = rows_budget.div_ceil(PAGE_SIZE);
+                // Whole-mode accounting only: those admissions reserve
+                // their prompts up front, and the pool provisions exactly
+                // one full-context transient for them. A chunked gather
+                // reserves nothing here, so it keeps no such ledger.
+                let mut transient_pages = match self.mix_chunk {
+                    Some(_) => 0,
+                    None => rows_budget.div_ceil(PAGE_SIZE),
+                };
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
                     && newcomers.len() + active.len() < MAX_CONCURRENCY
@@ -924,7 +914,7 @@ impl EngineState {
                     }
                     let cand_pages = new_tokens.div_ceil(PAGE_SIZE);
                     if rows_budget + new_tokens > MIX_GATHER_ROWS
-                        || transient_pages + cand_pages > context_pages
+                        || transient_pages + cand_pages > MAX_CONTEXT.div_ceil(PAGE_SIZE)
                     {
                         pending.push_front((cand, cand_prefix));
                         break;
@@ -964,7 +954,12 @@ impl EngineState {
         if let Some(chunk) = self.mix_chunk {
             while request.prompt_tokens.len() - kv.local.seq_len() > chunk {
                 let off = kv.local.seq_len();
-                if let Err(err) = admit_walk_segment(&self.serve, &mut kv, chunk) {
+                if let Err(err) = admit_tokens(
+                    &self.serve.local_pool,
+                    &self.serve.global_pool,
+                    &mut kv,
+                    chunk,
+                ) {
                     return fail(format!("{err:#}"));
                 }
                 if let Err(err) = self.serve.step(
@@ -977,7 +972,12 @@ impl EngineState {
                 }
             }
             let rest = request.prompt_tokens.len() - kv.local.seq_len();
-            if let Err(err) = admit_walk_segment(&self.serve, &mut kv, rest) {
+            if let Err(err) = admit_tokens(
+                &self.serve.local_pool,
+                &self.serve.global_pool,
+                &mut kv,
+                rest,
+            ) {
                 return fail(format!("{err:#}"));
             }
         }
@@ -1194,8 +1194,8 @@ impl EngineState {
     /// prompts. Each round samples every segment's last row; only a
     /// walker's final segment's row is kept as its first token, and that
     /// walker graduates into the decode batch at the round boundary. A
-    /// drained roster finishes the remaining tails on the plain path, one
-    /// whole scan each.
+    /// drained roster finishes the remaining tails on the plain path,
+    /// segment by segment.
     fn mixed_walk(
         &mut self,
         chunk: usize,
@@ -1246,8 +1246,9 @@ impl EngineState {
             first_round = false;
 
             if active.is_empty() {
-                // The batch drained mid-walk: finish each remaining tail on
-                // the plain path — the KV frontier carries the position.
+                // The batch drained mid-walk: finish each remaining tail
+                // on the plain path, one segment at a time — the KV
+                // frontier carries the position.
                 for w in &mut walkers {
                     if w.failed || w.offset >= w.request.prompt_tokens.len() {
                         continue;
@@ -1255,12 +1256,17 @@ impl EngineState {
                     let mut tail_failed = false;
                     while w.request.prompt_tokens.len() - w.offset > chunk {
                         let seg = &w.request.prompt_tokens[w.offset..w.offset + chunk];
-                        let stepped =
-                            admit_walk_segment(&self.serve, &mut w.kv, chunk).and_then(|()| {
-                                self.serve
-                                    .step(&self.ctx, &mut w.kv, seg, LogitsSpan::LastRow)
-                                    .map(|_| ())
-                            });
+                        let stepped = admit_tokens(
+                            &self.serve.local_pool,
+                            &self.serve.global_pool,
+                            &mut w.kv,
+                            chunk,
+                        )
+                        .and_then(|()| {
+                            self.serve
+                                .step(&self.ctx, &mut w.kv, seg, LogitsSpan::LastRow)
+                                .map(|_| ())
+                        });
                         if let Err(err) = stepped {
                             let _ = w.request.token_tx.send(TokenEvent::Error {
                                 message: format!("walk tail segment failed: {err:#}"),
@@ -1277,7 +1283,12 @@ impl EngineState {
                         continue;
                     }
                     let rest_len = w.request.prompt_tokens.len() - w.offset;
-                    if let Err(err) = admit_walk_segment(&self.serve, &mut w.kv, rest_len) {
+                    if let Err(err) = admit_tokens(
+                        &self.serve.local_pool,
+                        &self.serve.global_pool,
+                        &mut w.kv,
+                        rest_len,
+                    ) {
                         let _ = w.request.token_tx.send(TokenEvent::Error {
                             message: format!("walk tail admission failed: {err:#}"),
                             prompt_tokens: w.request.prompt_tokens.len(),
@@ -1353,7 +1364,12 @@ impl EngineState {
                 // pages already skips the call. A refusal means the pool's
                 // provision failed — fail the walker loud rather than
                 // stall the round.
-                if let Err(err) = admit_walk_segment(&self.serve, &mut w.kv, take) {
+                if let Err(err) = admit_tokens(
+                    &self.serve.local_pool,
+                    &self.serve.global_pool,
+                    &mut w.kv,
+                    take,
+                ) {
                     let _ = w.request.token_tx.send(TokenEvent::Error {
                         message: format!("walk segment admission failed: {err:#}"),
                         prompt_tokens: w.request.prompt_tokens.len(),
