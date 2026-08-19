@@ -675,8 +675,19 @@ impl EngineState {
         // serving headroom.
         let cache_entries = crate::prefix_cache::prefix_cache_cap().unwrap_or(0);
         let sliding_window = weights.config.sliding_window;
-        let local_pages =
-            context_pages + (MAX_CONCURRENCY - 1) * window_pages + 1 + cache_entries * window_pages;
+        // With the chunk knob set every scan is bounded by window plus
+        // segment — except the lane's, which prefills whole and keeps the
+        // full transient.
+        let transient_pages = match mix_chunk {
+            Some(chunk) if matches!(lane_mode, AsyncPrefillMode::Off) => {
+                window_pages + chunk.div_ceil(PAGE_SIZE)
+            }
+            _ => context_pages,
+        };
+        let local_pages = transient_pages
+            + (MAX_CONCURRENCY - 1) * window_pages
+            + 1
+            + cache_entries * window_pages;
         let global_pages = MAX_CONCURRENCY * context_pages
             + 1
             + cache_entries * crate::prefix_cache::entry_global_pages(MAX_CONTEXT);
@@ -771,13 +782,21 @@ impl EngineState {
             },
             None => self.serve.alloc_kv(),
         };
+        // The lane prefills whole on its own stream, so a lane-bound
+        // admission still reserves everything; with the chunk knob set the
+        // walk owns the scan and one segment's quantum is the reservation.
+        let lane_takes = self.lane.is_some() && !active.is_empty();
         loop {
             let new_tokens = prompt_tokens - kv.local.seq_len();
+            let reserve_tokens = match self.mix_chunk {
+                Some(chunk) if !lane_takes => new_tokens.min(chunk),
+                _ => new_tokens,
+            };
             match admit_tokens(
                 &self.serve.local_pool,
                 &self.serve.global_pool,
                 &mut kv,
-                new_tokens,
+                reserve_tokens,
             ) {
                 Ok(()) => break,
                 Err(err) => {
@@ -838,7 +857,10 @@ impl EngineState {
                 // its pages across many rounds while the live rows keep
                 // growing toward their windows.
                 let context_pages = MAX_CONTEXT.div_ceil(crate::kv::PAGE_SIZE);
-                let mut transient_pages = rows_budget.div_ceil(crate::kv::PAGE_SIZE);
+                let mut transient_pages = match self.mix_chunk {
+                    Some(chunk) => rows_budget.min(chunk).div_ceil(PAGE_SIZE),
+                    None => rows_budget.div_ceil(PAGE_SIZE),
+                };
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
                     && newcomers.len() + active.len() < MAX_CONCURRENCY
@@ -935,6 +957,28 @@ impl EngineState {
             });
             Admitted::Done
         };
+        // Under the chunk knob a solo prompt walks its own segments too:
+        // residency stays window plus segment whatever the prompt length.
+        if let Some(chunk) = self.mix_chunk {
+            while request.prompt_tokens.len() - kv.local.seq_len() > chunk {
+                let off = kv.local.seq_len();
+                if let Err(err) = admit_walk_segment(&self.serve, &mut kv, chunk) {
+                    return fail(format!("{err:#}"));
+                }
+                if let Err(err) = self.serve.step(
+                    &self.ctx,
+                    &mut kv,
+                    &request.prompt_tokens[off..off + chunk],
+                    LogitsSpan::LastRow,
+                ) {
+                    return fail(format!("{err:#}"));
+                }
+            }
+            let rest = request.prompt_tokens.len() - kv.local.seq_len();
+            if let Err(err) = admit_walk_segment(&self.serve, &mut kv, rest) {
+                return fail(format!("{err:#}"));
+            }
+        }
         let resume = kv.local.seq_len();
         let mut logits = match self.serve.step(
             &self.ctx,
@@ -1204,6 +1248,30 @@ impl EngineState {
                 // the plain path — the KV frontier carries the position.
                 for w in &mut walkers {
                     if w.failed || w.offset >= w.request.prompt_tokens.len() {
+                        continue;
+                    }
+                    let mut tail_failed = false;
+                    while w.request.prompt_tokens.len() - w.offset > chunk {
+                        let seg = &w.request.prompt_tokens[w.offset..w.offset + chunk];
+                        let stepped =
+                            admit_walk_segment(&self.serve, &mut w.kv, chunk).and_then(|()| {
+                                self.serve
+                                    .step(&self.ctx, &mut w.kv, seg, LogitsSpan::LastRow)
+                                    .map(|_| ())
+                            });
+                        if let Err(err) = stepped {
+                            let _ = w.request.token_tx.send(TokenEvent::Error {
+                                message: format!("walk tail segment failed: {err:#}"),
+                                prompt_tokens: w.request.prompt_tokens.len(),
+                                completion_tokens: 0,
+                            });
+                            w.failed = true;
+                            tail_failed = true;
+                            break;
+                        }
+                        w.offset += chunk;
+                    }
+                    if tail_failed {
                         continue;
                     }
                     let rest_len = w.request.prompt_tokens.len() - w.offset;
