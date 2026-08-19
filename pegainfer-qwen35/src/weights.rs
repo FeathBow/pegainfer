@@ -494,7 +494,8 @@ impl Qwen35Model {
             config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
-        );
+        )
+        .expect("kv layout geometry");
         let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
         let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;

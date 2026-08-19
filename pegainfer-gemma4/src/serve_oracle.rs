@@ -44,7 +44,8 @@ fn fixture_manifest(bytes: &[u8], key: &str) -> serde_json::Value {
 
 fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
-    let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0).expect("load 12B weights");
+    let config = Gemma4Config::from_file(&dir).expect("config");
+    let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0, config).expect("load 12B weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
     let serve = GemmaServe::new(&ctx, weights, max_context, pages, pages).expect("serve");
     (ctx, serve, dir)

@@ -28,11 +28,25 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    pub fn new(num_layers: usize, num_kv_heads: usize, head_dim: usize, page_size: usize) -> Self {
-        let kv_block_len = page_size * num_kv_heads * head_dim;
-        let layer_stride = 2 * kv_block_len;
-        let page_stride = num_layers * layer_stride;
-        Self {
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+    ) -> anyhow::Result<Self> {
+        let strides = || -> Option<(usize, usize, usize)> {
+            let kv_block_len = page_size.checked_mul(num_kv_heads)?.checked_mul(head_dim)?;
+            let layer_stride = kv_block_len.checked_mul(2)?;
+            let page_stride = num_layers.checked_mul(layer_stride)?;
+            Some((kv_block_len, layer_stride, page_stride))
+        };
+        let (kv_block_len, layer_stride, page_stride) = strides().ok_or_else(|| {
+            anyhow::anyhow!(
+                "kv layout strides overflow usize: {num_layers} layers x {num_kv_heads} heads x \
+                 {head_dim} dim x {page_size} page"
+            )
+        })?;
+        Ok(Self {
             page_size,
             num_layers,
             num_kv_heads,
@@ -40,7 +54,7 @@ impl KvLayout {
             kv_block_len,
             layer_stride,
             page_stride,
-        }
+        })
     }
 
     pub fn kernel_layout(&self) -> pegainfer_kernels::paged_kv::PagedKvLayout {
@@ -91,8 +105,22 @@ impl KvPool {
         page_size: usize,
         num_pages: usize,
     ) -> Result<Self> {
-        let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size);
-        let total_elements = num_pages * layout.page_stride;
+        let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size)?;
+        let total_elements = num_pages.checked_mul(layout.page_stride).ok_or_else(|| {
+            anyhow::anyhow!(
+                "KvPool geometry overflows: {num_pages} pages x {} elements per page",
+                layout.page_stride
+            )
+        })?;
+        // The allocator multiplies by the element size unchecked; answer
+        // for the byte domain here, before it does.
+        total_elements
+            .checked_mul(std::mem::size_of::<bf16>())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "KvPool geometry overflows the byte domain: {total_elements} bf16 elements"
+                )
+            })?;
 
         let buffer: CudaSlice<bf16> = ctx
             .stream
@@ -331,7 +359,7 @@ mod tests {
     #[test]
     fn stride_geometry_qwen35() {
         // Qwen3.5-4B: 8 full attn layers, 4 KV heads, head_dim=256, page_size=16
-        let l = KvLayout::new(8, 4, 256, 16);
+        let l = KvLayout::new(8, 4, 256, 16).expect("layout");
 
         assert_eq!(l.kv_block_len, 16 * 4 * 256); // 16384 elements
         assert_eq!(l.layer_stride, 2 * 16384); // 32768 (K + V)
@@ -343,7 +371,7 @@ mod tests {
     #[test]
     fn stride_geometry_qwen3() {
         // Qwen3-4B: 36 full attn layers, 4 KV heads, head_dim=128, page_size=16
-        let l = KvLayout::new(36, 4, 128, 16);
+        let l = KvLayout::new(36, 4, 128, 16).expect("layout");
 
         // 36 layers × 16384 = 589824 elements per page
         assert_eq!(l.page_stride, 589_824);

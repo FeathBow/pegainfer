@@ -33,9 +33,7 @@ use crate::serve::LogitsSpan;
 use crate::serve::StepArena;
 use crate::weights::Gemma4Weights;
 
-/// Serving ceiling: bounds the rope tables and the pool budget. The
-/// checkpoint's 262k `max_position_embeddings` needs a table and KV budget
-/// design of its own.
+/// The default serving ceiling; `serving_context` tells the raising story.
 const MAX_CONTEXT: usize = 8192;
 
 /// Decode-batch ceiling: bounds the step buffers, the sampling scratch and
@@ -65,14 +63,14 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
 
     let (submit_tx, mut submit_rx) =
         mpsc::unbounded_channel::<pegainfer_frontend::engine::SubmittedRequest>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<usize>>();
     let join = std::thread::Builder::new()
         .name("gemma4-engine".into())
         .spawn(move || {
             let state = EngineState::load(&dir, device, policy, base_seed, graph_enabled);
             let mut state = match state {
                 Ok(state) => {
-                    let _ = ready_tx.send(Ok(()));
+                    let _ = ready_tx.send(Ok(state.max_context));
                     state
                 }
                 Err(err) => {
@@ -131,51 +129,23 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                 // flight for its whole length. Bound the attempts too, so a
                 // burst costs the streams a bounded number of prefills per
                 // token however deep it is.
-                let mut attempts = 0;
-                while attempts < MAX_CONCURRENCY && active.len() < MAX_CONCURRENCY {
-                    // With the lane busy, arrivals wait in `pending` while
-                    // decode keeps stepping.
-                    if state
-                        .lane
-                        .as_ref()
-                        .is_some_and(|lane| lane.inflight.is_some())
-                    {
-                        break;
-                    }
-                    let Some(item) = pending.pop_front() else {
-                        break;
-                    };
-                    attempts += 1;
-                    let can_wait = !active.is_empty();
-                    match state.admit_and_prefill(
-                        item,
-                        can_wait,
-                        &mut active,
-                        &mut pending,
-                        &mut attempts,
-                    ) {
-                        Admitted::Active(request) => active.push(*request),
-                        Admitted::Done => {}
-                        Admitted::Requeue(item) => {
-                            pending.push_front(*item);
-                            break;
-                        }
-                    }
-                }
+                state.admit_from_queue(&mut pending, &mut active);
                 if !active.is_empty() {
                     state.decode_round(&mut active);
                 }
             }
         })
         .context("spawn gemma4 engine thread")?;
-    ready_rx
+    let servable = ready_rx
         .recv()
         .context("gemma4 engine thread died during load")??;
-    // The checkpoint advertises 262k positions this engine cannot serve.
     // Publishing the real ceiling is what lets the frontend refuse an
     // over-length request with its own message instead of forwarding one the
     // engine can only fail mid-stream.
-    Ok(EngineHandle::new_with_join_handle(submit_tx, join).with_servable_len(MAX_CONTEXT as u32))
+    // The ceiling domain keeps the value inside i32, so this API-boundary
+    // conversion cannot fail.
+    let servable = u32::try_from(servable).expect("ceiling domain holds servable inside u32");
+    Ok(EngineHandle::new_with_join_handle(submit_tx, join).with_servable_len(servable))
 }
 
 struct GenerationPolicy {
@@ -378,7 +348,11 @@ impl Drop for AsyncPrefillLane {
 /// carries the rejection message. The contract refuses every capability
 /// this engine does not implement — echo, a frontend-resolved prefix, P/D
 /// transfer metadata, a multi-partition placement — loudly, not silently.
-fn validate_request(request: &GenerateRequest, prefix_hit_tokens: usize) -> Result<(), String> {
+fn validate_request(
+    request: &GenerateRequest,
+    prefix_hit_tokens: usize,
+    max_context: usize,
+) -> Result<usize, String> {
     let prompt_tokens = request.prompt_tokens.len();
     if prompt_tokens == 0 {
         return Err("empty prompt".into());
@@ -386,13 +360,15 @@ fn validate_request(request: &GenerateRequest, prefix_hit_tokens: usize) -> Resu
     if request.max_tokens == 0 {
         return Err("max_tokens must be positive".into());
     }
-    let context_len = prompt_tokens.checked_add(request.max_tokens);
-    if context_len.is_none_or(|len| len > MAX_CONTEXT) {
+    let Some(context_len) = prompt_tokens
+        .checked_add(request.max_tokens)
+        .filter(|len| *len <= max_context)
+    else {
         return Err(format!(
-            "prompt {prompt_tokens} + max_tokens {} exceeds the serving ceiling {MAX_CONTEXT}",
+            "prompt {prompt_tokens} + max_tokens {} exceeds the serving ceiling {max_context}",
             request.max_tokens
         ));
-    }
+    };
     if request.lora_adapter.is_some() {
         return Err("gemma4 has no LoRA support".into());
     }
@@ -415,32 +391,120 @@ fn validate_request(request: &GenerateRequest, prefix_hit_tokens: usize) -> Resu
             ));
         }
     }
-    Ok(())
+    Ok(context_len)
+}
+
+/// Both pools' page budgets for one configuration; `None` when the
+/// arithmetic overflows.
+fn pool_pages(
+    transient_pages: usize,
+    window_pages: usize,
+    context_pages: usize,
+    slots: usize,
+    cache_entries: usize,
+    entry_global_pages: usize,
+) -> Option<(usize, usize)> {
+    let local = (slots - 1)
+        .checked_mul(window_pages)?
+        .checked_add(transient_pages)?
+        .checked_add(1)?
+        .checked_add(cache_entries.checked_mul(window_pages)?)?;
+    let global = slots
+        .checked_mul(context_pages)?
+        .checked_add(1)?
+        .checked_add(cache_entries.checked_mul(entry_global_pages)?)?;
+    Some((local, global))
+}
+
+/// The global family never releases, so a request's whole account — its
+/// validated context length, page-ceilinged — is what admission must see.
+/// The pool provisions slots times the ceiling and validation caps every
+/// request inside it, so a shortfall at this door is an accounting bug
+/// surfacing before any segment runs, not a load signal.
+fn global_account_pages(context_len: usize) -> usize {
+    context_len.div_ceil(PAGE_SIZE)
 }
 
 /// How many prompts one mixed step may absorb: bounded well below the
 /// sampler-row capacity so a burst still leaves decode rows headroom.
 const MIX_MAX_PROMPTS: usize = 4;
 
+/// The serving ceiling — prompt plus output per request, the pool budget
+/// axis, and the published servable length. `PEGAINFER_MAX_CONTEXT=N`
+/// raises it past the 8192 default up to the checkpoint's own limit; the
+/// pools scale with it, so a raise buys context with device memory.
+fn serving_context(checkpoint_limit: usize) -> Result<usize> {
+    match std::env::var("PEGAINFER_MAX_CONTEXT") {
+        Ok(raw) => parse_serving_context(&raw, checkpoint_limit),
+        Err(std::env::VarError::NotPresent) => Ok(MAX_CONTEXT.min(checkpoint_limit)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PEGAINFER_MAX_CONTEXT is not valid UTF-8")
+        }
+    }
+}
+
+/// The widest ceiling every downstream representation can carry: kernel
+/// position and page metadata is i32, and the published servable length
+/// is u32 — a checkpoint may declare more positions than either holds,
+/// so the contract stops here, not at the checkpoint's word.
+const CEILING_DOMAIN: usize = i32::MAX as usize;
+
+fn parse_serving_context(raw: &str, checkpoint_limit: usize) -> Result<usize> {
+    let limit = checkpoint_limit.min(CEILING_DOMAIN);
+    match raw.trim().parse::<usize>() {
+        Ok(n) if (1024..=limit).contains(&n) => Ok(n),
+        _ => anyhow::bail!(
+            "PEGAINFER_MAX_CONTEXT={raw:?} not recognized \
+             (N, 1024 <= N <= {limit}: the checkpoint's limit inside the i32 metadata domain)"
+        ),
+    }
+}
+
+/// The decode-slot count — the concurrency the pools are budgeted for.
+/// `PEGAINFER_DECODE_SLOTS=N` lowers it from the default 16: the global
+/// family never releases, so its budget is slots times the ceiling, and a
+/// raised ceiling buys context back by giving up slots.
+fn decode_slots() -> Result<usize> {
+    match std::env::var("PEGAINFER_DECODE_SLOTS") {
+        Ok(raw) => parse_decode_slots(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(MAX_CONCURRENCY),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PEGAINFER_DECODE_SLOTS is not valid UTF-8")
+        }
+    }
+}
+
+fn parse_decode_slots(raw: &str) -> Result<usize> {
+    match raw.trim().parse::<usize>() {
+        Ok(n) if (1..=MAX_CONCURRENCY).contains(&n) => Ok(n),
+        _ => anyhow::bail!(
+            "PEGAINFER_DECODE_SLOTS={raw:?} not recognized (N, 1 <= N <= {MAX_CONCURRENCY})"
+        ),
+    }
+}
+
 /// The chunked-walk knob: `PEGAINFER_MIX_CHUNK_TOKENS=N` walks admitted
 /// prompts through shared segment steps of at most `N` prompt rows each —
 /// live streams then advance one token per segment instead of waiting out
 /// a whole prompt. Unset (or `off`/`0`) keeps whole-prompt steps.
-fn mix_chunk_tokens() -> Result<Option<usize>> {
+fn mix_chunk_tokens(max_context: usize) -> Result<Option<usize>> {
     match std::env::var("PEGAINFER_MIX_CHUNK_TOKENS") {
-        Ok(raw) => parse_mix_chunk_tokens(&raw),
-        Err(_) => Ok(None),
+        Ok(raw) => parse_mix_chunk_tokens(&raw, max_context),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PEGAINFER_MIX_CHUNK_TOKENS is not valid UTF-8")
+        }
     }
 }
 
-fn parse_mix_chunk_tokens(raw: &str) -> Result<Option<usize>> {
+fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>> {
     let v = raw.trim().to_ascii_lowercase();
     match v.as_str() {
         "" | "0" | "off" => Ok(None),
         other => match other.parse::<usize>() {
-            Ok(n) if (64..MAX_CONTEXT).contains(&n) => Ok(Some(n)),
+            Ok(n) if n >= 64 && n < max_context => Ok(Some(n)),
             _ => anyhow::bail!(
-                "PEGAINFER_MIX_CHUNK_TOKENS={raw:?} not recognized (off | N, 64 <= N < {MAX_CONTEXT})"
+                "PEGAINFER_MIX_CHUNK_TOKENS={raw:?} not recognized (off | N, 64 <= N < {max_context})"
             ),
         },
     }
@@ -632,6 +696,12 @@ struct EngineState {
     /// The chunked-walk segment span; `None` unless
     /// `PEGAINFER_MIX_CHUNK_TOKENS` opted in at startup.
     mix_chunk: Option<usize>,
+    /// The serving ceiling this process was started with; the pools are
+    /// budgeted against it.
+    max_context: usize,
+    /// The decode-slot count the pools are budgeted for; requests past it
+    /// queue.
+    slots: usize,
 }
 
 impl EngineState {
@@ -642,12 +712,27 @@ impl EngineState {
         base_seed: u64,
         graph_enabled: bool,
     ) -> Result<Self> {
-        // Refuse an unservable global GQA shape or a bad lane mode before
-        // the multi-GiB load.
-        crate::serve::global_split_factor(&crate::config::Gemma4Config::from_file(dir)?)?;
+        // Refuse an unservable global GQA shape, a bad lane mode or a bad
+        // ceiling before the multi-GiB load.
+        let config = crate::config::Gemma4Config::from_file(dir)?;
+        let global_split = crate::serve::global_split_factor(&config)?;
+        let max_context = serving_context(config.max_position_embeddings)?;
         let lane_mode = async_prefill_mode()?;
-        let mix_chunk = mix_chunk_tokens()?;
-        let (weights, _) = Gemma4Weights::from_safetensors(dir, device)?;
+        let mix_chunk = mix_chunk_tokens(max_context)?;
+        let slots = decode_slots()?;
+        if max_context > MAX_CONTEXT {
+            anyhow::ensure!(
+                mix_chunk.is_some(),
+                "PEGAINFER_MAX_CONTEXT={max_context} needs PEGAINFER_MIX_CHUNK_TOKENS: a whole \
+                 scan would hold the full context in sliding pages"
+            );
+            anyhow::ensure!(
+                matches!(lane_mode, AsyncPrefillMode::Off),
+                "the overlap lane prefills whole; PEGAINFER_ASYNC_PREFILL is unsupported over \
+                 the default {MAX_CONTEXT} ceiling"
+            );
+        }
+        let (weights, _) = Gemma4Weights::from_safetensors(dir, device, config)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
         policy.check_against_vocab(vocab)?;
@@ -659,11 +744,12 @@ impl EngineState {
         // segment. The global family never releases, so it stays linear in
         // context for each request's whole lifetime. Both pools add the
         // padding page they reserve.
-        let context_pages = MAX_CONTEXT.div_ceil(PAGE_SIZE);
+        let context_pages = max_context.div_ceil(PAGE_SIZE);
         let window_pages = weights.config.sliding_window.div_ceil(PAGE_SIZE) + 1;
         // The cache brings its own page budget so cached entries never eat
         // serving headroom.
-        let cache_entries = crate::prefix_cache::prefix_cache_cap().unwrap_or(0);
+        let cache_cap = crate::prefix_cache::prefix_cache_cap();
+        let cache_entries = cache_cap.unwrap_or(0);
         let sliding_window = weights.config.sliding_window;
         // With the chunk knob set every scan is bounded by window plus
         // segment — except the lane's, which prefills whole and keeps the
@@ -677,28 +763,48 @@ impl EngineState {
             }
             _ => context_pages,
         };
-        let local_pages = transient_pages
-            + (MAX_CONCURRENCY - 1) * window_pages
-            + 1
-            + cache_entries * window_pages;
-        let global_pages = MAX_CONCURRENCY * context_pages
-            + 1
-            + cache_entries * crate::prefix_cache::entry_global_pages(MAX_CONTEXT);
-        let serve = GemmaServe::new(&ctx, weights, MAX_CONTEXT, local_pages, global_pages)
+        let (local_pages, global_pages) = pool_pages(
+            transient_pages,
+            window_pages,
+            context_pages,
+            slots,
+            cache_entries,
+            crate::prefix_cache::entry_global_pages(max_context),
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the pool budget arithmetic overflows for a {max_context} token ceiling with \
+                 {slots} slots and {cache_entries} cache entries"
+            )
+        })?;
+        // The arena pads steps to power-of-two buckets.
+        let arena_rows = slots.next_power_of_two();
+        // Page ids and mixed-step row metadata are i32 downstream, and the
+        // ceiling guard alone does not bound what slots and cache multiply
+        // out to — the derived counts answer here, before any allocation.
+        anyhow::ensure!(
+            i32::try_from(local_pages).is_ok()
+                && global_pages
+                    .checked_mul(global_split)
+                    .is_some_and(|expanded| i32::try_from(expanded).is_ok())
+                && max_context
+                    .checked_add(arena_rows)
+                    .is_some_and(|cap| i32::try_from(cap).is_ok()),
+            "a {max_context} token ceiling with {slots} slots and {cache_entries} cache entries \
+             derives page or row counts past the i32 metadata domain (the global family's pseudo \
+             tables carry {global_split} copies of every page)"
+        );
+        let serve = GemmaServe::new(&ctx, weights, max_context, local_pages, global_pages)
             .map_err(|err| {
-                if cache_entries > 0 {
-                    err.context(format!(
-                        "PEGAINFER_PREFIX_CACHE={cache_entries} grew the pools to \
-                         {local_pages} local / {global_pages} global pages"
-                    ))
-                } else {
-                    err
-                }
+                err.context(format!(
+                    "a {max_context} token ceiling, {slots} decode slots and {cache_entries} \
+                     cache entries sized the pools to {local_pages} local / {global_pages} \
+                     global pages"
+                ))
             })?;
-        let prefix_cache =
-            crate::prefix_cache::prefix_cache_cap().map(|k| PrefixCache::new(k, sliding_window));
-        let scratch = SampleScratch::new(&ctx, vocab, MAX_CONCURRENCY)?;
-        let mut arena = serve.alloc_step_arena(&ctx, MAX_CONCURRENCY, graph_enabled)?;
+        let prefix_cache = cache_cap.map(|k| PrefixCache::new(k, sliding_window));
+        let scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
+        let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
         serve.precapture_decode_graphs(&ctx, &mut arena)?;
         let blocked = ctx
             .stream
@@ -720,7 +826,42 @@ impl EngineState {
             sample_nonce: 0,
             lane,
             mix_chunk,
+            max_context,
+            slots,
         })
+    }
+
+    /// One turn's intake at the roster edge: admit from the queue head
+    /// until the slots are full, the queue empties, the lane is busy, or a
+    /// request has to wait for pages. Attempts are bounded so a burst
+    /// costs the streams a bounded number of prefills per token however
+    /// deep the queue is.
+    fn admit_from_queue(&mut self, pending: &mut VecDeque<Submitted>, active: &mut Vec<Active>) {
+        let mut attempts = 0;
+        while attempts < self.slots && active.len() < self.slots {
+            // With the lane busy, arrivals wait in `pending` while decode
+            // keeps stepping.
+            if self
+                .lane
+                .as_ref()
+                .is_some_and(|lane| lane.inflight.is_some())
+            {
+                break;
+            }
+            let Some(item) = pending.pop_front() else {
+                break;
+            };
+            attempts += 1;
+            let can_wait = !active.is_empty();
+            match self.admit_and_prefill(item, can_wait, active, pending, &mut attempts) {
+                Admitted::Active(request) => active.push(*request),
+                Admitted::Done => {}
+                Admitted::Requeue(item) => {
+                    pending.push_front(*item);
+                    break;
+                }
+            }
+        }
     }
 
     /// Validate, admit and prefill one request whole, emit its first token,
@@ -753,9 +894,10 @@ impl EngineState {
             }
             Admitted::Done
         };
-        if let Err(message) = validate_request(&request, prefix.hit_tokens()) {
-            return reject(message);
-        }
+        let context_len = match validate_request(&request, prefix.hit_tokens(), self.max_context) {
+            Ok(len) => len,
+            Err(message) => return reject(message),
+        };
 
         let mut resumed = None;
         let mut kv = match self
@@ -807,6 +949,29 @@ impl EngineState {
                     }
                 }
             }
+        } else {
+            // A chunked admission reserves per segment; the whole-account
+            // door (see `global_account_pages`) still answers up front.
+            loop {
+                let global_want = global_account_pages(context_len);
+                if global_want <= kv.global.held_pages() + self.serve.global_pool.available_pages()
+                {
+                    break;
+                }
+                if self
+                    .prefix_cache
+                    .as_mut()
+                    .is_some_and(PrefixCache::evict_lru)
+                {
+                    continue;
+                }
+                if can_wait {
+                    return Admitted::Requeue(Box::new((request, prefix)));
+                }
+                return reject(format!(
+                    "the global family cannot hold this request's {global_want} pages"
+                ));
+            }
         }
         // A restored prefix is what the bridge reports as cached: the
         // resumed KV's frontier is exactly the token count served from it.
@@ -854,8 +1019,8 @@ impl EngineState {
                 };
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
-                    && newcomers.len() + active.len() < MAX_CONCURRENCY
-                    && *attempts < MAX_CONCURRENCY
+                    && newcomers.len() + active.len() < self.slots
+                    && *attempts < self.slots
                 {
                     let Some((cand, cand_prefix)) = pending.pop_front() else {
                         break;
@@ -865,17 +1030,21 @@ impl EngineState {
                     if cand_sink.is_closed() {
                         continue;
                     }
-                    if let Err(message) = validate_request(&cand, cand_prefix.hit_tokens()) {
-                        let n = cand.prompt_tokens.len();
-                        if send_scheduled(&cand, n, 0) {
-                            let _ = cand_sink.send(TokenEvent::Rejected {
-                                message,
-                                prompt_tokens: n,
-                                completion_tokens: 0,
-                            });
-                        }
-                        continue;
-                    }
+                    let cand_context_len =
+                        match validate_request(&cand, cand_prefix.hit_tokens(), self.max_context) {
+                            Ok(len) => len,
+                            Err(message) => {
+                                let n = cand.prompt_tokens.len();
+                                if send_scheduled(&cand, n, 0) {
+                                    let _ = cand_sink.send(TokenEvent::Rejected {
+                                        message,
+                                        prompt_tokens: n,
+                                        completion_tokens: 0,
+                                    });
+                                }
+                                continue;
+                            }
+                        };
                     let cand_len = cand.prompt_tokens.len();
                     let mut cand_resumed = None;
                     let mut cand_kv = match self
@@ -901,10 +1070,16 @@ impl EngineState {
                     };
                     let new_tokens = cand_len - cand_kv.local.seq_len();
                     if self.mix_chunk.is_some() {
-                        // A chunked candidate reserves nothing: its segments
-                        // admit their own pages inside the walk, so parked
-                        // walkers hold no quantum and the shared segment
-                        // transient stays sufficient however many gather.
+                        // A chunked candidate reserves nothing locally: its
+                        // segments admit their own pages inside the walk;
+                        // the whole-account door still answers here.
+                        let cand_global_want = global_account_pages(cand_context_len);
+                        if cand_global_want
+                            > cand_kv.global.held_pages() + self.serve.global_pool.available_pages()
+                        {
+                            pending.push_front((cand, cand_prefix));
+                            break;
+                        }
                         if !send_scheduled(&cand, cand_len, cand_kv.local.seq_len()) {
                             continue;
                         }
@@ -913,9 +1088,15 @@ impl EngineState {
                         continue;
                     }
                     let cand_pages = new_tokens.div_ceil(PAGE_SIZE);
-                    if rows_budget + new_tokens > MIX_GATHER_ROWS
-                        || transient_pages + cand_pages > MAX_CONTEXT.div_ceil(PAGE_SIZE)
-                    {
+                    // The row ceiling is the binding bound: 512 gathered
+                    // rows round to at most ~35 pages of transient while
+                    // the smallest ceiling provisions 64 — kept as an
+                    // invariant note for future constant changes.
+                    debug_assert!(
+                        transient_pages + cand_pages <= self.max_context.div_ceil(PAGE_SIZE)
+                            || rows_budget + new_tokens > MIX_GATHER_ROWS
+                    );
+                    if rows_budget + new_tokens > MIX_GATHER_ROWS {
                         pending.push_front((cand, cand_prefix));
                         break;
                     }
@@ -1882,7 +2063,6 @@ mod lane_tests {
     use pegainfer_frontend::engine::TokenEvent;
     use pegainfer_frontend::engine::TokenSink;
     use pegainfer_frontend::engine::TokenStreamReceiver;
-    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::AsyncPrefillMode;
     use super::parse_async_prefill_mode;
@@ -1892,26 +2072,8 @@ mod lane_tests {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
     ) -> TokenStreamReceiver {
-        let (token_tx, token_rx) = TokenSink::standalone();
-        handle
-            .submit(GenerateRequest {
-                trace_parent: None,
-                request_id: None,
-                queued_at_unix_s: None,
-                data_parallel_rank: None,
-                prompt_tokens,
-                params: SamplingParams {
-                    ignore_eos: true,
-                    ..SamplingParams::default()
-                },
-                max_tokens,
-                lora_adapter: None,
-                kv_transfer_params: None,
-                token_tx,
-                logprobs: 0,
-                echo: false,
-            })
-            .expect("submit");
+        let (request, token_rx) = walk_request(prompt_tokens, max_tokens);
+        handle.submit(request).expect("submit");
         token_rx
     }
 
@@ -1960,21 +2122,70 @@ mod lane_tests {
     /// the drop lands while its pass is in flight — exits through the join;
     /// an out-of-vocab prompt fails the launch itself and the lane drains;
     /// and the engine still serves after all of it.
+    /// Serialize the serving-knob environment across every gate and put it
+    /// back afterwards — including on panic — so no gate can poison another
+    /// or be poisoned by the operator's shell. Values round-trip as OsString.
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard's lock serializes all environment access
+            // among gates, and the ignored suites run single-threaded.
+            unsafe {
+                for (k, v) in self.saved.drain(..) {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    const SERVING_KNOBS: [&str; 5] = [
+        "PEGAINFER_ASYNC_PREFILL",
+        "PEGAINFER_PREFIX_CACHE",
+        "PEGAINFER_MIX_CHUNK_TOKENS",
+        "PEGAINFER_MAX_CONTEXT",
+        "PEGAINFER_DECODE_SLOTS",
+    ];
+
+    /// Clear every serving knob, set `overrides`, and hand back the guard
+    /// that restores the environment when it drops.
+    fn scoped_engine_env(overrides: &[(&str, &str)]) -> EnvGuard {
+        let lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let saved = SERVING_KNOBS
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: as in Drop — the lock serializes environment access.
+        unsafe {
+            for k in SERVING_KNOBS {
+                std::env::remove_var(k);
+            }
+            for (k, v) in overrides {
+                std::env::set_var(k, v);
+            }
+        }
+        EnvGuard { saved, _lock: lock }
+    }
+
     fn lane_lifecycle_script(mode: &str) {
-        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
-        // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
-        // so no other thread reads the environment concurrently.
-        unsafe {
-            std::env::set_var("PEGAINFER_ASYNC_PREFILL", mode);
-            std::env::set_var("PEGAINFER_PREFIX_CACHE", "4");
-        }
-        let handle = super::start(Path::new(&dir), &EngineLoadOptions::default());
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("PEGAINFER_ASYNC_PREFILL");
-            std::env::remove_var("PEGAINFER_PREFIX_CACHE");
-        }
-        let handle = handle.expect("engine start");
+        let dir = crate::testkit::model_path();
+        let _env = scoped_engine_env(&[
+            ("PEGAINFER_ASYNC_PREFILL", mode),
+            ("PEGAINFER_PREFIX_CACHE", "4"),
+        ]);
+        let handle =
+            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
 
         // The streamer pins the decode batch non-empty for the whole
         // script: its budget is far past the script's round count, and its
@@ -2177,32 +2388,129 @@ mod lane_tests {
     /// duration, so the outside environment cannot change the pool or the
     /// admission route under the test.
     fn walk_test_state(chunk: &str) -> super::EngineState {
-        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        let dir = crate::testkit::model_path();
         let policy = super::generation_policy(&dir).expect("policy");
-        let knobs = [
-            "PEGAINFER_ASYNC_PREFILL",
-            "PEGAINFER_PREFIX_CACHE",
-            "PEGAINFER_MIX_CHUNK_TOKENS",
-        ];
-        let saved: Vec<Option<String>> = knobs.iter().map(|k| std::env::var(k).ok()).collect();
-        // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
-        // so no other thread reads the environment concurrently.
-        unsafe {
-            std::env::remove_var("PEGAINFER_ASYNC_PREFILL");
-            std::env::remove_var("PEGAINFER_PREFIX_CACHE");
-            std::env::set_var("PEGAINFER_MIX_CHUNK_TOKENS", chunk);
+        let _env = scoped_engine_env(&[("PEGAINFER_MIX_CHUNK_TOKENS", chunk)]);
+        super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state")
+    }
+
+    /// A raise without the chunk knob, and a raise with the overlap lane,
+    /// both refuse before the multi-GiB load — the startup policy the
+    /// serving doc promises.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and --test-threads=1"]
+    fn the_raise_refuses_without_its_prerequisites() {
+        let dir = crate::testkit::model_path();
+        let load = |overrides: &[(&str, &str)]| {
+            let policy = super::generation_policy(&dir).expect("policy");
+            let _env = scoped_engine_env(overrides);
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true)
+        };
+        let err = load(&[("PEGAINFER_MAX_CONTEXT", "32768")])
+            .err()
+            .expect("a raise without the chunk knob must refuse");
+        assert!(
+            format!("{err:#}").contains("needs PEGAINFER_MIX_CHUNK_TOKENS"),
+            "unexpected refusal: {err:#}"
+        );
+        let err = load(&[
+            ("PEGAINFER_MAX_CONTEXT", "32768"),
+            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
+            ("PEGAINFER_ASYNC_PREFILL", "green:35"),
+        ])
+        .err()
+        .expect("the lane over the default ceiling must refuse");
+        assert!(
+            format!("{err:#}").contains("unsupported over"),
+            "unexpected refusal: {err:#}"
+        );
+    }
+
+    /// The slots boundary, driven at the roster edge the engine loop owns
+    /// — the same intake method, single-threaded, no clocks, no
+    /// thresholds: with both slots held by live requests an intake pass
+    /// leaves the third queued with no Scheduled; once an incumbent
+    /// retires, the same intake admits it and it runs to its budget.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
+    fn the_slots_hold_at_the_roster_edge() {
+        let dir = crate::testkit::model_path();
+        let policy = super::generation_policy(&dir).expect("policy");
+        let _env = scoped_engine_env(&[
+            ("PEGAINFER_MAX_CONTEXT", "32768"),
+            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
+            ("PEGAINFER_DECODE_SLOTS", "2"),
+        ]);
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        let prompts = walk_fixture_prompts();
+        let long: Vec<u32> = prompts[0].iter().cycle().copied().take(12000).collect();
+        let (req_a, mut rx_a) = walk_request(long, 4);
+        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 40);
+        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), 6);
+
+        let mut pending = std::collections::VecDeque::new();
+        let mut active: Vec<super::Active> = Vec::new();
+        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
+        pending.push_back((req_b, pegainfer_frontend::engine::KvPrefix::none()));
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(active.len(), 2, "both slots are held by live requests");
+        assert!(pending.is_empty(), "nothing waits yet");
+
+        pending.push_back((req_c, pegainfer_frontend::engine::KvPrefix::none()));
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(
+            pending.len(),
+            1,
+            "the intake leaves the third request queued at full slots"
+        );
+        assert!(
+            rx_c.try_recv().is_err(),
+            "no Scheduled while both slots are held"
+        );
+
+        while active.len() == 2 {
+            state.decode_round(&mut active);
         }
-        let state = super::EngineState::load(&dir, 0, policy, 0x5EED, true);
-        // SAFETY: as above.
-        unsafe {
-            for (k, v) in knobs.iter().zip(saved) {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(active.len(), 2, "the freed slot admits the third request");
+        assert!(pending.is_empty(), "the queue drained");
+        while !active.is_empty() {
+            state.decode_round(&mut active);
         }
-        state.expect("engine state")
+        assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 4);
+        assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 40);
+        assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
+    }
+
+    /// The raised ceiling's own contract, nothing else: the published
+    /// servable length follows the knob, and a prompt past the default
+    /// 8192 serves through the production engine.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
+    fn the_raised_ceiling_serves_past_the_default() {
+        let dir = crate::testkit::model_path();
+        let _env = scoped_engine_env(&[
+            ("PEGAINFER_MAX_CONTEXT", "32768"),
+            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
+            ("PEGAINFER_DECODE_SLOTS", "2"),
+        ]);
+        let handle =
+            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
+        assert_eq!(
+            handle.servable_len(),
+            Some(32768),
+            "the frontend limit follows the raised ceiling"
+        );
+        let seeds = walk_fixture_prompts();
+        let long: Vec<u32> = seeds[0].iter().cycle().copied().take(12000).collect();
+        let mut rx = submit(&handle, long, 8);
+        assert_eq!(
+            drain(&mut rx, "past-default prompt").tokens,
+            8,
+            "the 12K prompt served its budget"
+        );
+        drop(handle);
     }
 
     /// The chunked pool provisions one shared segment transient, so no
@@ -2214,9 +2522,11 @@ mod lane_tests {
     #[test]
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
     fn the_gathered_transient_leaves_headroom() {
-        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        let dir = crate::testkit::model_path();
         let mut state = walk_test_state("2048");
         assert_eq!(state.mix_chunk, Some(2048), "the knob preceded the load");
+        assert_eq!(state.max_context, 8192, "the ceiling default held");
+        assert_eq!(state.slots, 16, "the slots default held");
         let window = crate::config::Gemma4Config::from_file(&dir)
             .expect("config")
             .sliding_window;
@@ -2273,7 +2583,15 @@ mod lane_tests {
             pending.is_empty(),
             "all three newcomers must enter one gather"
         );
-        assert_eq!(active.len(), 15, "streams plus every walker keep decoding");
+        // Walkers graduate at their final segment's round and may retire
+        // through their two-token budgets before the walk returns; the
+        // streams must all still be decoding, and the drains below hold
+        // every request to its full budget.
+        assert!(
+            active.len() >= 12,
+            "a stream lost its slot during the walk: {} active",
+            active.len()
+        );
         while !active.is_empty() {
             state.decode_round(&mut active);
         }
@@ -2290,30 +2608,28 @@ mod lane_tests {
     }
 
     /// One shared walk against the engine's own serial path, on the reduced
-    /// production pool with the 64-row production floor: three tiled
+    /// production pool with the 64-row production floor: three fixture
     /// prompts get their reference sequences from single-request episodes
     /// through the production admission path, then a rider decodes while
-    /// the other two enter one gathered walk (boundary rounds carry a
-    /// final and a non-final segment), both walk again from an idle roster
-    /// (the segment-by-segment tail path), and a walker cancelled before
-    /// the first round is dropped without touching its partner or the
-    /// rider. Every surviving request's greedy sequence must match its
-    /// reference whole. The direct `mixed_walk` calls in the later phases
-    /// stage what the production loop cannot pin deterministically — a
-    /// drained roster and a mid-walk disconnect — with the production
-    /// zero-ahead reservation shape: nothing is admitted before the walk.
+    /// the other two enter one gathered walk, both walk again from an idle
+    /// roster (the segment-by-segment tail path) at a 24-row span so
+    /// boundary rounds carry a final and a non-final segment, and a walker
+    /// cancelled before the first round is dropped without touching its
+    /// partner or the rider. Every surviving request's greedy sequence
+    /// must match its reference whole. The direct `mixed_walk` calls in
+    /// the later phases stage what the production loop cannot pin
+    /// deterministically — a drained roster, a mid-walk disconnect, a
+    /// span below the knob floor — with the production zero-ahead
+    /// reservation shape: nothing is admitted before the walk. Those
+    /// phases are algorithm oracles for `mixed_walk` itself, not serving
+    /// evidence: the public floor rejects spans under 64.
     #[test]
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
     fn the_gathered_walk_matches_the_serial_path() {
         let mut state = walk_test_state("64");
         assert_eq!(state.mix_chunk, Some(64), "the knob preceded the load");
-        let seeds = walk_fixture_prompts();
+        let prompts = walk_fixture_prompts();
         let cases = ["a", "b", "c"];
-        let lens = [180usize, 150, 190];
-        let prompts: Vec<Vec<u32>> = lens
-            .iter()
-            .map(|&n| seeds[0].iter().cycle().copied().take(n).collect())
-            .collect();
         let budgets = [24usize, 17, 21];
 
         let serial: Vec<Vec<u32>> = prompts
@@ -2380,7 +2696,7 @@ mod lane_tests {
         let kv_b2 = state.serve.alloc_kv();
         let mut active2: Vec<super::Active> = Vec::new();
         let admitted2 = state.mixed_walk(
-            64,
+            24,
             vec![(req_a2, kv_a2, None), (req_b2, kv_b2, None)],
             &mut active2,
         );
@@ -2427,7 +2743,7 @@ mod lane_tests {
         let kv_b3 = state.serve.alloc_kv();
         state.ready_decode_rows(&mut active3);
         let admitted3 = state.mixed_walk(
-            64,
+            24,
             vec![(req_a3, kv_a3, None), (req_b3, kv_b3, None)],
             &mut active3,
         );
@@ -2468,18 +2784,10 @@ mod lane_tests {
     #[test]
     #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
     fn the_gather_engine_lifecycle_completes() {
-        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
-        // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
-        // so no other thread reads the environment concurrently.
-        unsafe {
-            std::env::set_var("PEGAINFER_PREFIX_CACHE", "4");
-        }
-        let handle = super::start(Path::new(&dir), &EngineLoadOptions::default());
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("PEGAINFER_PREFIX_CACHE");
-        }
-        let handle = handle.expect("engine start");
+        let dir = crate::testkit::model_path();
+        let _env = scoped_engine_env(&[("PEGAINFER_PREFIX_CACHE", "4")]);
+        let handle =
+            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
 
         let mut streamer = submit(&handle, ids(40, 0), 1024);
         let mut seen = 0;
@@ -2577,15 +2885,77 @@ mod lane_tests {
     fn mix_chunk_tokens_parses_or_refuses() {
         use super::parse_mix_chunk_tokens;
         for off in ["", "0", "off", " OFF "] {
-            assert_eq!(parse_mix_chunk_tokens(off).unwrap(), None);
+            assert_eq!(parse_mix_chunk_tokens(off, 8192).unwrap(), None);
         }
-        assert_eq!(parse_mix_chunk_tokens("2048").unwrap(), Some(2048));
-        assert_eq!(parse_mix_chunk_tokens("64").unwrap(), Some(64));
+        assert_eq!(parse_mix_chunk_tokens("2048", 8192).unwrap(), Some(2048));
+        assert_eq!(parse_mix_chunk_tokens("64", 8192).unwrap(), Some(64));
+        assert_eq!(
+            parse_mix_chunk_tokens("8192", 262_144).unwrap(),
+            Some(8192),
+            "a raised ceiling admits a wider chunk"
+        );
         for bad in ["63", "8192", "on", "2k", "-1"] {
             assert!(
-                parse_mix_chunk_tokens(bad).is_err(),
+                parse_mix_chunk_tokens(bad, 8192).is_err(),
                 "{bad:?} must refuse, not silently degrade"
             );
         }
+    }
+
+    #[test]
+    fn pool_pages_follow_the_knobs() {
+        // The documented defaults: 8192 ceiling, 16 slots, no cache.
+        assert_eq!(
+            super::pool_pages(512, 65, 512, 16, 0, 256),
+            Some((1488, 8193))
+        );
+        // Raised 32768 x 2 slots with a 2048 chunk: transient = W + 128 + 3.
+        assert_eq!(
+            super::pool_pages(196, 65, 2048, 2, 0, 1024),
+            Some((262, 4097))
+        );
+        assert_eq!(super::pool_pages(usize::MAX, 65, 512, 16, 0, 256), None);
+    }
+
+    #[test]
+    fn the_global_door_is_defensive() {
+        // Validation caps every context inside the ceiling and the pool
+        // provisions slots times the ceiling's pages, so no request's whole
+        // account can exceed its slot's share: the door only ever fires on
+        // an accounting bug, which is exactly its job.
+        for ceiling in [8192usize, 32768, 262_144] {
+            let provision_per_slot = ceiling.div_ceil(super::PAGE_SIZE);
+            for context_len in [1usize, 17, ceiling / 2, ceiling] {
+                assert!(super::global_account_pages(context_len) <= provision_per_slot);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_slots_parse_or_refuse() {
+        use super::parse_decode_slots;
+        assert_eq!(parse_decode_slots("1").unwrap(), 1);
+        assert_eq!(parse_decode_slots("16").unwrap(), 16);
+        for bad in ["0", "17", "two", ""] {
+            assert!(parse_decode_slots(bad).is_err(), "{bad:?} must refuse");
+        }
+    }
+
+    #[test]
+    fn serving_context_parses_or_refuses() {
+        use super::parse_serving_context;
+        assert_eq!(parse_serving_context("262144", 262_144).unwrap(), 262_144);
+        assert_eq!(parse_serving_context(" 32768 ", 262_144).unwrap(), 32_768);
+        assert_eq!(parse_serving_context("1024", 262_144).unwrap(), 1024);
+        for bad in ["1023", "262145", "off", "8k", "-1", ""] {
+            assert!(
+                parse_serving_context(bad, 262_144).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+        assert!(
+            parse_serving_context("4294967296", usize::MAX).is_err(),
+            "the i32 metadata domain caps a checkpoint's wider word"
+        );
     }
 }

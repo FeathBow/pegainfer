@@ -238,7 +238,8 @@ mod oracle {
                 .expect("embed_scale_bf16"),
             "embed scale disagrees with the fixture's recorded bf16 value"
         );
-        let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0).expect("load 12B weights");
+        let (weights, _) =
+            Gemma4Weights::from_safetensors(&dir, 0, config.clone()).expect("load 12B weights");
         let ctx = DeviceContext::new_with_device(0).expect("device context");
 
         let cos_max_pos = 1024;

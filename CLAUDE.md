@@ -46,7 +46,9 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
 - `PEGAINFER_PREFIX_CACHE` — gemma4 opt-in conversation prefix cache: `K` entries of captured prompt state resume multi-turn prompts (pre-allocated page budget; unset = off, byte-identical serving)
 - `PEGAINFER_ASYNC_PREFILL` — gemma4 opt-in overlap lane: `green:NN` prefills live-batch admissions on an SM-capped stream to protect decode tails (`shared` for comparison; unset = off; bad values refuse to start)
-- `PEGAINFER_MIX_CHUNK_TOKENS` — gemma4 opt-in chunked walk: a mixed admission computes at most `N` prompt rows per step (`64..8191`; unset = whole-prompt steps; bad values refuse to start)
+- `PEGAINFER_MIX_CHUNK_TOKENS` — gemma4 opt-in chunked walk: a mixed admission computes at most `N` prompt rows per step (`64 <= N <` the serving ceiling; unset = whole-prompt steps; bad values refuse to start)
+- `PEGAINFER_MAX_CONTEXT` — gemma4 serving ceiling raise (default 8192, up to the checkpoint's 262144; a raise past the default needs `PEGAINFER_MIX_CHUNK_TOKENS` and refuses the async lane)
+- `PEGAINFER_DECODE_SLOTS` — gemma4 decode slots (1..16, default 16): global KV budget = slots x ceiling, trade concurrency for context
 - `GLM52_DECODE_SLOTS` / `GLM52_MTP_DRAFTS` — glm52 runtime profile: decode slots per rank (default 8, ceiling 32) and MTP draft span (default 5); `slots x (1+drafts)` must fit the 96-row step (validated at launch; MTP only). Throughput ceiling profile: `32` / `2`.
 
 ## Tests

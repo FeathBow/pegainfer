@@ -61,6 +61,9 @@ pub(crate) struct Gemma4Config {
     /// Applied as `cap * tanh(x / cap)` over the final logits; every
     /// published size declares one.
     pub(crate) final_logit_softcapping: f32,
+    /// The checkpoint's own position limit — the ceiling a raised serving
+    /// context may not pass.
+    pub(crate) max_position_embeddings: usize,
 }
 
 #[cfg(feature = "gemma4")]
@@ -137,6 +140,12 @@ impl Gemma4Config {
             sliding_window > 0,
             "Gemma 4: sliding_window must be positive"
         );
+        let max_position_embeddings = usize_field(tc, "max_position_embeddings")?;
+        anyhow::ensure!(
+            max_position_embeddings >= sliding_window,
+            "Gemma 4: max_position_embeddings {max_position_embeddings} sits below the \
+             sliding_window {sliding_window}"
+        );
         let final_logit_softcapping = f32_field(tc, "text_config", "final_logit_softcapping")?;
         anyhow::ensure!(
             final_logit_softcapping > 0.0,
@@ -157,6 +166,7 @@ impl Gemma4Config {
             rms_norm_eps: f32_field(tc, "text_config", "rms_norm_eps")?,
             sliding_rope_theta,
             sliding_window,
+            max_position_embeddings,
             global_rope_theta,
             global_rotary_dim: rotary as usize,
             final_logit_softcapping,

@@ -3154,7 +3154,8 @@ impl LocalQwen3Lane {
             buf_layout.num_kv_heads,
             buf_layout.head_dim,
             buf_layout.page_size,
-        );
+        )
+        .expect("kv layout geometry");
         let max_bucket = *BATCH_BUCKETS.last().unwrap();
         let bufs = BatchDecodeBuffers::new(
             model.device_ctx(),

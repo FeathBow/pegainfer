@@ -130,7 +130,8 @@ fn layers_match_hf_probes() {
             .unwrap_or_else(|| panic!("cut {label} missing from fixture"))
     };
 
-    let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0).expect("load 12B weights");
+    let (weights, _) =
+        Gemma4Weights::from_safetensors(&dir, 0, config.clone()).expect("load 12B weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
 
     let geom = LayerGeometry::local_of(&config);

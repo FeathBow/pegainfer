@@ -228,12 +228,15 @@ impl Gemma4Weights {
     /// Loads the text tower onto one device. Config, manifest and headers are
     /// all checked before a device context exists, so a checkpoint that does
     /// not match its config costs no GPU.
+    /// The caller parses and validates the config before the multi-GiB
+    /// load; taking it here keeps that validated copy the one the weights
+    /// are built from.
     pub(crate) fn from_safetensors(
         model_path: &str,
         device_ordinal: usize,
+        config: Gemma4Config,
     ) -> Result<(Self, LoadStats)> {
         let started = Instant::now();
-        let config = Gemma4Config::from_file(model_path)?;
         let manifest = Manifest::from_config(&config)?;
         let manifest_bytes = manifest.weight_bytes()?;
 
@@ -319,7 +322,8 @@ mod tests {
     #[ignore = "needs a Gemma 4 checkpoint and a device"]
     fn loads_the_text_tower_and_reports_residency() -> Result<()> {
         let path = model_path()?;
-        let (weights, stats) = Gemma4Weights::from_safetensors(&path, 0)?;
+        let config = Gemma4Config::from_file(&path)?;
+        let (weights, stats) = Gemma4Weights::from_safetensors(&path, 0, config)?;
 
         let config = &weights.config;
         assert_eq!(weights.layers.len(), config.layer_types.len());
@@ -394,7 +398,8 @@ mod tests {
         std::fs::write(&config_path, serde_json::to_string(&config)?)?;
 
         let staged_path = staged.path().to_str().context("temp path is not UTF-8")?;
-        let err = Gemma4Weights::from_safetensors(staged_path, UNOPENABLE_DEVICE)
+        let parsed = Gemma4Config::from_file(staged_path).expect("config");
+        let err = Gemma4Weights::from_safetensors(staged_path, UNOPENABLE_DEVICE, parsed)
             .err()
             .context("a config that disagrees with the checkpoint was accepted")?
             .to_string();
