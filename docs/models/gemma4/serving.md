@@ -26,7 +26,15 @@ local  = C + (slots - 1) * W + 1 = 512 + 15 * 65 + 1 = 1488 pages
 global = slots * C + 1           = 16 * 512 + 1      = 8193 pages
 ```
 
-The shapes behind the page: the local family is 40 layers of 8 KV heads at head_dim 256, the global family is 8 layers of 1 KV head at head_dim 512, and a page carries K and V for every layer of its family. That makes a local page 5 MiB and a global page 256 KiB, so at 12B the pools are **7.27 GiB local and 2.00 GiB global**, on top of 22.18 GiB of resident weights.
+Those are the knob-off defaults. With `PEGAINFER_MIX_CHUNK_TOKENS=N` set no scan holds more than window plus segment, so the local line shrinks to
+
+```
+local = 16 * W + ceil(N / 16) + (MIX_MAX_PROMPTS - 1) + 1   (+ the cache budget)
+```
+
+— at `N=2048` that is 1172 pages instead of 1488. The global line is unchanged. Every page count and byte figure below is measured with the knob off unless it says otherwise.
+
+The shapes behind the page: the local family is 40 layers of 8 KV heads at head_dim 256, the global family is 8 layers of 1 KV head at head_dim 512, and a page carries K and V for every layer of its family. That makes a local page 5 MiB and a global page 256 KiB, so at 12B the knob-off pools are **7.27 GiB local and 2.00 GiB global**, on top of 22.18 GiB of resident weights.
 
 The asymmetry is the design: the local family only has to hold one full-context transient — the request currently prefilling, which has not released its front yet — on top of the window-capped steady footprint of everyone else. The global family never releases, so it stays linear in context for each request's whole lifetime, and that is what makes it the larger page count despite the smaller page.
 
@@ -67,7 +75,7 @@ curl -s localhost:18099/v1/completions -H 'Content-Type: application/json' \
 
 ## What it costs to hold a slot
 
-The 16 slots are a fixed constant and the pools are sized for all of them up front. Measured on a 49140 MiB card with the default per-bucket CUDA graphs, the process sits at **33034 MiB with no request in flight** and peaked at 33386 MiB under the serving checks below: 22.18 GiB of weights, 9.27 GiB of pools, and the rest CUDA context, RoPE tables, step buffers and the captured graphs. The eager baseline (`--cuda-graph=false`) measured 32926 MiB idle and peaked at 32932 MiB.
+The 16 slots are a fixed constant and the pools are sized for all of them up front. Measured with the chunk knob off on a 49140 MiB card with the default per-bucket CUDA graphs, the process sits at **33034 MiB with no request in flight** and peaked at 33386 MiB under the serving checks below: 22.18 GiB of weights, 9.27 GiB of pools, and the rest CUDA context, RoPE tables, step buffers and the captured graphs. The eager baseline (`--cuda-graph=false`) measured 32926 MiB idle and peaked at 32932 MiB.
 
 That is a hardware floor, not a target. A 32 GiB device cannot start this configuration at all. Serving a single request needs about 2.6 GiB of pool rather than 9.27, so the slot count is what sets the floor, and it is not exposed as a knob today.
 
