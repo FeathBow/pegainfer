@@ -200,6 +200,131 @@ fn score_rows(
     (max_abs, top1)
 }
 
+const LONGCTX_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../test_data/gemma4-12b-hf-longctx-golden.safetensors"
+);
+
+/// A case's sdpa rows with a borrowed tolerance: where eager could not fit
+/// next to the tower, the widest dual-backend case lends its floor — the
+/// reference says what agreement is reachable, not that less is correct.
+fn reference_sdpa_only(
+    fixture: &safetensors::SafeTensors<'_>,
+    case: &str,
+    tolerance: f32,
+    backend_top1_share: f64,
+) -> (Vec<i32>, Vec<f32>, usize, usize, f32, usize) {
+    let (shape, ids) = i32_tensor(fixture, &format!("{case}_sdpa_ids"));
+    let (_, lps) = f32_tensor(fixture, &format!("{case}_sdpa_logprobs"));
+    let (positions, top_k) = (shape[0], shape[1]);
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let backend_top1 = (backend_top1_share * positions as f64).floor() as usize;
+    (ids, lps, positions, top_k, tolerance, backend_top1)
+}
+
+/// The raised ceiling's numeric waypoints: 16384 and 32768 teacher-forced
+/// against the Hugging Face reference — proportional rope and global
+/// attention far past the window fixture's 4096 — each gated at twice its
+/// own backends' measured gap, the widest dual-backend floor standing in
+/// where eager could not fit. The widest case runs again in 2048-token
+/// chunks, the raised ceiling's production prefill shape.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint and the longctx fixture"]
+fn longctx_waypoints_match_hf() {
+    // A 32776-token prefill holds every local page at once (append then
+    // attend); pools sized for one request plus padding.
+    let (ctx, serve, dir) = stack_with(32900, 2200);
+    let bytes = std::fs::read(LONGCTX_FIXTURE).expect("read longctx fixture");
+    let golden = fixture_manifest(
+        &std::fs::read(GOLDEN_PATH).expect("read golden"),
+        METADATA_KEY,
+    );
+    assert_checkpoint_matches(&golden, &dir);
+    let manifest = fixture_manifest(&bytes, "gemma4_longctx_golden");
+    assert_eq!(
+        manifest["revision"], golden["revision"],
+        "the longctx fixture was dumped from a different revision than the golden one"
+    );
+    let eager_skipped: Vec<String> = manifest["eager_skipped"]
+        .as_array()
+        .expect("eager_skipped list")
+        .iter()
+        .map(|v| v.as_str().expect("case name").to_string())
+        .collect();
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+    let page = serve.local_pool.layout().page_size;
+
+    // Neither waypoint fits eager next to the tower on this device, so no
+    // in-fixture dual-backend floor exists; the window fixture's deepest
+    // dual case lends its own — the widest measured agreement bound
+    // available. A depth-grown gap past it fails loud and is widened only
+    // with a written justification.
+    let window_bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let window_manifest = fixture_manifest(&window_bytes, "gemma4_window_golden");
+    assert_eq!(
+        window_manifest["revision"], golden["revision"],
+        "the window fixture was dumped from a different revision than the golden one"
+    );
+    let window_fixture =
+        safetensors::SafeTensors::deserialize(&window_bytes).expect("parse window fixture");
+    let (_, _, donor_positions, _, donor_tolerance, donor_top1) =
+        reference(&window_fixture, "w4096");
+    #[allow(clippy::cast_precision_loss)]
+    let donor_share = donor_top1 as f64 / donor_positions as f64;
+
+    let mut over: Vec<String> = Vec::new();
+    for (case, chunk) in [("w16384", 0), ("w32768", 0), ("w32768", 2048)] {
+        let label = if chunk == 0 {
+            case.to_string()
+        } else {
+            format!("{case}-chunked")
+        };
+        let (ref_ids, ref_lps, positions, top_k, tolerance, backend_top1) =
+            if eager_skipped.contains(&case.to_string()) {
+                reference_sdpa_only(&fixture, case, donor_tolerance, donor_share)
+            } else {
+                reference(&fixture, case)
+            };
+        let run = run_case(&ctx, &serve, &fixture, case, chunk);
+        assert_eq!(run.rows.len(), positions, "{label}: fixture positions");
+        assert_eq!(
+            chunk > 0,
+            run.shifted_multi_token,
+            "{label}: a shifted multi-token step is exactly what chunking adds"
+        );
+
+        let (max_abs, top1) = score_rows(&run.rows, &ref_ids, &ref_lps, top_k, &label);
+        eprintln!(
+            "{label}: max |dlogprob| {max_abs} (tol {tolerance:.2}), top-1 {top1}/{positions} \
+             (backend bar {backend_top1}/{positions}), local pages {}, global {}",
+            run.local_pages, run.global_pages
+        );
+        assert!(
+            top1 >= backend_top1,
+            "{label}: top-1 {top1}/{positions} below the backends' own \
+             {backend_top1}/{positions}"
+        );
+        let released = run.kv_len.saturating_sub(serve.sliding_window) / page;
+        assert_eq!(
+            run.local_pages,
+            run.kv_len.div_ceil(page) - released,
+            "{label}: resident pages after {released} released"
+        );
+        assert_eq!(
+            run.global_pages,
+            run.kv_len.div_ceil(page),
+            "{label}: the global family must keep every page"
+        );
+        if max_abs > tolerance {
+            over.push(format!("{label} ({max_abs} > {tolerance})"));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "cases over their calibrated floor: {over:?}"
+    );
+}
+
 /// Gated distribution-level because a greedy chain is not reachable at this
 /// depth: the reference's own backends continue the same prompt in different
 /// directions, so each case is gated at twice its measured sdpa-vs-eager
