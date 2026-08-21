@@ -7,8 +7,10 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -96,6 +98,12 @@ impl WeightPrefetch {
     pub fn spawn(shard_paths: &[String]) -> Self {
         const CHUNK: u64 = 16 << 20;
         const THREADS: usize = 8;
+        /// Below this the prefetch cannot outrun the load path it shares the
+        /// device with, so warming stops being a head start and is only
+        /// contention.
+        const FLOOR_BYTES_PER_SEC: f64 = 1e9;
+        /// Read enough that the rate is the device's and not thread start-up.
+        const PROBE_BYTES: u64 = 512 << 20;
 
         let stats = Arc::new(PrefetchStats::default());
         let mut files: Vec<(Arc<fs::File>, u64, String)> = Vec::new();
@@ -129,10 +137,13 @@ impl WeightPrefetch {
             let files = Arc::new(files);
             let chunks = Arc::new(chunks);
             let next = Arc::new(AtomicUsize::new(0));
+            let read_bytes = Arc::new(AtomicU64::new(0));
+            let started = Instant::now();
             for _ in 0..threads {
                 let worker = {
                     let (files, chunks, next) = (files.clone(), chunks.clone(), next.clone());
                     let (cancel, stats) = (cancel.clone(), stats.clone());
+                    let read_bytes = read_bytes.clone();
                     std::thread::Builder::new()
                         .name("weight-prefetch".into())
                         .spawn(move || {
@@ -144,9 +155,28 @@ impl WeightPrefetch {
                                 };
                                 let (file, len, path) = &files[file_idx];
                                 let want = CHUNK.min(len - off) as usize;
-                                if let Err(err) = file.read_exact_at(&mut buf[..want], off) {
-                                    stats.read_errors.fetch_add(1, Ordering::Relaxed);
-                                    stats.record_first_error(|| format!("{path}@{off}: {err}"));
+                                match file.read_exact_at(&mut buf[..want], off) {
+                                    Ok(()) => {
+                                        let read = want as u64;
+                                        let done =
+                                            read_bytes.fetch_add(read, Ordering::Relaxed) + read;
+                                        if done >= PROBE_BYTES && done - read < PROBE_BYTES {
+                                            let rate =
+                                                done as f64 / started.elapsed().as_secs_f64();
+                                            if rate < FLOOR_BYTES_PER_SEC {
+                                                cancel.store(true, Ordering::Relaxed);
+                                                info!(
+                                                    "Weight prefetch standing down: source reads at {:.2} GB/s, leaving the device to the load path",
+                                                    rate / 1e9
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                                        stats
+                                            .record_first_error(|| format!("{path}@{off}: {err}"));
+                                    }
                                 }
                             }
                         })
