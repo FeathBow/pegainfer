@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -94,13 +95,33 @@ impl PrefetchStats {
     }
 }
 
+/// `RWF_NOWAIT` fails with `EAGAIN` for a page the kernel would have to fetch.
+/// One page stands for the chunk, and any error counts as a miss.
+fn chunk_looks_resident(file: &fs::File, off: u64) -> bool {
+    let mut page = [0u8; 4096];
+    let iov = libc::iovec {
+        iov_base: page.as_mut_ptr().cast(),
+        iov_len: page.len(),
+    };
+    // SAFETY: `iov` describes `page.len()` writable bytes that outlive the call.
+    let got = unsafe {
+        libc::preadv2(
+            file.as_raw_fd(),
+            &raw const iov,
+            1,
+            off as libc::off_t,
+            libc::RWF_NOWAIT,
+        )
+    };
+    got > 0
+}
+
 impl WeightPrefetch {
     pub fn spawn(shard_paths: &[String]) -> Self {
         const CHUNK: u64 = 16 << 20;
         const THREADS: usize = 8;
         /// Below this the prefetch cannot outrun the load path it shares the
-        /// device with, so warming stops being a head start and is only
-        /// contention.
+        /// device with, and only contends with it.
         const FLOOR_BYTES_PER_SEC: f64 = 1e9;
         /// Read enough that the rate is the device's and not thread start-up.
         const PROBE_BYTES: u64 = 512 << 20;
@@ -147,14 +168,21 @@ impl WeightPrefetch {
                     std::thread::Builder::new()
                         .name("weight-prefetch".into())
                         .spawn(move || {
-                            let mut buf = vec![0u8; CHUNK as usize];
+                            // A resident checkpoint reads no chunk at all.
+                            let mut buf = Vec::new();
                             while !cancel.load(Ordering::Relaxed) {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(&(file_idx, off)) = chunks.get(i) else {
                                     break;
                                 };
                                 let (file, len, path) = &files[file_idx];
+                                if chunk_looks_resident(file, off) {
+                                    continue;
+                                }
                                 let want = CHUNK.min(len - off) as usize;
+                                if buf.is_empty() {
+                                    buf = vec![0u8; CHUNK as usize];
+                                }
                                 match file.read_exact_at(&mut buf[..want], off) {
                                     Ok(()) => {
                                         let read = want as u64;
