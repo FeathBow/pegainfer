@@ -1,7 +1,6 @@
 //! Shared plumbing for the in-crate checkpoint oracles: the golden fixture,
 //! its provenance checks, and typed tensor readers.
 
-use half::bf16;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -98,22 +97,6 @@ pub(crate) fn assert_checkpoint_matches(manifest: &serde_json::Value, dir: &str)
              oracle runs against that checkpoint only"
         );
     }
-}
-
-pub(crate) fn bf16_tensor(
-    fixture: &safetensors::SafeTensors<'_>,
-    name: &str,
-) -> (Vec<usize>, Vec<bf16>) {
-    let view = fixture.tensor(name).expect("fixture tensor");
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16, "{name} dtype");
-    let host = view
-        .data()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
-        .collect();
-    (view.shape().to_vec(), host)
 }
 
 /// Log-probabilities at `ids`, plus our own argmax. The 262k-way sum

@@ -21,10 +21,7 @@ FEATURE=gemma4
 # gate to the crate without adding it here fails the membership check.
 GATES_NUMERIC_PARITY=(
   serve::oracle::context_waypoints_match_hf
-  serve::oracle::serve_matches_oracle_forward
   serve::oracle::greedy_matches_hf_generate
-  forward::oracle::full_forward_matches_hf_topk
-  layer::oracle::layers_match_hf_probes
 )
 GATES_ADMISSION=(
   serve::oracle::mixed_step_matches_serial

@@ -1,11 +1,10 @@
-//! GPU + checkpoint gates for the KV serving path. The A/B oracle needs only
-//! the existing golden fixture; the generate gate needs the HF `generate()`
-//! fixture dumped on the test box.
+//! GPU + checkpoint gates for the KV serving path, every one of them the
+//! production path against an external reference or against itself under a
+//! different admission shape.
 
 use anyhow::Result;
 
 use super::*;
-use crate::forward::full_forward;
 use crate::kv::admit_tokens;
 use crate::testkit::f32_tensor;
 use crate::testkit::fixture_manifest;
@@ -14,21 +13,6 @@ use crate::testkit::i32_tensor;
 use crate::testkit::log_softmax_at;
 use crate::testkit::model_path;
 use crate::testkit::u32_tensor;
-
-/// Compare one logit row against the oracle's: both must be finite (a NaN
-/// would rank highest under `total_cmp` and be ignored by `f32::max`), the
-/// argmaxes must agree, and the worst absolute gap is what the caller gates.
-fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> f32 {
-    assert!(
-        ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
-        "{what}: non-finite logit"
-    );
-    assert_eq!(argmax(ours), argmax(theirs), "{what}: argmax diverged");
-    ours.iter()
-        .zip(theirs)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max)
-}
 
 fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
@@ -405,95 +389,6 @@ fn eviction_is_footprint_only() {
         pages_evicted < pages_retained,
         "release must shrink the resident footprint ({pages_evicted} vs {pages_retained})"
     );
-}
-
-/// The paged serving path against the no-KV oracle forward on the same
-/// weights and tokens: each decode step is compared against a full recompute
-/// of the grown sequence, so a KV write that drifts shows up immediately.
-#[test]
-#[ignore = "requires the pinned 12B checkpoint and a GPU"]
-fn serve_matches_oracle_forward() {
-    let (ctx, serve, dir) = load_stack();
-    let (fixture_bytes, _) = golden_bytes(&dir);
-    let fixture = safetensors::SafeTensors::deserialize(&fixture_bytes).expect("parse fixture");
-    let (_, mut tokens) = u32_tensor(&fixture, "short_tokens");
-    let config = &serve.weights.config;
-    let local_geom = LayerGeometry::local_of(config);
-    let global_geom = LayerGeometry::global_of(config);
-    let (scos, ssin) = pegainfer_core::rope::precompute_rope(
-        &ctx,
-        &RopeTableSpec {
-            rotary_dim: local_geom.head_dim,
-            frequency_dim: local_geom.head_dim,
-            max_seq_len: 1024,
-            theta: config.sliding_rope_theta,
-        },
-    )
-    .expect("sliding tables");
-    let (gcos, gsin) = build_proportional_rope_tables(
-        &ctx,
-        config.global_rope_theta,
-        global_geom.head_dim,
-        config.global_rotary_dim,
-        1024,
-    )
-    .expect("global tables");
-
-    let oracle = |tokens: &[u32]| -> Vec<f32> {
-        let logits = full_forward(
-            &ctx,
-            &serve.weights,
-            tokens,
-            (&scos, &ssin),
-            (&gcos, &gsin),
-            1024,
-        )
-        .expect("oracle forward");
-        logits.to_host(&ctx).expect("D2H")
-    };
-
-    let mut kv = serve.alloc_kv();
-    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, tokens.len())
-        .expect("admit prompt");
-    let serve_logits = serve.step(&ctx, &mut kv, &tokens).expect("serve prefill");
-    let vocab = serve_logits.hidden_dim;
-    let serve_host = serve_logits.to_host(&ctx).expect("D2H");
-    let oracle_host = oracle(&tokens);
-    let last = tokens.len() - 1;
-    let oracle_last = &oracle_host[last * vocab..(last + 1) * vocab];
-    let max_abs = compare_row(&serve_host, oracle_last, "prefill last row");
-    eprintln!(
-        "prefill: last of {} positions, max |dlogit| {max_abs}",
-        tokens.len()
-    );
-    // The former all-row comparison measured a 1.31 peak, so its 2.0
-    // bound remains a conservative ceiling for the production last row.
-    assert!(
-        max_abs <= 2.0,
-        "prefill last-row |dlogit| {max_abs} above calibrated 2.0"
-    );
-
-    // Feed the ORACLE's continuation each step so one divergence cannot
-    // cascade; its last row doubles as the next step's greedy pick.
-    let mut oracle_last = oracle_host[(tokens.len() - 1) * vocab..tokens.len() * vocab].to_vec();
-    let mut arena = serve
-        .alloc_step_arena(&ctx, 1, false)
-        .expect("oracle step arena");
-    for step in 0..4 {
-        let next = u32::try_from(argmax(&oracle_last)).expect("token id");
-        let step_host =
-            decode_serving(&serve, &ctx, &mut arena, &mut kv, next).expect("serve decode step");
-        tokens.push(next);
-        let o = oracle(&tokens);
-        oracle_last = o[(tokens.len() - 1) * vocab..tokens.len() * vocab].to_vec();
-        let s_row = &step_host[0..vocab];
-        let m = compare_row(s_row, &oracle_last, &format!("decode step {step}"));
-        eprintln!("decode step {step}: max |dlogit| {m}");
-        assert!(
-            m <= 2.0,
-            "decode step {step} |dlogit| {m} above calibrated 2.0"
-        );
-    }
 }
 
 /// DoD gate: greedy continuation matches HF `generate()` token for

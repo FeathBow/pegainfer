@@ -17,17 +17,6 @@ pub(crate) enum LayerKind {
     Global,
 }
 
-#[cfg(all(feature = "gemma4", test))]
-pub(crate) fn first_last(layer_types: &[LayerKind], kind: LayerKind) -> Option<(usize, usize)> {
-    let mut matching = layer_types
-        .iter()
-        .enumerate()
-        .filter(|(_, k)| **k == kind)
-        .map(|(index, _)| index);
-    let first = matching.next()?;
-    Some((first, matching.next_back().unwrap_or(first)))
-}
-
 /// What the manifest is derived from. Only [`Gemma4Config::from_file`] is
 /// probe-backed; a value built directly is not, so consumers check what they
 /// depend on.

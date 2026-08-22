@@ -17,6 +17,10 @@ Last touched: 2026-08.
 | `short` | 9 | yes | the compact multi-token case — causal masking and non-zero positions are live from two tokens on |
 | `edge` | 1024 | no | the widest prefill that evicts nothing, at exactly `sliding_window` |
 
+No gate reads the probe activations any more: the layer-probe comparison ran a test-only second
+implementation of the decoder layers, and it went when that implementation did. The probes stay in
+the fixture and in the dumper, so a future per-layer gate needs no re-dump.
+
 Global layers have no `v_proj` — the value is the `k_proj` output on its scale-free branch — so
 `single` exercises `k_proj` too. The window edge is 1024 rather than 1023, measured rather than
 read off the mask: changing token 0 still moves the last position of layer 0's output at 1023 and
