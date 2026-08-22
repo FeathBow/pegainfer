@@ -368,6 +368,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a GPU"]
     fn admission_is_atomic_across_pools() {
         let ctx = DeviceContext::new().expect("GPU required");
         let (local, global) = tiny_pools(&ctx);

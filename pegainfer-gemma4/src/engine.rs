@@ -2008,6 +2008,7 @@ mod gate {
     use super::*;
 
     #[test]
+    #[ignore = "requires a GPU"]
     fn the_suppression_mask_writes_only_the_ids_it_is_given() {
         let ctx = DeviceContext::new().expect("GPU required");
         let (vocab, rows) = (8usize, 2usize);
@@ -2817,9 +2818,19 @@ mod lane_tests {
 
     #[test]
     #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_engine_lifecycle_variants_complete() {
+    fn the_shared_lane_lifecycle_completes() {
         lane_lifecycle_script("shared");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_green_lane_lifecycle_completes() {
         lane_lifecycle_script("green:35");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_gathered_lifecycle_completes() {
         gather_lifecycle_script();
     }
 

@@ -18,7 +18,9 @@ CRATE=pegainfer-gemma4
 FEATURE=gemma4
 
 # The maintained suite, grouped by the invariant each gate owns. Adding a
-# gate to the crate without adding it here fails the membership check.
+# gate to the crate without adding it here fails the membership check, which
+# covers every target an ignored test can live in — the library and each
+# integration binary — so a gate cannot hide in one the runner never looks at.
 GATES_NUMERIC_PARITY=(
   serve::oracle::context_waypoints_match_hf
   serve::oracle::greedy_matches_hf_generate
@@ -29,7 +31,9 @@ GATES_ADMISSION=(
   engine::lane_tests::the_gathered_transient_leaves_headroom
 )
 GATES_SERVING_CONTRACT=(
-  engine::lane_tests::the_engine_lifecycle_variants_complete
+  engine::lane_tests::the_shared_lane_lifecycle_completes
+  engine::lane_tests::the_green_lane_lifecycle_completes
+  engine::lane_tests::the_gathered_lifecycle_completes
   engine::lane_tests::the_raised_ceiling_and_slots_hold_at_the_roster_edge
   engine::lane_tests::the_raise_reaches_the_frontend
   engine::lane_tests::the_raise_refuses_without_its_prerequisites
@@ -44,12 +48,28 @@ GATES_LOADER=(
   weights::load::tests::loads_the_text_tower_and_reports_residency
   weights::load::tests::a_disagreeing_config_names_every_faulty_tensor
 )
-MANIFEST=(
+# A card but no checkpoint is all these two need. They run under the same
+# preflight regardless: a gate the runner does not own is a gate nothing runs.
+GATES_DEVICE=(
+  engine::gate::the_suppression_mask_writes_only_the_ids_it_is_given
+  kv::tests::admission_is_atomic_across_pools
+)
+MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
   "${GATES_ADMISSION[@]}"
   "${GATES_SERVING_CONTRACT[@]}"
   "${GATES_KV_AND_LANES[@]}"
   "${GATES_LOADER[@]}"
+  "${GATES_DEVICE[@]}"
+)
+
+# Integration gates live in their own binaries, which `--lib` cannot see. One
+# array per binary, named GATES_<TARGET>; the target list itself is held
+# against `tests/*.rs` below, so a new binary fails the check rather than
+# going unowned.
+INTEGRATION_TARGETS=(tokenizer_parity)
+GATES_TOKENIZER_PARITY=(
+  string_form_chat_renders_match_hf_reference
 )
 
 FIXTURES=(
@@ -123,34 +143,65 @@ print(f"preflight: {len(fixtures)} fixtures agree on revision {revision[:12]}")
 PY
 
 # --- membership: the crate's ignored set must be exactly the manifest ------
-listing=$(cargo test --release -p "$CRATE" --features "$FEATURE" --lib -- \
-  --ignored --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort)
-[ -n "$listing" ] || die "could not list the crate's ignored gates"
-expected=$(printf '%s\n' "${MANIFEST[@]}" | sort)
-missing=$(comm -13 <(printf '%s\n' "$listing") <(printf '%s\n' "$expected"))
-extra=$(comm -23 <(printf '%s\n' "$listing") <(printf '%s\n' "$expected"))
-[ -z "$missing" ] || die "manifest names gates the crate does not have:"$'\n'"$missing"
-[ -z "$extra" ] || die "the crate has ignored gates the manifest does not name:"$'\n'"$extra"
+ignored_in() {
+  cargo test --release -p "$CRATE" --features "$FEATURE" "$@" -- \
+    --ignored --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
+}
+
+check_membership() {
+  local what=$1 listing=$2 expected=$3 missing extra
+  missing=$(comm -13 <(printf '%s\n' "$listing") <(printf '%s\n' "$expected"))
+  extra=$(comm -23 <(printf '%s\n' "$listing") <(printf '%s\n' "$expected"))
+  [ -z "$missing" ] || die "the manifest names $what gates that do not exist:"$'\n'"$missing"
+  [ -z "$extra" ] || die "$what has ignored gates the manifest does not name:"$'\n'"$extra"
+}
+
+lib_listing=$(ignored_in --lib)
+[ -n "$lib_listing" ] || die "could not list the library's ignored gates"
+check_membership "library" "$lib_listing" "$(printf '%s\n' "${MANIFEST_LIB[@]}" | sort)"
+
+# The integration binaries the crate actually has, so adding one without a
+# manifest entry fails here instead of leaving its gates unowned.
+discovered=$(find "$CRATE/tests" -maxdepth 1 -name '*.rs' -exec basename {} .rs \; 2>/dev/null | sort)
+declared=$(printf '%s\n' "${INTEGRATION_TARGETS[@]}" | sort)
+[ "$discovered" = "$declared" ] || die \
+  "integration binaries disagree with INTEGRATION_TARGETS:"$'\n'"on disk: $discovered"$'\n'"declared: $declared"
+
+all_gates=()
+for gate in "${MANIFEST_LIB[@]}"; do all_gates+=("lib|$gate"); done
+for target in "${INTEGRATION_TARGETS[@]}"; do
+  names="GATES_$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')[@]"
+  check_membership "integration binary $target" \
+    "$(ignored_in --test "$target")" "$(printf '%s\n' "${!names}" | sort)"
+  for gate in "${!names}"; do all_gates+=("$target|$gate"); done
+done
 
 filter=${1:-}
 selected=()
-for gate in "${MANIFEST[@]}"; do
-  [ -z "$filter" ] || [[ $gate == *"$filter"* ]] || continue
-  selected+=("$gate")
+for entry in "${all_gates[@]}"; do
+  [ -z "$filter" ] || [[ ${entry#*|} == *"$filter"* ]] || continue
+  selected+=("$entry")
 done
 [ ${#selected[@]} -gt 0 ] || die "filter ${filter:-<none>} selected no gate"
 
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"
 echo "gemma4 gates: checkpoint $ckpt"
-echo "gemma4 gates: ${#selected[@]} selected of ${#MANIFEST[@]} in the manifest"
-printf '  %s\n' "${selected[@]}"
+echo "gemma4 gates: ${#selected[@]} selected of ${#all_gates[@]} in the manifest"
+printf '  %s\n' "${selected[@]#*|}"
 
 # --- execution: one gate per process, serialized --------------------------
 completed=0
 failed=()
-for gate in "${selected[@]}"; do
+for entry in "${selected[@]}"; do
+  target=${entry%%|*}
+  gate=${entry#*|}
+  if [ "$target" = lib ]; then
+    target_args=(--lib)
+  else
+    target_args=(--test "$target")
+  fi
   echo "--- $gate"
-  if cargo test --release -p "$CRATE" --features "$FEATURE" --lib -- \
+  if cargo test --release -p "$CRATE" --features "$FEATURE" "${target_args[@]}" -- \
       --ignored --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
     completed=$((completed + 1))
   else
