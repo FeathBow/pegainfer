@@ -2159,7 +2159,7 @@ fn main() {
                 flashinfer.spdlog.to_string_lossy().to_string(),
                 "-I".to_string(),
                 csrc_dir
-                    .join("kimi_k2/vllm_marlin")
+                    .join("marlin/vllm_marlin")
                     .to_string_lossy()
                     .to_string(),
             ]);
@@ -2211,8 +2211,10 @@ fn main() {
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
                 "-I".to_string(),
+                csrc_dir.join("marlin").to_string_lossy().to_string(),
+                "-I".to_string(),
                 csrc_dir
-                    .join("kimi_k2/vllm_marlin")
+                    .join("marlin/vllm_marlin")
                     .to_string_lossy()
                     .to_string(),
             ]);
