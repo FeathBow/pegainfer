@@ -618,6 +618,7 @@ pub(crate) struct GemmaServe {
     sliding_window: usize,
     global_split_factor: usize,
     final_logit_softcapping: f32,
+    #[cfg(test)]
     release_enabled: bool,
     sliding_cos: DeviceVec,
     sliding_sin: DeviceVec,
@@ -745,6 +746,7 @@ impl GemmaServe {
             sliding_window,
             global_split_factor,
             final_logit_softcapping,
+            #[cfg(test)]
             release_enabled: true,
             sliding_cos,
             sliding_sin,
@@ -1078,12 +1080,12 @@ impl GemmaServe {
     }
 
     fn advance_local(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
-        if self.release_enabled {
-            kv.local.advance_and_release(tokens, self.sliding_window)
-        } else {
+        #[cfg(test)]
+        if !self.release_enabled {
             kv.local.advance(tokens);
-            Ok(())
+            return Ok(());
         }
+        kv.local.advance_and_release(tokens, self.sliding_window)
     }
 
     fn check_step_bounds(&self, kv: &GemmaKv, kv_len: usize) -> Result<()> {

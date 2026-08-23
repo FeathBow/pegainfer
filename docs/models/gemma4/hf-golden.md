@@ -158,14 +158,19 @@ The gates that consume them are `#[ignore]`: they need the checkpoint and a devi
 compiles them. `scripts/gemma4_gates.sh` runs them:
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=<checkpoint> scripts/gemma4_gates.sh [name-filter]
+PEGAINFER_TEST_MODEL_PATH=<checkpoint> \
+  PEGAINFER_GATE_GPU=<index-or-UUID> scripts/gemma4_gates.sh [name-filter]
 ```
 
 It refuses to start when the checkpoint, a fixture, the pinned metadata or a device is missing,
 holds the crate's ignored set against the gate list it carries — so a gate cannot leave the suite
-unnoticed — and runs one gate per process. That last part is not a stylistic choice: repeated 12B
-loads inside one test binary exhaust a 48 GiB device, and a plain `cargo test -- --ignored` run
-fails its last gates on allocation rather than on any assertion.
+unnoticed — and runs one gate per process. For a GPU-backed selection it resolves the requested
+device to its stable UUID, exports that UUID as the sole `CUDA_VISIBLE_DEVICES` entry, and holds a
+non-blocking cross-process lock on it until the suite exits. Lock contention refuses the run before
+the first gate; when no selector is supplied the runner uses an existing single-device
+`CUDA_VISIBLE_DEVICES`, then physical device 0. This ownership and one-process execution are not
+stylistic choices: repeated 12B loads inside one test binary exhaust a 48 GiB device, while two
+runners sharing a card can fail each other's gates on allocation rather than on any assertion.
 
 ## Why hooks rather than `output_hidden_states`
 

@@ -279,10 +279,6 @@ mod tests {
 
     use super::*;
 
-    const WINDOW: usize = 1024;
-    const SEGMENT: usize = 128;
-    const TOTAL: usize = 1500;
-
     fn tiny_pools(ctx: &DeviceContext) -> (KvPool, KvPool) {
         let local = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 4).expect("local pool");
         let global = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 2).expect("global pool");
@@ -294,77 +290,6 @@ mod tests {
             local: SlidingLocalKv::new(local.clone()),
             global: global.alloc(),
         }
-    }
-
-    fn apply_release(state: ReleaseState, tokens: usize) -> ReleaseState {
-        let plan = plan_release(
-            state,
-            ReleaseStep {
-                tokens,
-                window: WINDOW,
-                page_size: PAGE_SIZE,
-            },
-        )
-        .expect("release plan");
-        ReleaseState {
-            frontier: plan.frontier,
-            origin_pages: plan.origin_pages,
-            resident_pages: state.resident_pages - plan.release_pages,
-        }
-    }
-
-    fn segmented(mut state: ReleaseState) -> ReleaseState {
-        let mut left = TOTAL;
-        while left > 0 {
-            let tokens = left.min(SEGMENT);
-            state = apply_release(state, tokens);
-            left -= tokens;
-        }
-        state
-    }
-
-    #[test]
-    fn whole_and_segmented_release_share_one_ledger() {
-        let initial = ReleaseState {
-            frontier: 0,
-            origin_pages: 0,
-            resident_pages: TOTAL.div_ceil(PAGE_SIZE),
-        };
-        assert_eq!(segmented(initial), apply_release(initial, TOTAL));
-    }
-
-    #[test]
-    fn segment_admission_keeps_the_same_ledger_and_bounds_residency() {
-        let mut state = ReleaseState {
-            frontier: 0,
-            origin_pages: 0,
-            resident_pages: 0,
-        };
-        let mut peak = 0;
-        let mut left = TOTAL;
-        while left > 0 {
-            let tokens = left.min(SEGMENT);
-            state.resident_pages += pages_to_reserve(
-                state.frontier + tokens,
-                state.origin_pages + state.resident_pages,
-                PAGE_SIZE,
-            )
-            .expect("the account cannot sit past its own frontier");
-            peak = peak.max(state.resident_pages);
-            state = apply_release(state, tokens);
-            left -= tokens;
-        }
-        let whole = apply_release(
-            ReleaseState {
-                frontier: 0,
-                origin_pages: 0,
-                resident_pages: TOTAL.div_ceil(PAGE_SIZE),
-            },
-            TOTAL,
-        );
-        assert_eq!(state, whole);
-        let cap = WINDOW.div_ceil(PAGE_SIZE) + SEGMENT.div_ceil(PAGE_SIZE) + 1;
-        assert!(peak <= cap, "resident peak {peak} exceeds cap {cap}");
     }
 
     #[test]

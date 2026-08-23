@@ -4,11 +4,12 @@
 # The gates below need a real checkpoint, its fixtures and a device, so CI
 # only compiles them. This script owns their execution: it refuses to start
 # unless every prerequisite is present, it holds the discovered gate set
-# against the manifest here so a gate cannot quietly leave the suite, and it
-# runs one gate per process so two checkpoint-heavy tests never share a
-# device — repeated 12B loads in one test binary exhaust a 48 GiB card.
+# against the manifest here so a gate cannot quietly leave the suite. It
+# claims one physical device for the suite's lifetime and runs one gate per
+# process — repeated 12B loads in one test binary exhaust a 48 GiB card.
 #
-#   PEGAINFER_TEST_MODEL_PATH=<checkpoint> scripts/gemma4_gates.sh [filter]
+#   PEGAINFER_TEST_MODEL_PATH=<checkpoint> \
+#     [PEGAINFER_GATE_GPU=<index-or-UUID>] scripts/gemma4_gates.sh [filter]
 #
 # A filter runs the subset of manifest gates whose names contain it; the
 # membership check still covers the whole manifest.
@@ -16,6 +17,7 @@ set -uo pipefail
 
 CRATE=pegainfer-gemma4
 FEATURE=gemma4
+GPU_LOCK_ROOT=/tmp
 
 # The maintained suite, grouped by the invariant each gate owns. Adding a
 # gate to the crate without adding it here fails the membership check, which
@@ -79,6 +81,8 @@ MANIFEST_LIB=(
 # against `tests/*.rs` below, so a new binary fails the check rather than
 # going unowned.
 INTEGRATION_TARGETS=(tokenizer_parity)
+# Expanded indirectly from each name in INTEGRATION_TARGETS.
+# shellcheck disable=SC2034
 GATES_TOKENIZER_PARITY=(
   "ckpt,chatgolden string_form_chat_renders_match_hf_reference"
 )
@@ -102,10 +106,51 @@ cd "$root" || die "cannot enter the repository root"
 # carries the cost of what it runs: the device-only gates need no checkpoint,
 # and the chat-render gate needs no card.
 ckpt=
+gpu_uuid=
+gpu_lock_fd=
 
 require_gpu() {
   command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable, so no device can be claimed"
-  nvidia-smi -L 2>/dev/null | grep -q GPU || die "nvidia-smi lists no device"
+  command -v flock >/dev/null 2>&1 || die "flock is unavailable, so device ownership cannot be enforced"
+
+  local selector=${PEGAINFER_GATE_GPU:-}
+  if [ -z "$selector" ] && [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
+    [ -n "$CUDA_VISIBLE_DEVICES" ] || die \
+      "CUDA_VISIBLE_DEVICES is empty; set PEGAINFER_GATE_GPU to claim a device"
+    [[ $CUDA_VISIBLE_DEVICES != *,* ]] || die \
+      "CUDA_VISIBLE_DEVICES must name one device; set PEGAINFER_GATE_GPU explicitly"
+    selector=$CUDA_VISIBLE_DEVICES
+  fi
+  selector=${selector:-0}
+  [[ $selector != *,* ]] || die "PEGAINFER_GATE_GPU must name exactly one device"
+
+  local rows=() row compute_mode lock_key lock_path
+  mapfile -t rows < <(
+    nvidia-smi -i "$selector" --query-gpu=uuid,compute_mode --format=csv,noheader 2>/dev/null
+  )
+  [ ${#rows[@]} -eq 1 ] || die "device selector $selector does not resolve to one GPU"
+  row=${rows[0]}
+  gpu_uuid=${row%%,*}
+  gpu_uuid=${gpu_uuid//[[:space:]]/}
+  compute_mode=${row#*,}
+  compute_mode=${compute_mode#"${compute_mode%%[![:space:]]*}"}
+  compute_mode=${compute_mode%"${compute_mode##*[![:space:]]}"}
+  [ "$compute_mode" != Prohibited ] || die "GPU $gpu_uuid prohibits compute contexts"
+  [[ $gpu_uuid =~ ^[A-Za-z0-9._:/-]+$ ]] || die "nvidia-smi returned an unsafe GPU identity"
+
+  export CUDA_VISIBLE_DEVICES=$gpu_uuid
+  lock_key=${gpu_uuid//\//_}
+  lock_key=${lock_key//:/_}
+  lock_path=$GPU_LOCK_ROOT/pegainfer-gemma4-gates-$lock_key.lock
+  if (umask 022; set -o noclobber; : >"$lock_path") 2>/dev/null; then
+    :
+  elif [ ! -e "$lock_path" ]; then
+    die "cannot create device lock $lock_path"
+  fi
+  # A read-only descriptor lets separate Unix accounts lock the same inode.
+  exec {gpu_lock_fd}<"$lock_path" || die "cannot open device lock $lock_path"
+  flock -n "$gpu_lock_fd" || die "GPU $gpu_uuid is already owned by another Gemma 4 gate runner"
+  echo "gemma4 gates: claimed GPU $gpu_uuid (selector $selector)"
 }
 
 require_ckpt() {
