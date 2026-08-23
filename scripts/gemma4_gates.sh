@@ -21,38 +21,49 @@ FEATURE=gemma4
 # gate to the crate without adding it here fails the membership check, which
 # covers every target an ignored test can live in — the library and each
 # integration binary — so a gate cannot hide in one the runner never looks at.
+#
+# Each entry is "<needs> <gate>". `needs` is a comma-separated subset of
+#   gpu         a CUDA device
+#   ckpt        PEGAINFER_TEST_MODEL_PATH and the config it holds
+#   prompts     the generate fixture, read for its prompts only
+#   fixtures    all four tensor fixtures, held against the checkpoint's digests
+#   chatgolden  the chat/tokenizer reference JSON
+# and a run demands only the union over the gates it selects, so a filter can
+# run a gate without producing the whole suite's prerequisites.
 GATES_NUMERIC_PARITY=(
-  serve::oracle::context_waypoints_match_hf
-  serve::oracle::greedy_matches_hf_generate
+  "gpu,ckpt,fixtures serve::oracle::context_waypoints_match_hf"
+  "gpu,ckpt,fixtures serve::oracle::greedy_matches_hf_generate"
 )
 GATES_ADMISSION=(
-  serve::oracle::mixed_step_matches_serial
-  engine::lane_tests::the_gathered_walk_matches_the_serial_path
-  engine::lane_tests::the_gathered_transient_leaves_headroom
+  "gpu,ckpt,prompts serve::oracle::mixed_step_matches_serial"
+  "gpu,ckpt,prompts engine::lane_tests::the_gathered_walk_matches_the_serial_path"
+  "gpu,ckpt,prompts engine::lane_tests::the_gathered_transient_leaves_headroom"
 )
+# The roster-edge gate borrows the generate fixture's prompts too; the raise
+# refusals are settled by `EngineState::load` before it opens a device or
+# reads a weight, so that one needs the config and nothing else.
 GATES_SERVING_CONTRACT=(
-  engine::lane_tests::the_shared_lane_lifecycle_completes
-  engine::lane_tests::the_green_lane_lifecycle_completes
-  engine::lane_tests::the_gathered_lifecycle_completes
-  engine::lane_tests::the_raised_ceiling_and_slots_hold_at_the_roster_edge
-  engine::lane_tests::the_raise_reaches_the_frontend
-  engine::lane_tests::the_raise_refuses_without_its_prerequisites
+  "gpu,ckpt engine::lane_tests::the_shared_lane_lifecycle_completes"
+  "gpu,ckpt engine::lane_tests::the_green_lane_lifecycle_completes"
+  "gpu,ckpt engine::lane_tests::the_gathered_lifecycle_completes"
+  "gpu,ckpt,prompts engine::lane_tests::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
+  "gpu,ckpt engine::lane_tests::the_raise_reaches_the_frontend"
+  "ckpt engine::lane_tests::the_raise_refuses_without_its_prerequisites"
 )
 GATES_KV_AND_LANES=(
-  serve::oracle::eviction_is_footprint_only
-  serve::oracle::prefix_restore_matches_cold_path
-  serve::oracle::overlapped_prefill_matches_the_sync_step
-  serve::oracle::a_ragged_batch_does_not_depend_on_row_order
+  "gpu,ckpt serve::oracle::eviction_is_footprint_only"
+  "gpu,ckpt serve::oracle::prefix_restore_matches_cold_path"
+  "gpu,ckpt serve::oracle::overlapped_prefill_matches_the_sync_step"
+  "gpu,ckpt serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
 )
+# The disagreeing-config gate deliberately fails before any device is opened.
 GATES_LOADER=(
-  weights::load::tests::loads_the_text_tower_and_reports_residency
-  weights::load::tests::a_disagreeing_config_names_every_faulty_tensor
+  "gpu,ckpt weights::load::tests::loads_the_text_tower_and_reports_residency"
+  "ckpt weights::load::tests::a_disagreeing_config_names_every_faulty_tensor"
 )
-# A card but no checkpoint is all these two need. They run under the same
-# preflight regardless: a gate the runner does not own is a gate nothing runs.
 GATES_DEVICE=(
-  engine::gate::the_suppression_mask_writes_only_the_ids_it_is_given
-  kv::tests::admission_is_atomic_across_pools
+  "gpu engine::gate::the_suppression_mask_writes_only_the_ids_it_is_given"
+  "gpu kv::tests::admission_is_atomic_across_pools"
 )
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
@@ -69,7 +80,7 @@ MANIFEST_LIB=(
 # going unowned.
 INTEGRATION_TARGETS=(tokenizer_parity)
 GATES_TOKENIZER_PARITY=(
-  string_form_chat_renders_match_hf_reference
+  "ckpt,chatgolden string_form_chat_renders_match_hf_reference"
 )
 
 FIXTURES=(
@@ -78,26 +89,49 @@ FIXTURES=(
   test_data/gemma4-12b-hf-longctx-golden.safetensors
   test_data/gemma4-12b-generate.safetensors
 )
+PROMPT_FIXTURE=test_data/gemma4-12b-generate.safetensors
+CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
 
 die() { echo "gemma4 gates: $*" >&2; exit 1; }
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || die "cannot enter the repository root"
 
-# --- preflight: every reason to refuse, before anything runs ---------------
-[ -n "${PEGAINFER_TEST_MODEL_PATH:-}" ] || die "PEGAINFER_TEST_MODEL_PATH is unset"
-ckpt=$PEGAINFER_TEST_MODEL_PATH
-[ -d "$ckpt" ] || die "checkpoint directory $ckpt does not exist"
-[ -f "$ckpt/config.json" ] || die "$ckpt has no config.json"
-for fixture in "${FIXTURES[@]}"; do
-  [ -f "$fixture" ] || die "fixture $fixture is missing (dump it on the test box first)"
-done
-command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable, so no device can be claimed"
-nvidia-smi -L 2>/dev/null | grep -q GPU || die "nvidia-smi lists no device"
+# --- prerequisites, one refusal per tier ----------------------------------
+# Each is demanded only when a selected gate declares it, so a focused run
+# carries the cost of what it runs: the device-only gates need no checkpoint,
+# and the chat-render gate needs no card.
+ckpt=
 
-# The fixtures pin the checkpoint they were dumped from; the gates assert it
-# per-run, but a mismatch should stop the suite before the first 12B load.
-python3 - "$ckpt" "${FIXTURES[@]}" <<'PY' || die "fixture metadata preflight failed"
+require_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable, so no device can be claimed"
+  nvidia-smi -L 2>/dev/null | grep -q GPU || die "nvidia-smi lists no device"
+}
+
+require_ckpt() {
+  [ -n "${PEGAINFER_TEST_MODEL_PATH:-}" ] || die "PEGAINFER_TEST_MODEL_PATH is unset"
+  ckpt=$PEGAINFER_TEST_MODEL_PATH
+  [ -d "$ckpt" ] || die "checkpoint directory $ckpt does not exist"
+  [ -f "$ckpt/config.json" ] || die "$ckpt has no config.json"
+}
+
+require_prompts() {
+  [ -f "$PROMPT_FIXTURE" ] || die "fixture $PROMPT_FIXTURE is missing (dump it on the test box first)"
+}
+
+require_chatgolden() {
+  [ -f "$CHAT_GOLDEN" ] || die "reference $CHAT_GOLDEN is missing (dump it on the test box first)"
+}
+
+require_fixtures() {
+  require_ckpt
+  local fixture
+  for fixture in "${FIXTURES[@]}"; do
+    [ -f "$fixture" ] || die "fixture $fixture is missing (dump it on the test box first)"
+  done
+  # The fixtures pin the checkpoint they were dumped from; the gates assert it
+  # per-run, but a mismatch should stop the suite before the first 12B load.
+  python3 - "$ckpt" "${FIXTURES[@]}" <<'PY' || die "fixture metadata preflight failed"
 import hashlib, json, os, struct, sys
 
 ckpt, fixtures = sys.argv[1], sys.argv[2:]
@@ -141,6 +175,8 @@ for name, want in digests.items():
         raise SystemExit(f"{name}: checkpoint digest does not match the fixture's")
 print(f"preflight: {len(fixtures)} fixtures agree on revision {revision[:12]}")
 PY
+}
+
 
 # --- membership: the crate's ignored set must be exactly the manifest ------
 ignored_in() {
@@ -158,7 +194,9 @@ check_membership() {
 
 lib_listing=$(ignored_in --lib)
 [ -n "$lib_listing" ] || die "could not list the library's ignored gates"
-check_membership "library" "$lib_listing" "$(printf '%s\n' "${MANIFEST_LIB[@]}" | sort)"
+lib_names=()
+for entry in "${MANIFEST_LIB[@]}"; do lib_names+=("${entry##* }"); done
+check_membership "library" "$lib_listing" "$(printf '%s\n' "${lib_names[@]}" | sort)"
 
 # The integration binaries the crate actually has, so adding one without a
 # manifest entry fails here instead of leaving its gates unowned.
@@ -168,33 +206,44 @@ declared=$(printf '%s\n' "${INTEGRATION_TARGETS[@]}" | sort)
   "integration binaries disagree with INTEGRATION_TARGETS:"$'\n'"on disk: $discovered"$'\n'"declared: $declared"
 
 all_gates=()
-for gate in "${MANIFEST_LIB[@]}"; do all_gates+=("lib|$gate"); done
+for entry in "${MANIFEST_LIB[@]}"; do all_gates+=("${entry%% *}|lib|${entry##* }"); done
 for target in "${INTEGRATION_TARGETS[@]}"; do
-  names="GATES_$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')[@]"
+  group="GATES_$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')[@]"
+  target_names=()
+  for entry in "${!group}"; do target_names+=("${entry##* }"); done
   check_membership "integration binary $target" \
-    "$(ignored_in --test "$target")" "$(printf '%s\n' "${!names}" | sort)"
-  for gate in "${!names}"; do all_gates+=("$target|$gate"); done
+    "$(ignored_in --test "$target")" "$(printf '%s\n' "${target_names[@]}" | sort)"
+  for entry in "${!group}"; do all_gates+=("${entry%% *}|$target|${entry##* }"); done
 done
 
 filter=${1:-}
 selected=()
 for entry in "${all_gates[@]}"; do
-  [ -z "$filter" ] || [[ ${entry#*|} == *"$filter"* ]] || continue
+  [ -z "$filter" ] || [[ ${entry##*|} == *"$filter"* ]] || continue
   selected+=("$entry")
 done
 [ ${#selected[@]} -gt 0 ] || die "filter ${filter:-<none>} selected no gate"
 
+# --- prerequisites: the union over what this run selected, and no more -----
+needs=" "
+for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
+needs=" ${needs//,/ } "
+demanded=""
+for want in gpu ckpt prompts fixtures chatgolden; do
+  case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
+done
+echo "gemma4 gates: prerequisites$demanded"
+
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"
-echo "gemma4 gates: checkpoint $ckpt"
+[ -z "$ckpt" ] || echo "gemma4 gates: checkpoint $ckpt"
 echo "gemma4 gates: ${#selected[@]} selected of ${#all_gates[@]} in the manifest"
-printf '  %s\n' "${selected[@]#*|}"
+printf '  %s\n' "${selected[@]##*|}"
 
 # --- execution: one gate per process, serialized --------------------------
 completed=0
 failed=()
 for entry in "${selected[@]}"; do
-  target=${entry%%|*}
-  gate=${entry#*|}
+  IFS='|' read -r _needs target gate <<<"$entry"
   if [ "$target" = lib ]; then
     target_args=(--lib)
   else
