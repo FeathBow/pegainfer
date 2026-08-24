@@ -17,6 +17,7 @@ pub use lora::fixtures as lora_fixtures;
 mod prefill;
 mod projection_fusion;
 mod scheduler;
+mod sizing;
 mod speculative;
 mod split_kv;
 mod unified_forward;
