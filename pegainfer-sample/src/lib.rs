@@ -49,6 +49,7 @@ use pegainfer_kernels::ops::logprob_topk_batch_bf16_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 use pegainfer_kernels::tensor::has_stream_override;
+use pegainfer_kernels::tensor::stream_spin_wait;
 
 /// Allocate-once device buffers for [`select_batch`], sized for `max_rows` × `vocab`.
 ///
@@ -207,7 +208,9 @@ pub fn select_batch(
             .map_err(|e| anyhow!("select_batch D2H greedy tokens failed: {e}"))?;
         // Blocks on this copy's own event — which transitively covers the
         // argmax kernel queued before it on the same stream, so the wait is
-        // equivalent to the old full-stream sync for this path.
+        // equivalent to the old full-stream sync for this path. The spin
+        // ahead of it takes the scheduler wake-up out of the step loop.
+        stream_spin_wait(ctx)?;
         let out = scratch
             .argmax_host
             .as_slice()

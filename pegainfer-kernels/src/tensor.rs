@@ -79,6 +79,34 @@ pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
         .unwrap_or_else(|| ctx.stream.cu_stream())
 }
 
+/// Bounded spin wait on the context stream. A blocking wait parks the caller
+/// and pays the OS scheduler's wake-up — low milliseconds per call on a
+/// loaded host — which a decode loop pays every step right before it reads
+/// the sampled tokens. Polling `cuStreamQuery` keeps the wake on our side;
+/// the cap falls back to the parking wait so a stuck stream still sleeps
+/// instead of burning the core forever.
+const STREAM_SPIN_WAIT_CAP: std::time::Duration = std::time::Duration::from_millis(5);
+
+pub fn stream_spin_wait(ctx: &DeviceContext) -> anyhow::Result<()> {
+    let stream = active_cu_stream(ctx);
+    let cap = std::time::Instant::now() + STREAM_SPIN_WAIT_CAP;
+    loop {
+        match unsafe { cudarc::driver::sys::cuStreamQuery(stream) } {
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS => return Ok(()),
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
+                if std::time::Instant::now() >= cap {
+                    return ctx
+                        .stream
+                        .synchronize()
+                        .map_err(|e| anyhow::anyhow!("stream sync after spin cap failed: {e}"));
+                }
+                std::hint::spin_loop();
+            }
+            err => return Err(anyhow::anyhow!("cuStreamQuery failed: {err:?}")),
+        }
+    }
+}
+
 /// Marker trait for tensor metadata tags.
 pub trait NamedTag {
     const NAME: &'static str;
