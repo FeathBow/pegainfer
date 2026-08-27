@@ -356,17 +356,43 @@ impl LocalQwen3Lane {
             // stripes are indexed by position order, so prefixes keep the
             // runner pass (always run over the full list, stable graph
             // shape) aligned with the ladder's stripe reads.
-            let ladder_chains = match auto.as_ref() {
-                Some(controller) => controller.current_c().min(hedge_positions.len()),
-                None => hedge_positions.len(),
+            // Batch-adaptive policy (PEGAINFER_SPEC_HEDGE_KNEE) takes precedence
+            // over both the fixed count and the auto controller: it sets the
+            // chain count from the free zone at THIS round's batch size, so
+            // hedging fades to zero as concurrency fills the verify pass.
+            let knee = spec_hedge_knee();
+            let (ladder_chains, round_cap) = if knee > 0 {
+                // Batch-adaptive, bucket-aware: the chain count keeps the
+                // expanded verify batch on a CUDA-graph bucket inside the free
+                // zone, so it fades to the baseline as concurrency rises. The
+                // whole batch hedges at that count (the cap is not the knob).
+                let c = batch_adaptive_chains(
+                    requests.len(),
+                    model.block_size(),
+                    knee,
+                    hedge_positions.len(),
+                    crate::batch_decode_buffers::BATCH_BUCKETS,
+                );
+                log::debug!(
+                    "spec hedge plan: batch {} -> {c} chain(s) ({} verify spans)",
+                    requests.len(),
+                    requests.len() * (1 + c)
+                );
+                (c, requests.len())
+            } else {
+                let c = match auto.as_ref() {
+                    Some(controller) => controller.current_c().min(hedge_positions.len()),
+                    None => hedge_positions.len(),
+                };
+                (c, *hedge_cap)
             };
             // Chains are built for the SAME requests the verify side will
             // hedge: eligibility travels on the draft item, and selection is
-            // capped by the per-round hedge cap and the ladder's scratch
+            // capped by the per-round request cap and the ladder's scratch
             // budget at the chain count that actually runs this round.
             let hedged = select_hedged_requests(
                 requests,
-                *hedge_cap,
+                round_cap,
                 match ladder_chains {
                     0 => 0,
                     // Slots are bounded by the ladder's Markov scratch AND by
@@ -536,6 +562,62 @@ pub(super) fn spec_hedge_cap() -> usize {
     })
 }
 
+/// `PEGAINFER_SPEC_HEDGE_KNEE=<rows>` turns on the batch-adaptive policy: the
+/// per-round chain count is chosen so the expanded verify batch stays within
+/// the roofline free zone of `<rows>` rows — the compute knee for this model
+/// and GPU, below which the verify pass is weight-bandwidth-bound and extra
+/// rows are nearly free. `0`/unset = off, keeping the fixed or auto chain
+/// count. Read once.
+pub(super) fn spec_hedge_knee() -> usize {
+    static KNEE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KNEE.get_or_init(|| {
+        std::env::var("PEGAINFER_SPEC_HEDGE_KNEE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Uniform hedge chain count for this batch, chosen to keep the expanded
+/// verify batch BOTH inside the roofline free zone AND on a CUDA-graph bucket.
+///
+/// Every hedged request is verified over `1 + C` spans, so the batch spans
+/// `batch * (1 + C)`. Two constraints: the rows must stay under the compute
+/// knee (`batch * (1 + C) * span <= knee_rows`, below which extra rows are
+/// nearly free), and the span count must be a captured graph bucket — a count
+/// that falls between buckets runs eager and gives back the hedge gain. Return
+/// the largest `C <= max_chains` satisfying both, or `0` when no bucket-aligned
+/// count fits, which is how the policy fades to the baseline as concurrency
+/// fills the zone.
+///
+/// A fractional free-zone remainder (a batch that fits, say, four extra chain
+/// spans across eight requests) is deliberately NOT spent: the only span
+/// counts between one bucket and the next are off-bucket, so partial hedging
+/// runs eager and loses more than it gains.
+pub(super) fn batch_adaptive_chains(
+    batch: usize,
+    block_size: usize,
+    knee_rows: usize,
+    max_chains: usize,
+    buckets: &[usize],
+) -> usize {
+    if batch == 0 || knee_rows == 0 || max_chains == 0 {
+        return 0;
+    }
+    let span = block_size + 1;
+    let mut best = 0;
+    for c in 1..=max_chains {
+        let spans = batch * (1 + c);
+        if spans * span > knee_rows {
+            break; // past the free zone; larger C only goes further past
+        }
+        if buckets.contains(&spans) {
+            best = c;
+        }
+    }
+    best
+}
+
 /// `PEGAINFER_SPEC_HEDGE_POSITIONS="0,1,2"` — draft positions at which hedge
 /// chains branch (each takes the exact Markov runner-up at that position,
 /// rank 2). Sorted/deduped; default `0` (the original single-chain hedge).
@@ -615,6 +697,39 @@ mod tests {
     }
 
     const BLOCK: usize = 7;
+
+    #[test]
+    fn batch_adaptive_chains_picks_the_largest_bucket_aligned_count_under_the_knee() {
+        // block 7 -> span 8 rows; knee 96 rows = 12 spans.
+        let bk = crate::batch_decode_buffers::BATCH_BUCKETS;
+        let c = |b| batch_adaptive_chains(b, BLOCK, 96, 7, bk);
+        // B=1: 1*(1+C) must be a bucket <= 12 -> {2,4,8}; largest gives C=7 (8 spans).
+        assert_eq!(c(1), 7);
+        // B=2: 2*(1+C) in buckets <= 12 -> {2,4,8}; 8 -> C=3, NOT the free-zone C=5.
+        assert_eq!(c(2), 3);
+        // B=4: 4*(1+C) in buckets <= 12 -> 8 -> C=1 (12 would be off-bucket).
+        assert_eq!(c(4), 1);
+        // B=8: 8*(1+C): C=0 gives 8 (baseline), C=1 gives 16 = past the knee.
+        // 9..15 spans are all off-bucket -> no hedge fits, fade to baseline.
+        assert_eq!(c(8), 0);
+        assert_eq!(c(16), 0); // past the knee outright
+        // every chosen count lands on a bucket and inside the free zone
+        for b in 1..=32 {
+            let cc = c(b);
+            if cc > 0 {
+                let spans = b * (1 + cc);
+                assert!(
+                    bk.contains(&spans),
+                    "b={b} c={cc}: {spans} spans off-bucket"
+                );
+                assert!(spans * (BLOCK + 1) <= 96, "b={b} c={cc}: past the knee");
+            }
+        }
+        // off / degenerate inputs
+        assert_eq!(batch_adaptive_chains(1, BLOCK, 0, 7, bk), 0);
+        assert_eq!(batch_adaptive_chains(0, BLOCK, 96, 7, bk), 0);
+        assert_eq!(batch_adaptive_chains(1, BLOCK, 96, 0, bk), 0);
+    }
 
     #[test]
     fn hedge_selection_is_order_invariant_for_mixed_batches() {
