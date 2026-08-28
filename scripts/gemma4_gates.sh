@@ -8,7 +8,8 @@
 # claims one physical device for the suite's lifetime and runs one gate per
 # process — repeated 12B loads in one test binary exhaust a 48 GiB card.
 #
-#   PEGAINFER_TEST_MODEL_PATH=<checkpoint> \
+#   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
+#     PEGAINFER_NVFP4_MODEL=<routed-checkpoint> \
 #     [PEGAINFER_GATE_GPU=<index-or-UUID>] scripts/gemma4_gates.sh [filter]
 #
 # A filter runs the subset of manifest gates whose names contain it; the
@@ -27,6 +28,7 @@ GPU_LOCK_ROOT=/tmp
 # Each entry is "<needs> <gate>". `needs` is a comma-separated subset of
 #   gpu         a CUDA device
 #   ckpt        PEGAINFER_TEST_MODEL_PATH and the config it holds
+#   moeckpt     PEGAINFER_NVFP4_MODEL and the routed config it holds
 #   prompts     the generate fixture, read for its prompts only
 #   fixtures    all four tensor fixtures, held against the checkpoint's digests
 #   chatgolden  the chat/tokenizer reference JSON
@@ -67,6 +69,9 @@ GATES_DEVICE=(
   "gpu engine::gate::the_suppression_mask_writes_only_the_ids_it_is_given"
   "gpu kv::tests::admission_is_atomic_across_pools"
 )
+GATES_ROUTED=(
+  "gpu,moeckpt moe::tests::the_routed_block_matches_the_reference_formulas"
+)
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
   "${GATES_ADMISSION[@]}"
@@ -74,6 +79,7 @@ MANIFEST_LIB=(
   "${GATES_KV_AND_LANES[@]}"
   "${GATES_LOADER[@]}"
   "${GATES_DEVICE[@]}"
+  "${GATES_ROUTED[@]}"
 )
 
 # Integration gates live in their own binaries, which `--lib` cannot see. One
@@ -106,6 +112,7 @@ cd "$root" || die "cannot enter the repository root"
 # carries the cost of what it runs: the device-only gates need no checkpoint,
 # and the chat-render gate needs no card.
 ckpt=
+moe_ckpt=
 gpu_uuid=
 gpu_lock_fd=
 
@@ -158,6 +165,13 @@ require_ckpt() {
   ckpt=$PEGAINFER_TEST_MODEL_PATH
   [ -d "$ckpt" ] || die "checkpoint directory $ckpt does not exist"
   [ -f "$ckpt/config.json" ] || die "$ckpt has no config.json"
+}
+
+require_moeckpt() {
+  [ -n "${PEGAINFER_NVFP4_MODEL:-}" ] || die "PEGAINFER_NVFP4_MODEL is unset"
+  moe_ckpt=$PEGAINFER_NVFP4_MODEL
+  [ -d "$moe_ckpt" ] || die "routed checkpoint directory $moe_ckpt does not exist"
+  [ -f "$moe_ckpt/config.json" ] || die "$moe_ckpt has no config.json"
 }
 
 require_prompts() {
@@ -274,13 +288,14 @@ needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
 needs=" ${needs//,/ } "
 demanded=""
-for want in gpu ckpt prompts fixtures chatgolden; do
+for want in gpu ckpt moeckpt prompts fixtures chatgolden; do
   case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
 done
 echo "gemma4 gates: prerequisites$demanded"
 
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"
 [ -z "$ckpt" ] || echo "gemma4 gates: checkpoint $ckpt"
+[ -z "$moe_ckpt" ] || echo "gemma4 gates: routed checkpoint $moe_ckpt"
 echo "gemma4 gates: ${#selected[@]} selected of ${#all_gates[@]} in the manifest"
 printf '  %s\n' "${selected[@]##*|}"
 

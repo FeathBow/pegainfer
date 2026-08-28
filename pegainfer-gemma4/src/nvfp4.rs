@@ -1,10 +1,9 @@
 //! Reading the NVFP4 tensors the routed experts are stored in.
 //!
-//! A value is `e2m1`, two to a byte, low nibble first. Every [`GROUP`] values
-//! along the reduction axis share one `e4m3` block scale, and one `f32` scales
-//! the whole tensor. Nothing here widens anything: the GEMM reads the packed
-//! form directly, so this resolves the four tensors to their bytes and decodes
-//! only the block scales the loader has to reason about on the host.
+//! A checkpoint declares packed weights, block scales, a tensor scale, and an
+//! input activation scale. The manifest validates all four. Production reads
+//! the first three and leaves the weights packed; BF16 activations do not
+//! consume the input scale. Test-only widening supports the arithmetic oracle.
 
 use anyhow::Result;
 use safetensors::SafeTensors;
@@ -38,7 +37,7 @@ pub(crate) fn decode_e4m3(bits: u8) -> f32 {
 /// One `e2m1` value of a packed row, the low nibble holding the even index.
 /// Sign, one exponent bit pair and one mantissa bit, so the magnitudes are
 /// exactly {0, .5, 1, 1.5, 2, 3, 4, 6}.
-#[cfg(test)]
+#[cfg(all(test, feature = "gemma4"))]
 fn decode_e2m1(packed: &[u8], index: usize) -> f32 {
     let byte = packed[index / PER_BYTE];
     let nibble = if index.is_multiple_of(PER_BYTE) {
@@ -60,8 +59,8 @@ fn decode_e2m1(packed: &[u8], index: usize) -> f32 {
     sign * magnitude
 }
 
-/// The four tensors one quantized projection is stored as, resolved to the
-/// bytes they occupy in the checkpoint.
+/// The three tensors one quantized projection consumes at runtime.
+/// `input_scale` remains manifest-only because activations stay BF16.
 pub(crate) struct QuantSource<'a> {
     packed: &'a [u8],
     scales: &'a [u8],
@@ -92,8 +91,6 @@ fn scalar_f32(shards: &[SafeTensors], name: &str) -> Result<f32> {
 }
 
 impl<'a> QuantSource<'a> {
-    /// The manifest has already held the shapes and dtypes up against the
-    /// headers; this reads the bytes those names resolve to.
     pub(crate) fn read(shards: &'a [SafeTensors<'a>], plan: &QuantMatrix) -> Result<Self> {
         Ok(Self {
             packed: find(shards, &plan.weight.name)?.data(),
@@ -102,7 +99,6 @@ impl<'a> QuantSource<'a> {
         })
     }
 
-    /// The packed values, as the checkpoint stores them.
     pub(crate) fn packed(&self) -> &[u8] {
         self.packed
     }
@@ -111,7 +107,7 @@ impl<'a> QuantSource<'a> {
     /// and by the tensor. The GEMM never does this — it reads the packed form
     /// — so this exists for the gates that hold the GEMM to the arithmetic
     /// the checkpoint's format defines.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "gemma4"))]
     pub(crate) fn widen(&self, rows: usize, values: usize) -> Result<Vec<f32>> {
         anyhow::ensure!(
             values.is_multiple_of(GROUP),
@@ -137,7 +133,6 @@ impl<'a> QuantSource<'a> {
         Ok(out)
     }
 
-    /// The block scales, one `e4m3` byte per [`GROUP`] values.
     pub(crate) fn scales(&self) -> &[u8] {
         self.scales
     }
@@ -184,42 +179,84 @@ mod tests {
     }
 
     #[test]
-    fn a_projection_is_read_out_of_the_shards() {
+    fn a_projection_is_resolved_from_a_later_shard() {
         let manifest = toy_manifest();
         let gate = &manifest.layers[0].moe.as_ref().unwrap().experts[0].gate;
         let (rows, values) = gate.geometry().unwrap();
-        let packed: Vec<u8> = (0..rows * values / PER_BYTE)
-            .map(|i| ((i * 5 + 1) % 256) as u8)
-            .collect();
-        let scales: Vec<u8> = (0..rows * values / GROUP).map(|_| 0x38u8).collect();
-        let scale_2 = 3.0f32.to_le_bytes().to_vec();
-        let input_scale = 1.0f32.to_le_bytes().to_vec();
-        let tensors = vec![
-            (
-                gate.weight.name.clone(),
-                TensorView::new(Dtype::U8, vec![rows, values / PER_BYTE], &packed).unwrap(),
-            ),
-            (
-                gate.weight_scale.name.clone(),
-                TensorView::new(Dtype::F8_E4M3, vec![rows, values / GROUP], &scales).unwrap(),
-            ),
-            (
-                gate.weight_scale_2.name.clone(),
-                TensorView::new(Dtype::F32, vec![], &scale_2).unwrap(),
-            ),
-            (
-                gate.input_scale.name.clone(),
-                TensorView::new(Dtype::F32, vec![], &input_scale).unwrap(),
-            ),
+        let unrelated = [0u8];
+        let first = safetensors::serialize(
+            [(
+                "unrelated",
+                TensorView::new(Dtype::U8, vec![1], &unrelated).unwrap(),
+            )],
+            None,
+        )
+        .unwrap();
+        let packed = vec![0x21u8; rows * values / PER_BYTE];
+        let scales = vec![0x38u8; rows * values / GROUP];
+        let scale_2 = 3.0f32.to_le_bytes();
+        let second = safetensors::serialize(
+            [
+                (
+                    gate.weight.name.as_str(),
+                    TensorView::new(Dtype::U8, vec![rows, values / PER_BYTE], &packed).unwrap(),
+                ),
+                (
+                    gate.weight_scale.name.as_str(),
+                    TensorView::new(Dtype::F8_E4M3, vec![rows, values / GROUP], &scales).unwrap(),
+                ),
+                (
+                    gate.weight_scale_2.name.as_str(),
+                    TensorView::new(Dtype::F32, vec![], &scale_2).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        let shards = [
+            SafeTensors::deserialize(&first).unwrap(),
+            SafeTensors::deserialize(&second).unwrap(),
         ];
-        let blob = safetensors::serialize(tensors, None).unwrap();
-        let shard = SafeTensors::deserialize(&blob).unwrap();
-        let shards = [shard];
         let source = QuantSource::read(&shards, gate).unwrap();
 
-        assert_eq!(source.packed(), packed.as_slice());
-        assert_eq!(source.scales(), scales.as_slice());
+        assert_eq!(source.packed(), packed);
+        assert_eq!(source.scales(), scales);
         assert_exact(source.tensor_scale(), 3.0);
+    }
+
+    #[test]
+    fn a_missing_runtime_tensor_names_itself() {
+        let manifest = toy_manifest();
+        let gate = &manifest.layers[0].moe.as_ref().unwrap().experts[0].gate;
+        let (rows, values) = gate.geometry().unwrap();
+        let packed = vec![0u8; rows * values / PER_BYTE];
+        let scales = vec![0x38u8; rows * values / GROUP];
+        let blob = safetensors::serialize(
+            [
+                (
+                    gate.weight.name.as_str(),
+                    TensorView::new(Dtype::U8, vec![rows, values / PER_BYTE], &packed).unwrap(),
+                ),
+                (
+                    gate.weight_scale.name.as_str(),
+                    TensorView::new(Dtype::F8_E4M3, vec![rows, values / GROUP], &scales).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        let shards = [SafeTensors::deserialize(&blob).unwrap()];
+        let Err(err) = QuantSource::read(&shards, gate) else {
+            panic!("a missing tensor was accepted");
+        };
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "NVFP4: '{}' is missing from every shard",
+                gate.weight_scale_2.name
+            )
+        );
     }
 
     #[test]

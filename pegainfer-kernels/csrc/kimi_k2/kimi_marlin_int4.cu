@@ -1,11 +1,9 @@
+#include "../marlin/ffi.cuh"
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
-
-extern "C" CUresult marlin_repack_4bit_cuda(const uint8_t* src, uint8_t* dst,
-                                          int experts, int in_dim, int out_dim,
-                                          cudaStream_t stream);
 
 namespace pegainfer_kimi_marlin_int4 {
 

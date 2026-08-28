@@ -67,57 +67,6 @@ pub fn gemma4_moe_router_topk_into(
     Ok(())
 }
 
-/// `out[rows[slot]] += weights[slot] * delta[slot]`.
-///
-/// The kernel reads and writes `out` without atomics, so one call must carry
-/// the slots of a single expert, where no two slots name the same token.
-pub fn gemma4_moe_scatter_add_into(
-    ctx: &DeviceContext,
-    delta: &HiddenStates,
-    rows: &impl DevicePtr<i32>,
-    weights: &impl DevicePtr<f32>,
-    slots: usize,
-    out: &mut HiddenStates,
-) -> Result<()> {
-    let hidden = out.hidden_dim;
-    ensure!(
-        slots > 0 && hidden > 0 && delta.hidden_dim == hidden,
-        "gemma4_moe_scatter_add_into: delta is {} wide, out is {hidden}",
-        delta.hidden_dim
-    );
-    ensure!(
-        delta.seq_len >= slots && rows.len() >= slots && weights.len() >= slots,
-        "gemma4_moe_scatter_add_into buffers too small for {slots} slots: delta {}, rows {}, \
-         weights {}",
-        delta.seq_len,
-        rows.len(),
-        weights.len()
-    );
-    let slots_i32 = i32::try_from(slots).map_err(|_| {
-        anyhow!("gemma4_moe_scatter_add_into: {slots} slots exceed the kernel's i32")
-    })?;
-    let hidden_i32 = i32::try_from(hidden).map_err(|_| {
-        anyhow!("gemma4_moe_scatter_add_into: {hidden} columns exceed the kernel's i32")
-    })?;
-    let (delta_ptr, _delta_guard) = delta.data.device_ptr(&ctx.stream);
-    let (rows_ptr, _rows_guard) = rows.device_ptr(&ctx.stream);
-    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
-    let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::gemma4_moe_scatter_add_cuda(
-            delta_ptr as *const ffi::Half,
-            rows_ptr as *const i32,
-            weights_ptr as *const f32,
-            slots_i32,
-            hidden_i32,
-            out_ptr as *mut ffi::Half,
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
 /// Fold a routed GEMM's `[rows * top_k, hidden]` result back onto its tokens.
 pub fn gemma4_moe_sum_topk_into(
     ctx: &DeviceContext,

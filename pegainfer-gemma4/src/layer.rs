@@ -136,7 +136,6 @@ pub(crate) struct EpilogueScratch {
     act: HiddenStates,
     down: HiddenStates,
     down_normed: HiddenStates,
-    combined: HiddenStates,
     moe: Option<MoeScratch>,
 }
 
@@ -155,7 +154,6 @@ impl EpilogueScratch {
             act: wide(max_rows)?,
             down: hidden(max_rows)?,
             down_normed: hidden(max_rows)?,
-            combined: hidden(max_rows)?,
             moe: match geom.moe {
                 Some(_) => Some(MoeScratch::new(ctx, geom, max_rows)?),
                 None => None,
@@ -182,7 +180,6 @@ impl EpilogueScratch {
             &mut self.act,
             &mut self.down,
             &mut self.down_normed,
-            &mut self.combined,
         ] {
             buf.seq_len = seq_len;
         }
@@ -278,9 +275,11 @@ pub(crate) fn attention_epilogue_into(
                 &scratch.h2,
                 &scratch.down,
                 moe_scratch,
-                &mut scratch.combined,
+                // The attention projection is dead after `h2` is formed and
+                // has the same shape, so the routed-only result reuses it.
+                &mut scratch.attn_proj,
             )?;
-            &scratch.combined
+            &scratch.attn_proj
         }
         (None, _) => &scratch.down,
         (Some(_), None) => anyhow::bail!("Gemma 4: a routed layer met a dense epilogue scratch"),

@@ -8,9 +8,7 @@
 //
 // The contract is vLLM's `moe_align_block_size`.
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <stdint.h>
+#include "ffi.cuh"
 
 namespace {
 

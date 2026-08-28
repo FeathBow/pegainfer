@@ -158,9 +158,23 @@ The gates that consume them are `#[ignore]`: they need the checkpoint and a devi
 compiles them. `scripts/gemma4_gates.sh` runs them:
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=<checkpoint> \
+PEGAINFER_TEST_MODEL_PATH=<12b-checkpoint> \
+  PEGAINFER_NVFP4_MODEL=<26b-checkpoint> \
   PEGAINFER_GATE_GPU=<index-or-UUID> scripts/gemma4_gates.sh [name-filter]
 ```
+
+An unfiltered run owns both checkpoint-backed suites. A filter only requires the inputs declared
+by the selected gates.
+
+The isolated routed-block diagnostic uses the 26B checkpoint separately:
+
+```bash
+PEGAINFER_NVFP4_MODEL=<26b-checkpoint> \
+  PEGAINFER_GATE_GPU=<index-or-UUID> \
+  scripts/gemma4_gates.sh the_routed_block_matches_the_reference_formulas
+```
+
+This diagnostic localizes router, expert GEMM, and combine errors; it is not a serving E2E.
 
 It refuses to start when the checkpoint, a fixture, the pinned metadata or a device is missing,
 holds the crate's ignored set against the gate list it carries — so a gate cannot leave the suite

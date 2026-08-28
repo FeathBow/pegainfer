@@ -5,9 +5,7 @@
 // not this kernel's. The source is one expert-major `[out_dim, in_dim / 2]`
 // plane per expert, which is how both checkpoints store it.
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <stdint.h>
+#include "ffi.cuh"
 
 namespace {
 

@@ -1,9 +1,8 @@
 // Gemma 4 routed-expert dispatch.
 //
 // The router's softmax runs over every expert, so one block owns one token
-// and keeps the whole expert row in shared memory. The scatter is launched
-// once per expert, which is what makes it atomic-free: within one launch no
-// two slots name the same destination token.
+// and keeps the whole expert row in shared memory. The routed GEMM emits one
+// row per pick; the sum kernel folds those rows back onto their tokens.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -110,23 +109,6 @@ __global__ void gemma4_moe_router_topk_kernel(
   }
 }
 
-__global__ void gemma4_moe_scatter_add_kernel(
-    const __nv_bfloat16 *__restrict__ delta, const int *__restrict__ rows,
-    const float *__restrict__ weights, int hidden, long long total,
-    __nv_bfloat16 *__restrict__ out) {
-  long long at = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (at >= total) {
-    return;
-  }
-  const int slot = (int)(at / hidden);
-  const int column = (int)(at % hidden);
-  const long long destination = (long long)rows[slot] * hidden + column;
-  const float scaled =
-      __bfloat162float(delta[at]) * weights[slot] + __bfloat162float(out[destination]);
-  out[destination] = __float2bfloat16(scaled);
-}
-
-
 __global__ void gemma4_moe_sum_topk_kernel(
     const __nv_bfloat16 *__restrict__ routed, int top_k, int hidden,
     long long total, __nv_bfloat16 *__restrict__ out) {
@@ -164,28 +146,6 @@ CUresult gemma4_moe_router_topk_cuda(const __nv_bfloat16 *logits,
       logits, per_expert_scale, experts, top_k, index_out, weight_out);
   return (CUresult)cudaGetLastError();
 }
-
-// `out[rows[slot]] += weights[slot] * delta[slot]`. One launch per expert:
-// the destinations within a launch are distinct, so no atomics.
-CUresult gemma4_moe_scatter_add_cuda(const __nv_bfloat16 *delta,
-                                     const int *rows, const float *weights,
-                                     int slots, int hidden,
-                                     __nv_bfloat16 *out, cudaStream_t stream) {
-  if (delta == nullptr || rows == nullptr || weights == nullptr ||
-      out == nullptr || slots <= 0 || hidden <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  const long long total = (long long)slots * hidden;
-  const int block = 256;
-  const long long grid = (total + block - 1) / block;
-  if (grid > 2147483647LL) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  gemma4_moe_scatter_add_kernel<<<(int)grid, block, 0, stream>>>(
-      delta, rows, weights, hidden, total, out);
-  return (CUresult)cudaGetLastError();
-}
-
 
 // The routed GEMM leaves one row per (token, pick); this folds the picks back
 // onto their token. The per-pick weights are already in the rows.

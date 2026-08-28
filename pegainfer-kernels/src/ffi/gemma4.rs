@@ -18,18 +18,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// `out[rows[slot]] += weights[slot] * delta[slot]`, for one expert's
-    /// slots at a time so the destinations stay distinct.
-    pub fn gemma4_moe_scatter_add_cuda(
-        delta: *const Half,
-        rows: *const i32,
-        weights: *const f32,
-        slots: i32,
-        hidden: i32,
-        out: *mut Half,
-        stream: CUstream,
-    ) -> CUresult;
-
     /// `out[token] = sum over picks of routed[token * top_k + pick]`.
     pub fn gemma4_moe_sum_topk_cuda(
         routed: *const Half,
