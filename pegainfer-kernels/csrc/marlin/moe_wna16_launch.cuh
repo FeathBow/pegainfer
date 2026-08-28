@@ -42,14 +42,15 @@ constexpr int kMarlinMinThreadN = min_thread_n;
 constexpr int kMarlinMaxThreadN = max_thread_n;
 constexpr int kMarlinPipeStages = pipe_stages;
 
-inline ThreadConfig small_batch_thread_configs[] = {
-    {128, 128, 256},
-    {64, 128, 128},
-};
-
-inline ThreadConfig large_batch_thread_configs[] = {
-    {64, 256, 256},
-    {64, 128, 128},
+/// The shapes a caller is willing to tile with. They stay with the caller
+/// because a table entry is only usable if the kernel table has the matching
+/// instantiation, and because widening one model's search would silently
+/// change which kernel another model picks.
+struct ThreadConfigs {
+  const ThreadConfig* small_batch;
+  int small_count;
+  const ThreadConfig* large_batch;
+  int large_count;
 };
 
 inline CUresult last_error_to_cu(cudaError_t err) {
@@ -163,15 +164,12 @@ inline ExecConfig determine_exec_config(
     bool m_block_size_8,
     int group_size,
     int max_shared_mem,
+    ThreadConfigs const& tables,
     MarlinKernelGetter get_kernel) {
   ExecConfig exec_cfg{1, ThreadConfig{-1, -1, -1}};
-  ThreadConfig* configs =
-      thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
-  int config_count = thread_m_blocks > 1
-                         ? static_cast<int>(sizeof(large_batch_thread_configs) /
-                                            sizeof(ThreadConfig))
-                         : static_cast<int>(sizeof(small_batch_thread_configs) /
-                                            sizeof(ThreadConfig));
+  const ThreadConfig* configs =
+      thread_m_blocks > 1 ? tables.large_batch : tables.small_batch;
+  int config_count = thread_m_blocks > 1 ? tables.large_count : tables.small_count;
   constexpr int device_max_reg_size = 255 * 1024;
   int best_count = 0;
   for (int i = 0; i < config_count; ++i) {
@@ -213,13 +211,15 @@ inline ExecConfig determine_exec_config(
 }
 
 /// One expert-blocked Marlin GEMM. `b_scales` is whatever the instantiated
-/// `s_type` reads.
+/// `s_type` reads, and `global_scale` is the per-tensor factor an FP4 weight
+/// type folds in; a type that scales per block alone passes null.
 inline CUresult launch_marlin_moe_gemm(
     const void* input,
     void* output,
     float* c_tmp,
     const void* b_qweight,
     const void* b_scales,
+    const float* global_scale,
     int* workspace,
     const int32_t* sorted_token_ids,
     const int32_t* expert_ids,
@@ -235,6 +235,7 @@ inline CUresult launch_marlin_moe_gemm(
     int size_k,
     int group_size,
     int sm_count,
+    ThreadConfigs const& tables,
     MarlinKernelGetter get_kernel,
     cudaStream_t stream) {
   if (input == nullptr || output == nullptr || b_qweight == nullptr ||
@@ -279,7 +280,7 @@ inline CUresult launch_marlin_moe_gemm(
   bool m_block_size_8 = moe_block_size == 8;
   ExecConfig exec_cfg = determine_exec_config(
       size_n, size_k, thread_m_blocks, m_block_size_8, group_size,
-      max_shared_mem, get_kernel);
+      max_shared_mem, tables, get_kernel);
   ThreadConfig cfg = exec_cfg.tb_cfg;
   if (cfg.thread_k == -1) return CUDA_ERROR_NOT_SUPPORTED;
 
@@ -315,7 +316,7 @@ inline CUresult launch_marlin_moe_gemm(
   int* locks = workspace;
 
   kernel<<<blocks, cfg.num_threads, max_shared_mem, stream>>>(
-      A_ptr, B_ptr, C_ptr, C_tmp_ptr, nullptr, nullptr, scales_ptr, nullptr,
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, nullptr, nullptr, scales_ptr, global_scale,
       nullptr, nullptr, sorted_token_ids, expert_ids, num_tokens_post_padded,
       topk_weights, top_k, mul_topk_weights, size_k / group_size, size_m,
       size_n, size_k, locks, false, use_atomic_add, use_fp32_reduce);

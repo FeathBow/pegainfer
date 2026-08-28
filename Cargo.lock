@@ -3706,6 +3706,7 @@ dependencies = [
  "log",
  "pegainfer-core",
  "pegainfer-frontend",
+ "pegainfer-kernels",
  "pegainfer-sample",
  "safetensors",
  "serde_json",

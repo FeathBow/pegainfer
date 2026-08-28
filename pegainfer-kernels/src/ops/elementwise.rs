@@ -220,7 +220,7 @@ pub fn scaled_add_rows_token_range_into(
 pub fn gather_hidden_tokens_into(
     ctx: &DeviceContext,
     input: &HiddenStates,
-    token_indices: &CudaSlice<i32>,
+    token_indices: &impl DevicePtr<i32>,
     token_count: usize,
     out: &mut HiddenStates,
 ) -> Result<()> {

@@ -817,9 +817,22 @@ impl EngineState {
         // Refuse an unservable global GQA shape, a bad lane mode or a bad
         // ceiling before the multi-GiB load.
         let config = crate::config::Gemma4Config::from_file(dir)?;
+        // A routed step captures — the dispatch is built on the device and the
+        // expert GEMM's grid is occupancy sized — but it does not pay: a
+        // single stream gained 6% while four concurrent ones swung between
+        // 1.4 and 9.1 seconds as the batch shrank through buckets and each
+        // one recaptured. Off until the capture cost is amortized.
+        let graph_enabled = graph_enabled && config.moe.is_none();
         let global_split = crate::serve::global_split_factor(&config)?;
         let max_context = serving_context(config.max_position_embeddings)?;
         let lane_mode = async_prefill_mode()?;
+        // Nothing in the routed block leaves the lane's stream any more, but
+        // the lane has never been exercised against one, so it stays refused
+        // until it is.
+        anyhow::ensure!(
+            config.moe.is_none() || lane_mode.is_none(),
+            "PEGAINFER_ASYNC_PREFILL is untested on a routed checkpoint"
+        );
         let mix_chunk = mix_chunk_tokens(max_context)?;
         let slots = decode_slots()?;
         if max_context > MAX_CONTEXT {

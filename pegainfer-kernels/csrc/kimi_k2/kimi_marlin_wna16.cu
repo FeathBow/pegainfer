@@ -11,6 +11,18 @@
 
 namespace pegainfer_kimi_marlin_moe_wna16 {
 
+const ThreadConfig kSmallBatch[] = {
+    {128, 128, 256},
+    {64, 128, 128},
+};
+
+const ThreadConfig kLargeBatch[] = {
+    {64, 256, 256},
+    {64, 128, 128},
+};
+
+const ThreadConfigs kTables{kSmallBatch, 2, kLargeBatch, 2};
+
 constexpr int kKimiLocalExperts = 48;
 constexpr int kKimiGroupSize = 32;
 #define KIMI_MARLIN_GET_IF(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, \
@@ -79,10 +91,10 @@ CUresult launch_marlin_gemm(
     return CUDA_ERROR_INVALID_VALUE;
   }
   return launch_marlin_moe_gemm(
-      input, output, c_tmp, b_qweight, b_scales, workspace,
+      input, output, c_tmp, b_qweight, b_scales, nullptr, workspace,
       sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights,
       workspace_len, sorted_token_ids_len, moe_block_size, top_k,
-      mul_topk_weights, size_m, size_n, size_k, group_size, sm_count,
+      mul_topk_weights, size_m, size_n, size_k, group_size, sm_count, kTables,
       get_marlin_kernel, stream);
 }
 

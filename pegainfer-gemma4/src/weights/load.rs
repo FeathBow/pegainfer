@@ -18,12 +18,17 @@ use safetensors::SafeTensors;
 use super::Gemma4Attention;
 use super::Gemma4Layer;
 use super::Gemma4Mlp;
+use super::Gemma4Moe;
 use super::Gemma4Weights;
+use super::StackedProjection;
 use crate::config::Gemma4Config;
+use crate::manifest::schema::ExpertTensors;
 use crate::manifest::schema::Manifest;
 use crate::manifest::schema::Matrix2d;
+use crate::manifest::schema::QuantMatrix;
 use crate::manifest::schema::Vector1d;
 use crate::manifest::validate::ObservedTensor;
+use crate::nvfp4::QuantSource;
 
 /// The wall figures are probes, not a partition: context creation, slot
 /// redemption, prefetch join and unmap fall between them, and the allocations
@@ -65,6 +70,18 @@ struct LayerSlots {
     gate: SlotId,
     up: SlotId,
     down: SlotId,
+    /// The bf16 half of a routed layer. The experts do not travel through the
+    /// staged loader at all.
+    moe: Option<MoeSlots>,
+}
+
+struct MoeSlots {
+    pre_feedforward_layernorm_2: VecSlotId,
+    post_feedforward_layernorm_1: VecSlotId,
+    post_feedforward_layernorm_2: VecSlotId,
+    router_proj: SlotId,
+    router_scale: VecSlotId,
+    router_per_expert_scale: VecSlotId,
 }
 
 struct RecordedPlan {
@@ -133,6 +150,172 @@ fn read_scalar_bf16(shards: &[SafeTensors], name: &str) -> Result<f32> {
     anyhow::bail!("Gemma 4: tensor '{name}' missing from every shard")
 }
 
+/// One layer's experts, already stacked and resident.
+struct StackedExperts {
+    gate: StackedProjection,
+    up: StackedProjection,
+    down: StackedProjection,
+}
+
+/// Upload every routed layer's experts. Returns one entry per layer, empty on
+/// the sizes that do not route.
+fn upload_experts(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    manifest: &Manifest,
+) -> Result<Vec<Option<StackedExperts>>> {
+    manifest
+        .layers
+        .iter()
+        .map(|layer| {
+            layer
+                .moe
+                .as_ref()
+                .map(|moe| {
+                    Ok(StackedExperts {
+                        gate: upload_stacked(ctx, shards, &moe.experts, |e| &e.gate)?,
+                        up: upload_stacked(ctx, shards, &moe.experts, |e| &e.up)?,
+                        down: upload_stacked(ctx, shards, &moe.experts, |e| &e.down)?,
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+/// Stack one projection of every expert into a pair of device buffers and
+/// upload it as the checkpoint stores it.
+///
+/// This bypasses the staged loader on purpose: that path is bf16-typed, and
+/// widening here is exactly what this representation exists to avoid. Each
+/// expert lands in its own row range, so the buffer is already the shape a
+/// batched call wants.
+fn upload_stacked(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    experts: &[ExpertTensors],
+    pick: fn(&ExpertTensors) -> &QuantMatrix,
+) -> Result<StackedProjection> {
+    let first = pick(experts.first().ok_or_else(|| {
+        anyhow::anyhow!("Gemma 4: a routed layer declares no experts, so nothing can be stacked")
+    })?);
+    let (rows, values) = first.geometry()?;
+    let packed_per_expert = rows * values / crate::nvfp4::PER_BYTE;
+    let scales_per_expert = rows * values / crate::nvfp4::GROUP;
+
+    let mut packed = ctx
+        .stream
+        .alloc_zeros::<u8>(packed_per_expert * experts.len())
+        .map_err(|e| anyhow::anyhow!("Gemma 4: cannot hold the stacked experts: {e}"))?;
+    let mut scales = ctx
+        .stream
+        .alloc_zeros::<u8>(scales_per_expert * experts.len())
+        .map_err(|e| anyhow::anyhow!("Gemma 4: cannot hold the stacked block scales: {e}"))?;
+    let mut tensor_scales = Vec::with_capacity(experts.len());
+    let mut scale_bytes = Vec::with_capacity(scales_per_expert * experts.len());
+
+    for (index, expert) in experts.iter().enumerate() {
+        let plan = pick(expert);
+        // Every expert of one projection is the same shape; a checkpoint that
+        // disagrees would otherwise write past its row range.
+        let geometry = plan.geometry()?;
+        anyhow::ensure!(
+            geometry == (rows, values),
+            "Gemma 4: expert {index} is {geometry:?}, but expert 0 is {:?}",
+            (rows, values)
+        );
+        let source = QuantSource::read(shards, plan)?;
+        anyhow::ensure!(
+            source.packed().len() == packed_per_expert
+                && source.scales().len() == scales_per_expert,
+            "Gemma 4: expert {index} carries {} packed bytes and {} scales, not {packed_per_expert} and {scales_per_expert}",
+            source.packed().len(),
+            source.scales().len()
+        );
+        let at = index * packed_per_expert;
+        ctx.stream
+            .memcpy_htod(
+                source.packed(),
+                &mut packed.slice_mut(at..at + packed_per_expert),
+            )
+            .map_err(|e| anyhow::anyhow!("Gemma 4: expert {index} weights did not upload: {e}"))?;
+        let at = index * scales_per_expert;
+        ctx.stream
+            .memcpy_htod(
+                source.scales(),
+                &mut scales.slice_mut(at..at + scales_per_expert),
+            )
+            .map_err(|e| anyhow::anyhow!("Gemma 4: expert {index} scales did not upload: {e}"))?;
+        scale_bytes.extend_from_slice(source.scales());
+        tensor_scales.push(source.tensor_scale());
+    }
+
+    // Marlin reads the block scale as S0E5M3, so every scale is normalized by
+    // one shared power of two and the per-tensor scale takes it back. The
+    // factor has to be the same across a projection's experts, which is why it
+    // is found here rather than per expert.
+    let rescale = marlin_rescale(&scale_bytes);
+    let mut qweight = ctx
+        .stream
+        .alloc_zeros::<u8>(packed_per_expert * experts.len())
+        .map_err(|e| anyhow::anyhow!("Gemma 4: cannot hold the reordered experts: {e}"))?;
+    pegainfer_kernels::ops::marlin_repack_4bit(
+        ctx,
+        &packed,
+        &mut qweight,
+        experts.len(),
+        values,
+        rows,
+    )?;
+    let mut prepared = ctx
+        .stream
+        .alloc_zeros::<u8>(scales_per_expert * experts.len())
+        .map_err(|e| anyhow::anyhow!("Gemma 4: cannot hold the reordered scales: {e}"))?;
+    pegainfer_kernels::ops::gemma4_marlin_nvfp4_prepare_scales(
+        ctx,
+        &scales,
+        &mut prepared,
+        experts.len(),
+        values,
+        rows,
+        rescale,
+    )?;
+    // The encoding reads the byte one bit higher than e4m3 does and drops the
+    // 2^7 the normalization applied, which is what this bias pays back.
+    let bias = 2f32.powi(119);
+    let global: Vec<f32> = tensor_scales
+        .iter()
+        .map(|scale| scale * bias / rescale)
+        .collect();
+    let global_scales = ctx
+        .stream
+        .clone_htod(&global)
+        .map_err(|e| anyhow::anyhow!("Gemma 4: cannot hold the per-tensor scales: {e}"))?;
+
+    Ok(StackedProjection {
+        qweight,
+        scales: prepared,
+        global_scales,
+        rows,
+        values,
+    })
+}
+
+/// The shared power of two that lifts every block scale so its leading bit
+/// survives the S0E5M3 re-encoding. Mirrors vLLM's
+/// `_nvfp4_compute_scale_factor`, whose bound is the e4m3 maximum.
+fn marlin_rescale(scale_bytes: &[u8]) -> f32 {
+    const CEILING: f32 = 448.0 * 128.0;
+    let peak = scale_bytes
+        .iter()
+        .map(|byte| crate::nvfp4::decode_e4m3(*byte) * 128.0)
+        .fold(0.0f32, f32::max);
+    if peak <= 0.0 || peak >= CEILING {
+        return 1.0;
+    }
+    (CEILING / peak).log2().floor().exp2()
+}
+
 fn record_plan(
     loader: &mut StagedWeightLoader,
     shards: &[SafeTensors],
@@ -162,6 +345,32 @@ fn record_plan(
             gate: record_matrix(loader, &layer.mlp.gate)?,
             up: record_matrix(loader, &layer.mlp.up)?,
             down: record_matrix(loader, &layer.mlp.down)?,
+            moe: layer
+                .moe
+                .as_ref()
+                .map(|moe| {
+                    Ok::<_, anyhow::Error>(MoeSlots {
+                        pre_feedforward_layernorm_2: record_vector(
+                            loader,
+                            &moe.pre_feedforward_layernorm_2,
+                        )?,
+                        post_feedforward_layernorm_1: record_vector(
+                            loader,
+                            &moe.post_feedforward_layernorm_1,
+                        )?,
+                        post_feedforward_layernorm_2: record_vector(
+                            loader,
+                            &moe.post_feedforward_layernorm_2,
+                        )?,
+                        router_proj: record_matrix(loader, &moe.router.proj)?,
+                        router_scale: record_vector(loader, &moe.router.scale)?,
+                        router_per_expert_scale: record_vector(
+                            loader,
+                            &moe.router.per_expert_scale,
+                        )?,
+                    })
+                })
+                .transpose()?,
         });
     }
     Ok(RecordedPlan {
@@ -176,14 +385,22 @@ fn materialize(
     loader: &mut StagedWeightLoader,
     plan: RecordedPlan,
     config: Gemma4Config,
+    experts: Vec<Option<StackedExperts>>,
 ) -> Result<Gemma4Weights> {
+    anyhow::ensure!(
+        experts.len() == plan.layers.len(),
+        "Gemma 4: {} expert sets for {} layers",
+        experts.len(),
+        plan.layers.len()
+    );
     Ok(Gemma4Weights {
         embed_tokens: loader.take(plan.embed_tokens),
         norm: loader.take_vec(plan.norm),
         layers: plan
             .layers
             .into_iter()
-            .map(|slots| -> Result<Gemma4Layer> {
+            .zip(experts)
+            .map(|(slots, experts)| -> Result<Gemma4Layer> {
                 Ok(Gemma4Layer {
                     input_layernorm: loader.take_vec(slots.input_layernorm),
                     post_attention_layernorm: loader.take_vec(slots.post_attention_layernorm),
@@ -202,6 +419,31 @@ fn materialize(
                         gate: loader.take(slots.gate),
                         up: loader.take(slots.up),
                         down: loader.take(slots.down),
+                    },
+                    moe: match (slots.moe, experts) {
+                        (Some(slots), Some(experts)) => Some(Gemma4Moe {
+                            pre_feedforward_layernorm_2: loader
+                                .take_vec(slots.pre_feedforward_layernorm_2),
+                            post_feedforward_layernorm_1: loader
+                                .take_vec(slots.post_feedforward_layernorm_1),
+                            post_feedforward_layernorm_2: loader
+                                .take_vec(slots.post_feedforward_layernorm_2),
+                            router_proj: loader.take(slots.router_proj),
+                            router_scale: loader.take_vec(slots.router_scale),
+                            router_per_expert_scale: loader.take_vec(slots.router_per_expert_scale),
+                            gate: experts.gate,
+                            up: experts.up,
+                            down: experts.down,
+                        }),
+                        (None, None) => None,
+                        // The manifest builds both halves from the same config,
+                        // so one without the other is a loader bug rather than
+                        // a checkpoint fault.
+                        (slots, experts) => anyhow::bail!(
+                            "Gemma 4: a layer has {} routed slots and {} expert sets",
+                            if slots.is_some() { "some" } else { "no" },
+                            if experts.is_some() { "some" } else { "no" }
+                        ),
                     },
                 })
             })
@@ -259,7 +501,8 @@ impl Gemma4Weights {
         loader.finish()?;
         let execute_and_drain_wall_ms = elapsed_ms(uploading);
 
-        let weights = materialize(&mut loader, plan, config)?;
+        let experts = upload_experts(&ctx, &shards, &manifest)?;
+        let weights = materialize(&mut loader, plan, config, experts)?;
         drop(loader);
         drop(prefetch);
         let device_free_bytes = free_device_bytes()?;

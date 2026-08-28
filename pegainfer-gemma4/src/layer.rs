@@ -20,6 +20,8 @@ use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
 use crate::config::Gemma4Config;
+use crate::config::MoeConfig;
+use crate::moe::MoeScratch;
 use crate::weights::Gemma4Layer;
 
 /// The geometry a layer runs at, read off the validated config — the local
@@ -31,6 +33,7 @@ pub(crate) struct LayerGeometry {
     pub(crate) num_kv_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) rms_norm_eps: f32,
+    pub(crate) moe: Option<MoeConfig>,
 }
 
 impl LayerGeometry {
@@ -42,6 +45,7 @@ impl LayerGeometry {
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             rms_norm_eps: config.rms_norm_eps,
+            moe: config.moe,
         }
     }
 
@@ -53,6 +57,7 @@ impl LayerGeometry {
             num_kv_heads: config.num_global_key_value_heads,
             head_dim: config.global_head_dim,
             rms_norm_eps: config.rms_norm_eps,
+            moe: config.moe,
         }
     }
 }
@@ -131,6 +136,8 @@ pub(crate) struct EpilogueScratch {
     act: HiddenStates,
     down: HiddenStates,
     down_normed: HiddenStates,
+    combined: HiddenStates,
+    moe: Option<MoeScratch>,
 }
 
 impl EpilogueScratch {
@@ -148,6 +155,11 @@ impl EpilogueScratch {
             act: wide(max_rows)?,
             down: hidden(max_rows)?,
             down_normed: hidden(max_rows)?,
+            combined: hidden(max_rows)?,
+            moe: match geom.moe {
+                Some(_) => Some(MoeScratch::new(ctx, geom, max_rows)?),
+                None => None,
+            },
         })
     }
 
@@ -170,6 +182,7 @@ impl EpilogueScratch {
             &mut self.act,
             &mut self.down,
             &mut self.down_normed,
+            &mut self.combined,
         ] {
             buf.seq_len = seq_len;
         }
@@ -256,9 +269,25 @@ pub(crate) fn attention_epilogue_into(
         &scratch.act,
         &mut scratch.down,
     )?;
+    let feed_forward = match (&layer.moe, &mut scratch.moe) {
+        (Some(moe), Some(moe_scratch)) => {
+            crate::moe::moe_into(
+                ctx,
+                moe,
+                geom,
+                &scratch.h2,
+                &scratch.down,
+                moe_scratch,
+                &mut scratch.combined,
+            )?;
+            &scratch.combined
+        }
+        (None, _) => &scratch.down,
+        (Some(_), None) => anyhow::bail!("Gemma 4: a routed layer met a dense epilogue scratch"),
+    };
     ops::rms_norm_batch_into(
         ctx,
-        &scratch.down,
+        feed_forward,
         &layer.post_feedforward_layernorm,
         geom.rms_norm_eps,
         &mut scratch.down_normed,

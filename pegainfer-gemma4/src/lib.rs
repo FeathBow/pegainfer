@@ -5,6 +5,8 @@ mod config;
 #[cfg(any(feature = "gemma4", test))]
 mod manifest;
 pub mod model_line;
+#[cfg(any(feature = "gemma4", test))]
+mod nvfp4;
 mod probe;
 // The engine is the live consumer; the oracles reach the rest, so an
 // `expect(dead_code)` cannot hold in every build.
@@ -18,6 +20,8 @@ mod green_ctx;
 mod kv;
 #[cfg(feature = "gemma4")]
 mod layer;
+#[cfg(feature = "gemma4")]
+mod moe;
 #[cfg(feature = "gemma4")]
 mod prefix_cache;
 #[cfg(feature = "gemma4")]
