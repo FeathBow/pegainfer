@@ -409,7 +409,7 @@ mod tests {
         let finite = finite_row();
         let logits_host = finite
             .iter()
-            .chain(std::iter::repeat(&bf16::ZERO).take(EXPERTS))
+            .chain(std::iter::repeat_n(&bf16::ZERO, EXPERTS))
             .copied()
             .collect::<Vec<_>>();
         let (index_host, weight_host) = run_router(ctx, scale, &logits_host);
