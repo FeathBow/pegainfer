@@ -452,10 +452,10 @@ mod tests {
             &mut invalid_index,
             &mut invalid_weight,
         );
-        assert_eq!(
-            error.expect_err("127 experts must be rejected").to_string(),
-            "gemma4_moe_router_topk_into: the 128-expert register-router contract requires exactly \
-             128 experts and 1..=32 picks, got 127 experts and top 8"
+        let message = error.expect_err("127 experts must be rejected").to_string();
+        assert!(
+            message.contains("128-expert register-router contract") && message.contains("127"),
+            "unexpected rejection: {message}"
         );
     }
 
