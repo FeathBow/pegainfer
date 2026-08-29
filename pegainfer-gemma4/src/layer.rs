@@ -128,8 +128,7 @@ pub(crate) fn build_proportional_rope_tables(
 pub(crate) struct EpilogueScratch {
     max_rows: usize,
     attn_proj: HiddenStates,
-    o_normed: HiddenStates,
-    h2: HiddenStates,
+    residual: HiddenStates,
     mlp_in: HiddenStates,
     gate: HiddenStates,
     up: HiddenStates,
@@ -145,8 +144,7 @@ impl EpilogueScratch {
         Ok(Self {
             max_rows,
             attn_proj: hidden(max_rows)?,
-            o_normed: hidden(max_rows)?,
-            h2: hidden(max_rows)?,
+            residual: hidden(max_rows)?,
             mlp_in: hidden(max_rows)?,
             gate: wide(max_rows)?,
             up: wide(max_rows)?,
@@ -170,8 +168,7 @@ impl EpilogueScratch {
         );
         for buf in [
             &mut self.attn_proj,
-            &mut self.o_normed,
-            &mut self.h2,
+            &mut self.residual,
             &mut self.mlp_in,
             &mut self.gate,
             &mut self.up,
@@ -222,22 +219,18 @@ pub(crate) fn attention_epilogue_into(
         attn,
         &mut scratch.attn_proj,
     )?;
-    ops::rms_norm_batch_into(
+    // The first normalized value and its residual sum still round to bf16
+    // before the second reduction reads them.
+    ops::rms_norm_add_rms_norm_round_batch_into(
         ctx,
         &scratch.attn_proj,
         &layer.post_attention_layernorm,
-        geom.rms_norm_eps,
-        &mut scratch.o_normed,
-    );
-    ops::add_batch_into(ctx, x, &scratch.o_normed, &mut scratch.h2)?;
-
-    ops::rms_norm_batch_into(
-        ctx,
-        &scratch.h2,
+        x,
         &layer.pre_feedforward_layernorm,
         geom.rms_norm_eps,
+        &mut scratch.residual,
         &mut scratch.mlp_in,
-    );
+    )?;
     ops::gemm_rows_into_checked(
         ctx,
         &layer.mlp.gate,
@@ -269,11 +262,11 @@ pub(crate) fn attention_epilogue_into(
                 ctx,
                 moe,
                 geom,
-                &scratch.h2,
+                &scratch.residual,
                 &scratch.down,
                 moe_scratch,
-                // The attention projection is dead after `h2` is formed and
-                // has the same shape, so the routed-only result reuses it.
+                // The attention projection is dead after `residual` is formed
+                // and has the same shape, so the routed-only result reuses it.
                 &mut scratch.attn_proj,
             )?;
             &scratch.attn_proj
@@ -285,7 +278,7 @@ pub(crate) fn attention_epilogue_into(
         ctx,
         feed_forward,
         &layer.post_feedforward_layernorm,
-        &scratch.h2,
+        &scratch.residual,
         layer.layer_scalar,
         geom.rms_norm_eps,
         out,

@@ -40,6 +40,23 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    /// `residual_out = bf16(rms_norm(x, weight_post) + res_in)` then
+    /// `out = rms_norm(residual_out, weight_pre)`, bitwise what
+    /// `rms_norm_batched_cuda` then `fused_add_rms_norm_round_batched_cuda`
+    /// produce.
+    pub fn rms_norm_add_rms_norm_round_batched_cuda(
+        x: *const Half,
+        weight_post: *const Half,
+        res_in: *const Half,
+        weight_pre: *const Half,
+        residual_out: *mut Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// `out = (residual + rms_norm(x, weight)) * scale`, the three standalone
     /// ops' roundings kept in place.
     pub fn rms_norm_add_scale_batched_cuda(

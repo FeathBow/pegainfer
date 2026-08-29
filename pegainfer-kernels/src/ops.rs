@@ -167,6 +167,7 @@ pub use norm::fused_add_rms_norm_round_batch_into;
 pub use norm::fused_add_rms_norm_round_into;
 pub use norm::layer_norm_into;
 pub use norm::rms_norm;
+pub use norm::rms_norm_add_rms_norm_round_batch_into;
 pub use norm::rms_norm_add_scale_batch_into;
 pub use norm::rms_norm_batch_dual_into;
 pub use norm::rms_norm_batch_into;

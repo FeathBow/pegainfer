@@ -206,6 +206,56 @@ pub fn rms_norm_batch_dual_into(
     }
 }
 
+/// The attention epilogue's norm pair in one launch:
+/// `residual_out = bf16(rms_norm(x, weight_post) + res_in)` then
+/// `out = rms_norm(residual_out, weight_pre)`, bitwise what the separate
+/// norm and [`fused_add_rms_norm_round_batch_into`] produce.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_add_rms_norm_round_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight_post: &DeviceVec,
+    res_in: &HiddenStates,
+    weight_pre: &DeviceVec,
+    eps: f32,
+    residual_out: &mut HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(weight_post.len, x.hidden_dim);
+    assert_eq!(weight_pre.len, x.hidden_dim);
+    assert_eq!(res_in.hidden_dim, x.hidden_dim);
+    assert_eq!(res_in.seq_len, x.seq_len);
+    assert_eq!(residual_out.hidden_dim, x.hidden_dim);
+    assert_eq!(residual_out.seq_len, x.seq_len);
+    assert_eq!(out.hidden_dim, x.hidden_dim);
+    assert_eq!(out.seq_len, x.seq_len);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (wp_ptr, _gwp) = weight_post.data.device_ptr(&ctx.stream);
+    let (r_ptr, _gr) = res_in.data.device_ptr(&ctx.stream);
+    let (wq_ptr, _gwq) = weight_pre.data.device_ptr(&ctx.stream);
+    let (ro_ptr, _gro) = residual_out.data.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::rms_norm_add_rms_norm_round_batched_cuda(
+            x_ptr as *const ffi::Half,
+            wp_ptr as *const ffi::Half,
+            r_ptr as *const ffi::Half,
+            wq_ptr as *const ffi::Half,
+            ro_ptr as *mut ffi::Half,
+            o_ptr as *mut ffi::Half,
+            x.hidden_dim as i32,
+            x.seq_len as i32,
+            eps,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(
+        result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "rms_norm_add_rms_norm_round_batched_cuda failed: {result:?}"
+    );
+    Ok(())
+}
+
 /// The layer tail in one launch: `out = (residual + rms_norm(x, weight)) *
 /// scale`, bit-identical to the separate norm, add and scale calls it
 /// replaces.
@@ -552,5 +602,40 @@ mod parity {
         let mut fused = HiddenStates::zeros(&ctx, d, rows).expect("fused");
         rms_norm_add_scale_batch_into(&ctx, &x, &weight, &residual, scale, eps, &mut fused);
         assert_bitwise(&ctx, &split, &fused, "fused layer tail");
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_epilogue_norm_pair_matches_its_parts() {
+        let ctx = DeviceContext::new_with_device(0).expect("device");
+        let (d, rows, eps) = (2816usize, 16usize, 1e-6f32);
+        let attn = seeded(&ctx, d, rows, 2);
+        let x = seeded(&ctx, d, rows, 3);
+        let w_post = seeded_weight(&ctx, d, 2);
+        let w_pre = seeded_weight(&ctx, d, 3);
+        // The standalone chain the epilogue ran: norm, a separate bf16 add,
+        // then the second norm reading the rounded sum.
+        let mut normed = HiddenStates::zeros(&ctx, d, rows).expect("normed");
+        rms_norm_batch_into(&ctx, &attn, &w_post, eps, &mut normed);
+        let mut residual = HiddenStates::zeros(&ctx, d, rows).expect("residual");
+        crate::ops::add_batch_into(&ctx, &x, &normed, &mut residual).expect("add");
+        let mut mlp_in = HiddenStates::zeros(&ctx, d, rows).expect("mlp_in");
+        rms_norm_batch_into(&ctx, &residual, &w_pre, eps, &mut mlp_in);
+
+        let mut fused_res = HiddenStates::zeros(&ctx, d, rows).expect("fr");
+        let mut fused_mlp = HiddenStates::zeros(&ctx, d, rows).expect("fm");
+        rms_norm_add_rms_norm_round_batch_into(
+            &ctx,
+            &attn,
+            &w_post,
+            &x,
+            &w_pre,
+            eps,
+            &mut fused_res,
+            &mut fused_mlp,
+        )
+        .expect("fused pair");
+        assert_bitwise(&ctx, &residual, &fused_res, "fused epilogue residual");
+        assert_bitwise(&ctx, &mlp_in, &fused_mlp, "fused epilogue mlp input");
     }
 }
