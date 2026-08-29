@@ -17,6 +17,16 @@ Rows retire independently. Requests in one batch have their own frontiers, their
 | Page size | 16 tokens | both families |
 | Sliding window | 1024 tokens | the local family releases its front past this; the global family never releases |
 
+## The routed expert schedule
+
+The 26B routed path fixes whole-column K stripes in Gemma's Marlin template instantiations. One CTA reduces an output element in one order, so identical target rows produce identical bytes regardless of grid partition, scratch layout or companion rows. Kimi keeps the dynamic schedule. This policy changes neither the shared WNA16 launcher, the Gemma Rust wrapper nor the WNA16 C ABI. The lock-serialized fp32 staging path therefore never engages, but `c_tmp` remains allocated because the shared launcher refuses a null staging buffer.
+
+Alignment uses 16-row blocks below 256 routed slots and 64-row blocks at or above that floor. Decode buckets top out at 16 rows × 8 picks = 128 slots, so decode never flips to the coarse block. The region immediately above 256 slots is unmeasured: the threshold is a policy that excludes decode, not a claimed performance crossover. The 26B projection widths constrain the ordered tile table too: the 704-wide gate and up projections admit only a 64-wide output tile, and the 2816-wide down projection takes a 128-wide tile in decode and a 256-wide one in the coarse-block prefill path.
+
+The register router accepts exactly 128 experts and from 1 through 32 picks. A non-finite row fails closed: every emitted index stays valid and row-unique, while every emitted weight is NaN so downstream computation remains loud.
+
+The checkpoint-backed `the_routed_block_matches_the_reference_formulas` gate owns the scratch-capacity, companion-route and coarse-block evidence, including a narrow block replay after a coarse block on one scratch. `router_topk_matches_the_exact_128_expert_contract` owns the register-router boundary and non-finite rows. The kernels-owned `kimi_marlin_align_boundary_matches_vllm_contract` oracle owns stable counts, offsets, padding and expert-local order on both sides of the alignment dispatch boundary.
+
 ## The two pools
 
 Gemma 4 runs two attention families with different KV shapes, so the budget is two budgets. With 16-token pages, `C = ceil(8192/16) = 512` context pages and `W = ceil(1024/16) + 1 = 65` window pages:
