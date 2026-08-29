@@ -48,7 +48,14 @@ const ThreadConfig kSmallBatch[] = {
     {64, 128, 128},
 };
 
-const ThreadConfigs kTables{kSmallBatch, 2, kSmallBatch, 2};
+const ThreadConfig kLargeBatch[] = {
+    {64, 256, 256},
+    {128, 64, 256},
+    {64, 128, 128},
+    {128, 64, 128},
+};
+
+const ThreadConfigs kTables{kSmallBatch, 2, kLargeBatch, 4};
 
 MarlinFuncPtr get_nvfp4_kernel(
     int thread_m_blocks,
@@ -64,6 +71,8 @@ MarlinFuncPtr get_nvfp4_kernel(
   GEMMA4_MARLIN_GET_IF_M1(8, 4, 128)
   GEMMA4_MARLIN_GET_IF(4, 4, 8, false, 128)
   GEMMA4_MARLIN_GET_IF(4, 8, 4, false, 128)
+  GEMMA4_MARLIN_GET_IF(4, 16, 4, false, 256)
+  GEMMA4_MARLIN_GET_IF(4, 4, 8, false, 256)
   return kernel;
 }
 
