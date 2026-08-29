@@ -11,7 +11,6 @@ use crate::tensor::AxisSpec;
 use crate::tensor::DeviceContext;
 use crate::tensor::GpuTensor;
 #[cfg(test)]
-use crate::tensor::KernelCall;
 #[cfg(test)]
 use crate::tensor::TensorSpec;
 
@@ -698,62 +697,14 @@ impl KimiMarlinWna16Workspace {
 }
 
 pub struct KimiMarlinRouting<'a> {
-    // Read only by the test-only `manifest_call`; kept as manifest metadata.
-    #[allow(dead_code)]
-    batch_size: usize,
     active_tokens: usize,
     pub route_elems: usize,
-    // Read only by the test-only `manifest_call`.
-    #[allow(dead_code)]
-    global_expert_start: usize,
     block_size: usize,
     max_padded_tokens: usize,
     pub max_m_blocks: usize,
     sorted_token_ids: &'a CudaSlice<i32>,
     expert_ids: &'a CudaSlice<i32>,
     pub num_tokens_post_padded: &'a CudaSlice<i32>,
-}
-
-impl KimiMarlinRouting<'_> {
-    #[must_use]
-    #[cfg(test)]
-    fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.marlin_align_block_size",
-            "Kimi-K2 vLLM Marlin WNA16 route alignment metadata",
-        )
-        .output(
-            "sorted_token_ids",
-            TensorSpec::named(
-                "i32",
-                "marlin_sorted_route_ids_padded",
-                [AxisSpec::named("max_padded_tokens", self.max_padded_tokens)],
-            ),
-        )
-        .output(
-            "expert_ids",
-            TensorSpec::named(
-                "i32",
-                "marlin_expert_id_per_m_block",
-                [AxisSpec::named("max_m_blocks", self.max_m_blocks)],
-            ),
-        )
-        .output(
-            "num_tokens_post_padded",
-            TensorSpec::named("i32", "scalar_device", [AxisSpec::named("value", 1)]),
-        )
-        .attr("batch_size", self.batch_size.to_string())
-        .attr("active_tokens", self.active_tokens.to_string())
-        .attr("route_elems", self.route_elems.to_string())
-        .attr("topk", KIMI_K2_TOPK.to_string())
-        .attr("local_experts", KIMI_K2_LOCAL_EXPERTS.to_string())
-        .attr("global_expert_start", self.global_expert_start.to_string())
-        .attr("block_size", self.block_size.to_string())
-        .attr("sentinel_token_id", self.route_elems.to_string())
-        .attr("device_resident_metadata", "true".to_string())
-        .attr("decode_step_allocation", "forbidden".to_string())
-        .attr("decode_step_d2h", "forbidden".to_string())
-    }
 }
 
 pub fn kimi_moe_marlin_align_block_size<'a>(
@@ -825,10 +776,8 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
         result.result()?;
     }
     Ok(KimiMarlinRouting {
-        batch_size,
         active_tokens,
         route_elems,
-        global_expert_start,
         block_size: workspace.block_size,
         max_padded_tokens: workspace.max_padded_tokens,
         max_m_blocks: workspace.max_m_blocks,
@@ -1302,10 +1251,8 @@ pub fn kimi_deepep_build_marlin_routing_on_stream<'a>(
     }
 
     Ok(KimiMarlinRouting {
-        batch_size: tight_max,
         active_tokens: tight_max,
         route_elems: tight_max,
-        global_expert_start: 0,
         block_size,
         max_padded_tokens: tight_max,
         max_m_blocks: tight_m_blocks,
@@ -1676,7 +1623,7 @@ mod tests {
             assert_eq!(topk_host.len(), route_elems);
 
             let topk_dev = ctx.stream.clone_htod(&topk_host).expect("topk H2D");
-            let (num_tokens, sorted, expert_ids, call) = {
+            let (num_tokens, sorted, expert_ids) = {
                 let routing = kimi_moe_marlin_align_block_size(
                     &ctx,
                     &mut workspace,
@@ -1698,7 +1645,7 @@ mod tests {
                     .stream
                     .clone_dtoh(routing.expert_ids)
                     .expect("expert_ids D2H");
-                (num_tokens, sorted, expert_ids, routing.manifest_call())
+                (num_tokens, sorted, expert_ids)
             };
             let expert_offsets = ctx
                 .stream
@@ -1740,19 +1687,6 @@ mod tests {
                 expected_expert_ids.as_slice()
             );
             assert_eq!(expert_offsets, expected_offsets);
-
-            let attrs: std::collections::HashMap<&str, &str> = call
-                .attrs
-                .iter()
-                .map(|a| (a.name.as_str(), a.value.as_str()))
-                .collect();
-            let route_elems_attr = route_elems.to_string();
-            assert_eq!(attrs.get("device_resident_metadata"), Some(&"true"));
-            assert_eq!(attrs.get("decode_step_d2h"), Some(&"forbidden"));
-            assert_eq!(
-                attrs.get("sentinel_token_id"),
-                Some(&route_elems_attr.as_str())
-            );
         }
     }
 
