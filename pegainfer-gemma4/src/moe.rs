@@ -27,10 +27,17 @@ use pegainfer_kernels::ops::marlin_moe_align_block_size;
 use crate::layer::LayerGeometry;
 use crate::weights::Gemma4Moe;
 
-/// The kernel's row block. Every expert's picks are padded up to it, so a
-/// narrower block wastes less on a thin step and a wider one launches fewer
-/// blocks; sixteen is the narrowest the kernel compiles a full table for.
-const BLOCK: usize = 16;
+const DECODE_BLOCK: usize = 16;
+const PREFILL_BLOCK: usize = 64;
+const PREFILL_MIN_SLOTS: usize = 256;
+
+fn marlin_block(slots: usize) -> usize {
+    if slots >= PREFILL_MIN_SLOTS {
+        PREFILL_BLOCK
+    } else {
+        DECODE_BLOCK
+    }
+}
 
 /// Marlin's lock array is one int per 64-wide output tile per row block.
 const TILE_N: usize = 64;
@@ -69,10 +76,8 @@ impl MoeScratch {
         let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
         let narrow = |rows| HiddenStates::zeros(ctx, moe.intermediate_size, rows);
         let slots = max_rows * moe.top_k;
-        // Every expert can leave one block part filled, so the padded total
-        // runs past the slot count by that much in the worst case.
-        let max_blocks = slots.div_ceil(BLOCK) + moe.num_experts;
-        let max_padded = max_blocks * BLOCK;
+        let max_blocks = slots.div_ceil(DECODE_BLOCK) + moe.num_experts;
+        let max_padded = (max_blocks * DECODE_BLOCK).max(slots + moe.num_experts * PREFILL_BLOCK);
         Ok(Self {
             max_rows,
             router_in: hidden(max_rows)?,
@@ -200,13 +205,14 @@ pub(crate) fn moe_into(
     )?;
 
     let slots = rows * config.top_k;
+    let block = marlin_block(slots);
     marlin_moe_align_block_size(
         ctx,
         &scratch.index,
         rows,
         config.top_k,
         config.num_experts,
-        BLOCK,
+        block,
         &mut MoeAlignScratch {
             sorted_token_ids: &mut scratch.sorted_token_ids,
             expert_ids: &mut scratch.expert_ids,
@@ -229,7 +235,7 @@ pub(crate) fn moe_into(
         expert_ids: &scratch.expert_ids,
         num_tokens_post_padded: &scratch.padded_total,
         topk_weights: &scratch.weight,
-        block_size: BLOCK,
+        block_size: block,
         top_k: config.top_k,
         mul_topk_weights: false,
     };
