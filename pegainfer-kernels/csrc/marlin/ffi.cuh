@@ -12,6 +12,7 @@ CUresult marlin_moe_align_block_size_cuda(
     int* expert_ids,
     int* num_tokens_post_padded,
     uint32_t* expert_offsets,
+    uint32_t* unused_expert_cursor,
     int active_tokens,
     int topk,
     int global_start,

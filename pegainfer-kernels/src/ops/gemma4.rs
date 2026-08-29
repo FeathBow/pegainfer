@@ -317,6 +317,7 @@ pub fn marlin_moe_align_block_size(
             expert_ptr as *mut i32,
             padded_ptr as *mut i32,
             offsets_ptr as *mut u32,
+            std::ptr::null_mut(),
             i32::try_from(rows)?,
             i32::try_from(top_k)?,
             0,

@@ -170,6 +170,8 @@ CUresult marlin_moe_align_block_size_cuda(
     int* expert_ids,
     int* num_tokens_post_padded,
     uint32_t* expert_offsets,
+    // Kept so the symbol's C signature does not change; never read.
+    uint32_t* unused_expert_cursor,
     int active_tokens,
     int topk,
     int global_start,
@@ -178,6 +180,7 @@ CUresult marlin_moe_align_block_size_cuda(
     int max_padded_tokens,
     int max_m_blocks,
     cudaStream_t stream) {
+  (void)unused_expert_cursor;
   if (topk_idx == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
       num_tokens_post_padded == nullptr || expert_offsets == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;

@@ -811,6 +811,7 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
                 expert_ids_ptr as *mut i32,
                 num_tokens_ptr as *mut i32,
                 offsets_ptr as *mut u32,
+                std::ptr::null_mut(),
                 active_tokens as i32,
                 KIMI_K2_TOPK as i32,
                 global_expert_start as i32,

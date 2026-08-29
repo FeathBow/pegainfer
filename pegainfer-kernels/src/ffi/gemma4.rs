@@ -79,13 +79,15 @@ unsafe extern "C" {
     ) -> CUresult;
 
     /// Build the expert-blocked dispatch on the device. `expert_offsets` holds
-    /// `experts + 1` scratch counters.
+    /// `experts + 1` scratch counters; the cursor slot after it is an ignored
+    /// compatibility parameter and may be null.
     pub fn marlin_moe_align_block_size_cuda(
         topk_idx: *const i32,
         sorted_token_ids: *mut i32,
         expert_ids: *mut i32,
         num_tokens_post_padded: *mut i32,
         expert_offsets: *mut u32,
+        unused_expert_cursor: *mut u32,
         active_tokens: i32,
         topk: i32,
         global_start: i32,
