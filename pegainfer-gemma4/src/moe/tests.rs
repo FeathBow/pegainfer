@@ -92,7 +92,7 @@ fn bf16_ulp(x: f32) -> f32 {
 fn assert_matches_reference(label: &str, capture: &RoutedCapture, reference: &RoutedReference) {
     const WEIGHT_TOLERANCE: f32 = 5e-3;
     const RELATIVE_TOLERANCE: f32 = 2e-2;
-    // Rows whose picks differ only by a bf16-level tie leave the numeric
+    // Rows whose pick set differs by a bf16-level tie leave the numeric
     // comparison (their expert set is not the reference's); more than one
     // row in this many says the input, not the arithmetic, is at fault.
     const TIED_ROWS_ONE_IN: usize = 8;
@@ -105,51 +105,57 @@ fn assert_matches_reference(label: &str, capture: &RoutedCapture, reference: &Ro
     );
     let rows = capture.index.len() / top_k;
     let mut tied_rows = Vec::new();
+    let mut reordered_rows = Vec::new();
     for row in 0..rows {
         let slots = row * top_k..(row + 1) * top_k;
         let mine = &capture.index[slots.clone()];
         let theirs = &reference.index[slots.clone()];
+        // Reference slot `j` compares against capture slot `order[j]`: the
+        // identity when the picks agree, the matching expert when only the
+        // order differs.
+        let mut order: Vec<usize> = (0..top_k).collect();
         if mine != theirs {
             let logits = &reference.logits[row * experts..(row + 1) * experts];
-            let only_mine: Vec<i32> = mine
+            let tie = mine
                 .iter()
-                .copied()
-                .filter(|e| !theirs.contains(e))
-                .collect();
-            let only_theirs: Vec<i32> = theirs
-                .iter()
-                .copied()
-                .filter(|e| !mine.contains(e))
-                .collect();
-            let tie = !only_mine.is_empty()
-                && only_mine.len() == only_theirs.len()
-                && only_mine.iter().all(|a| {
-                    only_theirs.iter().all(|b| {
-                        let (la, lb) = (logits[*a as usize], logits[*b as usize]);
-                        (la - lb).abs() <= bf16_ulp(la.abs().max(lb.abs()))
-                    })
+                .zip(theirs)
+                .filter(|(a, b)| a != b)
+                .all(|(a, b)| {
+                    let (la, lb) = (logits[*a as usize], logits[*b as usize]);
+                    (la - lb).abs() <= bf16_ulp(la.abs().max(lb.abs()))
                 });
             assert!(
                 tie,
                 "{label}: row {row} router picks {mine:?} differ from the reference {theirs:?} \
                  beyond a bf16 tie"
             );
-            tied_rows.push(row);
-            continue;
+            let same_set = theirs.iter().all(|e| mine.contains(e));
+            if !same_set {
+                tied_rows.push(row);
+                continue;
+            }
+            for (j, expert) in theirs.iter().enumerate() {
+                order[j] = mine.iter().position(|e| e == expert).expect("same set");
+            }
+            reordered_rows.push(row);
         }
-        let weight_gap = capture.weight[slots.clone()]
-            .iter()
-            .zip(&reference.weight[slots.clone()])
-            .fold(0.0f32, |acc, (a, b)| acc.max(abs_gap(*a, *b)));
+        let weight_gap = (0..top_k).fold(0.0f32, |acc, j| {
+            acc.max(abs_gap(
+                capture.weight[row * top_k + order[j]],
+                reference.weight[row * top_k + j],
+            ))
+        });
         assert!(
             weight_gap <= WEIGHT_TOLERANCE,
             "{label}: row {row} router weights differ by {weight_gap:.3e}"
         );
+        let gate: Vec<f32> = (0..top_k)
+            .flat_map(|j| {
+                let at = (row * top_k + order[j]) * width;
+                capture.gate[at..at + width].iter().map(|x| x.to_f32())
+            })
+            .collect();
         let gate_span = row * top_k * width..(row + 1) * top_k * width;
-        let gate = capture.gate[gate_span.clone()]
-            .iter()
-            .map(|x| x.to_f32())
-            .collect::<Vec<_>>();
         let gate_gap = relative_gap(&gate, &reference.gate[gate_span]);
         assert!(
             gate_gap <= RELATIVE_TOLERANCE,
@@ -171,8 +177,11 @@ fn assert_matches_reference(label: &str, capture: &RoutedCapture, reference: &Ro
         "{label}: {} of {rows} rows tied at bf16: {tied_rows:?}",
         tied_rows.len()
     );
-    if !tied_rows.is_empty() {
-        eprintln!("{label}: rows {tied_rows:?} tied at bf16 and left the numeric comparison");
+    if !tied_rows.is_empty() || !reordered_rows.is_empty() {
+        eprintln!(
+            "{label}: bf16 ties — rows {tied_rows:?} left the numeric comparison, rows \
+             {reordered_rows:?} compared by expert"
+        );
     }
 }
 
