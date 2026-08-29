@@ -22,10 +22,21 @@ __global__ void gemma4_moe_router_topk_kernel(
   const __nv_bfloat16 *row_logits = logits + (long long)row * experts;
 
   float held[kRouterLaneExperts];
-  float mine = -FLT_MAX;
+  bool poisoned = false;
   for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
     int e = lane + slot * kRouterBlock;
     held[slot] = e < experts ? __bfloat162float(row_logits[e]) : -FLT_MAX;
+    poisoned |= e < experts && !isfinite(held[slot]);
+  }
+  // One non-finite logit fails the whole row closed, -inf included: the
+  // softmax below would otherwise mask it and hand out ordinary weights.
+  if (__any_sync(0xffffffff, poisoned)) {
+    for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
+      held[slot] = NAN;
+    }
+  }
+  float mine = -FLT_MAX;
+  for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
     mine = fmaxf(mine, held[slot]);
   }
   for (int width = kRouterBlock / 2; width > 0; width >>= 1) {

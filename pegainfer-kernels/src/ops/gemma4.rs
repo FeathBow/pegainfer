@@ -385,12 +385,13 @@ mod tests {
     fn assert_non_finite_row_fails_closed(
         ctx: &DeviceContext,
         scale: &DeviceVec,
+        alone: &(Vec<i32>, Vec<f32>),
         non_finite: &[bf16],
     ) {
         let finite = finite_row();
         let paired_logits = finite.iter().chain(non_finite).copied().collect::<Vec<_>>();
         let (paired_index, paired_weight) = run_router(ctx, scale, &paired_logits);
-        let (alone_index, alone_weight) = run_router(ctx, scale, &finite);
+        let (alone_index, alone_weight) = alone;
         assert_eq!(&paired_index[..TOP_K], alone_index);
         assert_eq!(
             paired_weight[..TOP_K]
@@ -407,7 +408,11 @@ mod tests {
         assert!(paired_weight[TOP_K..].iter().all(|weight| weight.is_nan()));
     }
 
-    fn assert_finite_contract(ctx: &DeviceContext, scale: &DeviceVec, scale_host: &[bf16]) {
+    fn assert_finite_contract(
+        ctx: &DeviceContext,
+        scale: &DeviceVec,
+        scale_host: &[bf16],
+    ) -> (Vec<i32>, Vec<f32>) {
         let finite = finite_row();
         let logits_host = finite
             .iter()
@@ -429,6 +434,7 @@ mod tests {
                 "slot {slot}: {actual} != {expected}"
             );
         }
+        (index_host[..TOP_K].to_vec(), weight_host[..TOP_K].to_vec())
     }
 
     fn assert_invalid_expert_contract(ctx: &DeviceContext) {
@@ -465,17 +471,22 @@ mod tests {
         let ctx = DeviceContext::new().expect("CUDA context");
         let scale_host = scale_host();
         let scale = DeviceVec::from_host(&ctx, &scale_host).expect("scale");
-        assert_finite_contract(&ctx, &scale, &scale_host);
+        let alone = assert_finite_contract(&ctx, &scale, &scale_host);
 
-        let all_negative_infinity = vec![bf16::from_f32(f32::NEG_INFINITY); EXPERTS];
-        assert_non_finite_row_fails_closed(&ctx, &scale, &all_negative_infinity);
         let finite = finite_row();
+        let all_negative_infinity = vec![bf16::from_f32(f32::NEG_INFINITY); EXPERTS];
+        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &all_negative_infinity);
         let mut positive_infinity = finite.clone();
         positive_infinity[SELECTED[0]] = bf16::from_f32(f32::INFINITY);
-        assert_non_finite_row_fails_closed(&ctx, &scale, &positive_infinity);
-        let mut nan = finite;
+        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &positive_infinity);
+        let mut nan = finite.clone();
         nan[SELECTED[0]] = bf16::from_f32(f32::NAN);
-        assert_non_finite_row_fails_closed(&ctx, &scale, &nan);
+        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &nan);
+        // A lone -inf beside finite logits is the case a plain softmax would
+        // mask into ordinary weights.
+        let mut one_negative_infinity = finite;
+        one_negative_infinity[SELECTED[0] + 1] = bf16::from_f32(f32::NEG_INFINITY);
+        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &one_negative_infinity);
         assert_invalid_expert_contract(&ctx);
     }
 }
