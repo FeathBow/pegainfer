@@ -35,7 +35,7 @@ constexpr int kKimiGroupSize = 32;
     kernel = Marlin<vllm::kBFloat16.id(), vllm::kU4B8.id(),                    \
                     vllm::kBFloat16.id(), vllm::kBFloat16.id(), NUM_THREADS,   \
                     THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS,         \
-                    M_BLOCK_SIZE_8, pipe_stages, GROUP_BLOCKS, false>;         \
+                    M_BLOCK_SIZE_8, pipe_stages, GROUP_BLOCKS, false, false>;  \
   }
 
 #define KIMI_MARLIN_COMMON_GET_IF_M1(N_BLOCKS, K_BLOCKS, NUM_THREADS)    \

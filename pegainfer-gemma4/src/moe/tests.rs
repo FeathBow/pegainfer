@@ -31,6 +31,26 @@ fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
         / scale
 }
 
+struct RoutedCapture {
+    index: Vec<i32>,
+    weight: Vec<f32>,
+    gate: Vec<half::bf16>,
+    block: Vec<half::bf16>,
+}
+
+fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapture) {
+    assert!(
+        expected.index == actual.index,
+        "{label}: router picks moved"
+    );
+    assert!(
+        expected.weight == actual.weight,
+        "{label}: router weights moved"
+    );
+    assert!(expected.gate == actual.gate, "{label}: gate bytes moved");
+    assert!(expected.block == actual.block, "{label}: block bytes moved");
+}
+
 /// The routed block against the formulas the reference implements, with
 /// the router, the expert GEMM and the combined block compared apart:
 /// a final-output comparison alone cannot say which of the three moved.
@@ -43,6 +63,10 @@ fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
 fn the_routed_block_matches_the_reference_formulas() {
     use half::bf16;
 
+    const TARGET_ROWS: usize = 4;
+    const COMPANION_ROWS: usize = TARGET_ROWS + 1;
+    const ROOMY_SCRATCH_ROWS: usize = 8;
+
     let model = std::env::var("PEGAINFER_NVFP4_MODEL")
         .expect("PEGAINFER_NVFP4_MODEL must name the checkpoint directory");
 
@@ -54,7 +78,7 @@ fn the_routed_block_matches_the_reference_formulas() {
     let hidden = geom.hidden_size;
     let width = routed.intermediate_size;
     let top_k = routed.top_k;
-    let rows = 4;
+    let rows = TARGET_ROWS;
     let slots = rows * top_k;
 
     let (weights, _) =
@@ -65,39 +89,56 @@ fn the_routed_block_matches_the_reference_formulas() {
 
     // Inputs both sides rebuild from the same rule, at bf16 precision so
     // neither side starts from a value the other cannot hold.
-    let sample = |seed: usize| -> Vec<bf16> {
-        (0..rows * hidden)
+    let sample = |seed: usize, sample_rows: usize| -> Vec<bf16> {
+        (0..sample_rows * hidden)
             .map(|i| bf16::from_f32((((i * 37 + seed * 11) % 199) as f32 - 99.0) / 200.0))
             .collect()
     };
-    let residual_host = sample(0);
-    let dense_host = sample(1);
-    let mut residual = HiddenStates::zeros(&ctx, hidden, rows).expect("residual");
-    let mut dense = HiddenStates::zeros(&ctx, hidden, rows).expect("dense");
-    ctx.stream
-        .memcpy_htod(&residual_host, &mut residual.data)
-        .expect("upload residual");
-    ctx.stream
-        .memcpy_htod(&dense_host, &mut dense.data)
-        .expect("upload dense");
+    let run = |residual_host: &[bf16], dense_host: &[bf16], scratch_rows: usize| {
+        let active_rows = residual_host.len() / hidden;
+        let residual =
+            HiddenStates::from_host(&ctx, residual_host, hidden, active_rows).expect("residual");
+        let dense = HiddenStates::from_host(&ctx, dense_host, hidden, active_rows).expect("dense");
+        let mut scratch = MoeScratch::new(&ctx, &geom, scratch_rows).expect("scratch");
+        let mut out = HiddenStates::zeros(&ctx, hidden, active_rows).expect("out");
+        moe_into(&ctx, moe, &geom, &residual, &dense, &mut scratch, &mut out)
+            .expect("routed block");
+        RoutedCapture {
+            index: ctx
+                .stream
+                .clone_dtoh(&scratch.index.slice(..slots))
+                .expect("index"),
+            weight: ctx
+                .stream
+                .clone_dtoh(&scratch.weight.slice(..slots))
+                .expect("weight"),
+            gate: ctx
+                .stream
+                .clone_dtoh(&scratch.routed_gate.data.slice(..slots * width))
+                .expect("routed gate"),
+            block: ctx
+                .stream
+                .clone_dtoh(&out.data.slice(..rows * hidden))
+                .expect("out"),
+        }
+    };
 
-    let mut scratch = MoeScratch::new(&ctx, &geom, rows).expect("scratch");
-    let mut out = HiddenStates::zeros(&ctx, hidden, rows).expect("out");
-    moe_into(&ctx, moe, &geom, &residual, &dense, &mut scratch, &mut out).expect("routed block");
+    let residual_host = sample(0, rows);
+    let dense_host = sample(1, rows);
+    let baseline = run(&residual_host, &dense_host, rows);
+    let roomy = run(&residual_host, &dense_host, ROOMY_SCRATCH_ROWS);
+    let companion = run(
+        &sample(0, COMPANION_ROWS),
+        &sample(1, COMPANION_ROWS),
+        ROOMY_SCRATCH_ROWS,
+    );
+    assert_same_target("scratch capacity", &baseline, &roomy);
+    assert_same_target("companion route", &baseline, &companion);
 
-    let index = ctx
-        .stream
-        .clone_dtoh(&scratch.index.slice(0..slots))
-        .expect("index");
-    let weight = ctx
-        .stream
-        .clone_dtoh(&scratch.weight.slice(0..slots))
-        .expect("weight");
-    let first_gemm = ctx
-        .stream
-        .clone_dtoh(&scratch.routed_gate.data)
-        .expect("routed gate");
-    let produced = ctx.stream.clone_dtoh(&out.data).expect("out");
+    let index = baseline.index;
+    let weight = baseline.weight;
+    let first_gemm = baseline.gate;
+    let produced = baseline.block;
 
     let host_vec = |v: &pegainfer_core::tensor::DeviceVec| -> Vec<f32> {
         ctx.stream
