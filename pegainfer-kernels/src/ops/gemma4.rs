@@ -326,3 +326,83 @@ pub fn marlin_moe_align_block_size(
     result.result()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+
+    use super::*;
+
+    const EXPERTS: usize = 128;
+    const TOP_K: usize = 8;
+    const ROWS: usize = 2;
+    const SELECTED: [usize; TOP_K] = [3, 10, 34, 41, 65, 72, 96, 127];
+    const SELECTED_LOGIT: f32 = 1.0;
+    const BASE_SCALE: f32 = 0.5;
+    const SCALE_STEP: f32 = 0.125;
+    const TOP_K_F32: f32 = 8.0;
+    const WEIGHT_TOLERANCE: f32 = 2.0e-6;
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn router_topk_matches_the_exact_128_expert_contract() {
+        let ctx = DeviceContext::new().expect("CUDA context");
+        let mut logits_host = vec![bf16::ZERO; ROWS * EXPERTS];
+        for expert in SELECTED {
+            logits_host[expert] = bf16::from_f32(SELECTED_LOGIT);
+        }
+        let scale_host = (0..EXPERTS)
+            .map(|expert| {
+                let bucket = u8::try_from(expert % TOP_K).expect("scale bucket");
+                bf16::from_f32(BASE_SCALE + f32::from(bucket) * SCALE_STEP)
+            })
+            .collect::<Vec<_>>();
+        let logits = HiddenStates::from_host(&ctx, &logits_host, EXPERTS, ROWS).expect("logits");
+        let scale = DeviceVec::from_host(&ctx, &scale_host).expect("scale");
+        let mut index = ctx.stream.alloc_zeros::<i32>(ROWS * TOP_K).expect("index");
+        let mut weight = ctx.stream.alloc_zeros::<f32>(ROWS * TOP_K).expect("weight");
+
+        gemma4_moe_router_topk_into(&ctx, &logits, &scale, TOP_K, &mut index, &mut weight)
+            .expect("router");
+        let index_host = ctx.stream.clone_dtoh(&index).expect("index D2H");
+        let weight_host = ctx.stream.clone_dtoh(&weight).expect("weight D2H");
+        let expected_index = SELECTED
+            .into_iter()
+            .chain(0..TOP_K)
+            .map(|expert| i32::try_from(expert).expect("expert index"))
+            .collect::<Vec<_>>();
+        assert_eq!(index_host, expected_index);
+        for (slot, (&expert, &actual)) in index_host.iter().zip(&weight_host).enumerate() {
+            let expert = usize::try_from(expert).expect("nonnegative expert");
+            let expected = scale_host[expert].to_f32() / TOP_K_F32;
+            assert!(
+                (actual - expected).abs() <= WEIGHT_TOLERANCE,
+                "slot {slot}: {actual} != {expected}"
+            );
+        }
+
+        let invalid_experts = EXPERTS - 1;
+        let invalid_logits =
+            HiddenStates::from_host(&ctx, &vec![bf16::ZERO; invalid_experts], invalid_experts, 1)
+                .expect("invalid logits");
+        let invalid_scale =
+            DeviceVec::from_host(&ctx, &vec![bf16::from_f32(SELECTED_LOGIT); invalid_experts])
+                .expect("invalid scale");
+        let mut invalid_index = ctx.stream.alloc_zeros::<i32>(TOP_K).expect("invalid index");
+        let mut invalid_weight = ctx
+            .stream
+            .alloc_zeros::<f32>(TOP_K)
+            .expect("invalid weight");
+        assert!(
+            gemma4_moe_router_topk_into(
+                &ctx,
+                &invalid_logits,
+                &invalid_scale,
+                TOP_K,
+                &mut invalid_index,
+                &mut invalid_weight,
+            )
+            .is_err()
+        );
+    }
+}
