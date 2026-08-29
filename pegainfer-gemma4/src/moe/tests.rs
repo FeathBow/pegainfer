@@ -42,6 +42,8 @@ fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
 }
 
 struct RoutedCapture {
+    /// The alignment pass's padded row total, which names the block it used.
+    padded: usize,
     /// Router logits as the router GEMM stored them, `[rows, experts]`.
     logits: Vec<half::bf16>,
     index: Vec<i32>,
@@ -51,6 +53,21 @@ struct RoutedCapture {
     /// the top-k sum and the post norm fold it into the block.
     down: Vec<half::bf16>,
     block: Vec<half::bf16>,
+}
+
+/// The padded total the alignment pass must have produced for these picks at
+/// this block: every expert's routes rounded up to the block. It proves which
+/// block ran and that the padding matched the routes.
+fn assert_padding(label: &str, capture: &RoutedCapture, experts: usize, block: usize) {
+    let mut counts = vec![0usize; experts];
+    for expert in &capture.index {
+        counts[usize::try_from(*expert).expect("expert id")] += 1;
+    }
+    let expected: usize = counts.iter().map(|c| c.div_ceil(block) * block).sum();
+    assert_eq!(
+        capture.padded, expected,
+        "{label}: padded total is not the {block}-row block's padding of these picks"
+    );
 }
 
 fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapture) {
@@ -131,6 +148,7 @@ impl HostBlock<'_> {
 fn assert_matches_reference(
     label: &str,
     capture: &RoutedCapture,
+    rows: std::ops::Range<usize>,
     residual_host: &[half::bf16],
     dense_host: &[half::bf16],
     host: &HostBlock<'_>,
@@ -142,10 +160,9 @@ fn assert_matches_reference(
 
     let (hidden, width, top_k, experts, eps) =
         (host.hidden, host.width, host.top_k, host.experts, host.eps);
-    let rows = capture.index.len() / top_k;
     let residual_f32: Vec<f32> = residual_host.iter().map(|x| x.to_f32()).collect();
     let dense_f32: Vec<f32> = dense_host.iter().map(|x| x.to_f32()).collect();
-    for row in 0..rows {
+    for row in rows {
         let residual_row = &residual_f32[row * hidden..(row + 1) * hidden];
 
         // The host projection rounds where the device does: the norm's
@@ -296,7 +313,6 @@ fn the_routed_block_matches_the_reference_formulas() {
     const NARROW_TARGET_ROWS: usize = 4;
     const COMPANION_ROWS: usize = NARROW_TARGET_ROWS + 1;
     const ROOMY_SCRATCH_ROWS: usize = 8;
-    const COARSE_TARGET_ROWS: usize = 40;
 
     let model = std::env::var("PEGAINFER_NVFP4_MODEL")
         .expect("PEGAINFER_NVFP4_MODEL must name the checkpoint directory");
@@ -309,6 +325,10 @@ fn the_routed_block_matches_the_reference_formulas() {
     let hidden = geom.hidden_size;
     let width = routed.intermediate_size;
     let top_k = routed.top_k;
+    // The smallest dispatch the production policy sends to the 64-row block.
+    let coarse_rows = super::PREFILL_MIN_SLOTS.div_ceil(top_k);
+    assert_eq!(super::marlin_block(coarse_rows * top_k), 64);
+    assert_eq!(super::marlin_block(coarse_rows * top_k - 1), 16);
 
     let (weights, _) =
         crate::weights::Gemma4Weights::from_safetensors(&model, 0, config).expect("weights");
@@ -332,6 +352,12 @@ fn the_routed_block_matches_the_reference_formulas() {
         let mut out = HiddenStates::zeros(&ctx, hidden, active_rows).expect("out");
         moe_into(&ctx, moe, &geom, &residual, &dense, scratch, &mut out).expect("routed block");
         RoutedCapture {
+            padded: usize::try_from(
+                ctx.stream
+                    .clone_dtoh(&scratch.padded_total)
+                    .expect("padded total")[0],
+            )
+            .expect("padded total"),
             logits: ctx
                 .stream
                 .clone_dtoh(
@@ -372,25 +398,30 @@ fn the_routed_block_matches_the_reference_formulas() {
     let dense_host = sample(1, NARROW_TARGET_ROWS);
     let baseline = run(&residual_host, &dense_host, NARROW_TARGET_ROWS);
     let roomy = run(&residual_host, &dense_host, ROOMY_SCRATCH_ROWS);
+    let companion_residual_host = sample(0, COMPANION_ROWS);
+    let companion_dense_host = sample(1, COMPANION_ROWS);
     let companion = run(
-        &sample(0, COMPANION_ROWS),
-        &sample(1, COMPANION_ROWS),
+        &companion_residual_host,
+        &companion_dense_host,
         ROOMY_SCRATCH_ROWS,
     );
     assert_same_target("scratch capacity", &baseline, &roomy);
     assert_same_target("companion route", &baseline, &companion);
+    assert_padding("narrow target", &baseline, routed.num_experts, 16);
+    assert_padding("companion route", &companion, routed.num_experts, 16);
 
-    let coarse_residual_host = sample(0, COARSE_TARGET_ROWS);
-    let coarse_dense_host = sample(1, COARSE_TARGET_ROWS);
-    let mut coarse_scratch =
-        MoeScratch::new(&ctx, &geom, COARSE_TARGET_ROWS).expect("coarse scratch");
+    let coarse_residual_host = sample(0, coarse_rows);
+    let coarse_dense_host = sample(1, coarse_rows);
+    let mut coarse_scratch = MoeScratch::new(&ctx, &geom, coarse_rows).expect("coarse scratch");
     let coarse = capture(
         &coarse_residual_host,
         &coarse_dense_host,
         &mut coarse_scratch,
     );
+    assert_padding("coarse dispatch", &coarse, routed.num_experts, 64);
     let reused = capture(&residual_host, &dense_host, &mut coarse_scratch);
     assert_same_target("block 16 after block 64", &baseline, &reused);
+    assert_padding("block 16 after block 64", &reused, routed.num_experts, 16);
 
     let host_vec = |v: &pegainfer_core::tensor::DeviceVec| -> Vec<f32> {
         ctx.stream
@@ -433,18 +464,39 @@ fn the_routed_block_matches_the_reference_formulas() {
         shards: &shards,
         widened: std::cell::RefCell::new(std::collections::HashMap::new()),
     };
+    // The narrow target's four rows and the companion's fifth (the narrow
+    // path's tail row) meet the oracle in full. The coarse dispatch is a
+    // thousand rows, so it meets the oracle on representatives: its first
+    // four rows (the narrow target's inputs, now on the 64-row block), a
+    // middle row and its last row.
     assert_matches_reference(
         "4-row target",
         &baseline,
+        0..NARROW_TARGET_ROWS,
         &residual_host,
         &dense_host,
         &host,
     );
     assert_matches_reference(
-        "40-row target",
-        &coarse,
-        &coarse_residual_host,
-        &coarse_dense_host,
+        "companion row",
+        &companion,
+        NARROW_TARGET_ROWS..COMPANION_ROWS,
+        &companion_residual_host,
+        &companion_dense_host,
         &host,
     );
+    for rows in [
+        0..NARROW_TARGET_ROWS,
+        coarse_rows / 2..coarse_rows / 2 + 1,
+        coarse_rows - 1..coarse_rows,
+    ] {
+        assert_matches_reference(
+            "coarse dispatch",
+            &coarse,
+            rows,
+            &coarse_residual_host,
+            &coarse_dense_host,
+            &host,
+        );
+    }
 }
