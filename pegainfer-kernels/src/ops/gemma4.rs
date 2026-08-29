@@ -35,21 +35,22 @@ pub fn gemma4_moe_router_topk_into(
         "gemma4_moe_router_topk_into: {rows} rows and top {top_k} of {experts} experts is not \
          a routing problem"
     );
+    // `DeviceVec::len` and `HiddenStates` dims are labels; the kernel reads
+    // the allocations, so the allocations are what is checked.
     ensure!(
-        per_expert_scale.len == experts,
-        "gemma4_moe_router_topk_into: the per-expert scale holds {}, not {experts}",
-        per_expert_scale.len
+        per_expert_scale.len == experts && per_expert_scale.data.len() >= experts,
+        "gemma4_moe_router_topk_into: the per-expert scale holds {} over {} allocated, not \
+         {experts}",
+        per_expert_scale.len,
+        per_expert_scale.data.len()
     );
     let slots = rows
         .checked_mul(top_k)
         .ok_or_else(|| anyhow!("gemma4_moe_router_topk_into: {rows} x {top_k} overflows usize"))?;
+    logits.checked_extent("gemma4_moe_router_topk_into logits")?;
     ensure!(
-        logits.data.len() >= rows * experts
-            && index_out.len() >= slots
-            && weight_out.len() >= slots,
-        "gemma4_moe_router_topk_into buffers too small for {rows} x {top_k}: logits {}, index {}, \
-         weight {}",
-        logits.data.len(),
+        index_out.len() >= slots && weight_out.len() >= slots,
+        "gemma4_moe_router_topk_into outputs too small for {rows} x {top_k}: index {}, weight {}",
         index_out.len(),
         weight_out.len()
     );
