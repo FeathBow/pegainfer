@@ -40,15 +40,60 @@ struct RoutedCapture {
 
 fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapture) {
     assert!(
-        expected.index == actual.index,
+        actual.index.starts_with(&expected.index),
         "{label}: router picks moved"
     );
     assert!(
-        expected.weight == actual.weight,
+        actual.weight.starts_with(&expected.weight),
         "{label}: router weights moved"
     );
-    assert!(expected.gate == actual.gate, "{label}: gate bytes moved");
-    assert!(expected.block == actual.block, "{label}: block bytes moved");
+    assert!(
+        actual.gate.starts_with(&expected.gate),
+        "{label}: gate bytes moved"
+    );
+    assert!(
+        actual.block.starts_with(&expected.block),
+        "{label}: block bytes moved"
+    );
+}
+
+struct RoutedReference {
+    index: Vec<i32>,
+    weight: Vec<f32>,
+    gate: Vec<f32>,
+    block: Vec<f32>,
+}
+
+fn assert_matches_reference(label: &str, capture: &RoutedCapture, reference: &RoutedReference) {
+    const WEIGHT_TOLERANCE: f32 = 5e-3;
+    const RELATIVE_TOLERANCE: f32 = 2e-2;
+
+    assert_eq!(
+        capture.index,
+        reference.index[..capture.index.len()],
+        "{label}: router picks differ from the reference"
+    );
+    let weight_gap = capture
+        .weight
+        .iter()
+        .zip(&reference.weight)
+        .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+    assert!(
+        weight_gap <= WEIGHT_TOLERANCE,
+        "{label}: router weights differ by {weight_gap:.3e}"
+    );
+    let gate = capture.gate.iter().map(|x| x.to_f32()).collect::<Vec<_>>();
+    let gate_gap = relative_gap(&gate, &reference.gate[..gate.len()]);
+    assert!(
+        gate_gap <= RELATIVE_TOLERANCE,
+        "{label}: the expert GEMM differs from the widened reference by {gate_gap:.3e}"
+    );
+    let block = capture.block.iter().map(|x| x.to_f32()).collect::<Vec<_>>();
+    let block_gap = relative_gap(&block, &reference.block[..block.len()]);
+    assert!(
+        block_gap <= RELATIVE_TOLERANCE,
+        "{label}: the combined block differs from the reference by {block_gap:.3e}"
+    );
 }
 
 /// The routed block against the formulas the reference implements, with
@@ -63,9 +108,10 @@ fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapt
 fn the_routed_block_matches_the_reference_formulas() {
     use half::bf16;
 
-    const TARGET_ROWS: usize = 4;
-    const COMPANION_ROWS: usize = TARGET_ROWS + 1;
+    const NARROW_TARGET_ROWS: usize = 4;
+    const COMPANION_ROWS: usize = NARROW_TARGET_ROWS + 1;
     const ROOMY_SCRATCH_ROWS: usize = 8;
+    const COARSE_TARGET_ROWS: usize = 40;
 
     let model = std::env::var("PEGAINFER_NVFP4_MODEL")
         .expect("PEGAINFER_NVFP4_MODEL must name the checkpoint directory");
@@ -78,8 +124,6 @@ fn the_routed_block_matches_the_reference_formulas() {
     let hidden = geom.hidden_size;
     let width = routed.intermediate_size;
     let top_k = routed.top_k;
-    let rows = TARGET_ROWS;
-    let slots = rows * top_k;
 
     let (weights, _) =
         crate::weights::Gemma4Weights::from_safetensors(&model, 0, config).expect("weights");
@@ -94,38 +138,41 @@ fn the_routed_block_matches_the_reference_formulas() {
             .map(|i| bf16::from_f32((((i * 37 + seed * 11) % 199) as f32 - 99.0) / 200.0))
             .collect()
     };
-    let run = |residual_host: &[bf16], dense_host: &[bf16], scratch_rows: usize| {
+    let capture = |residual_host: &[bf16], dense_host: &[bf16], scratch: &mut MoeScratch| {
         let active_rows = residual_host.len() / hidden;
+        let active_slots = active_rows * top_k;
         let residual =
             HiddenStates::from_host(&ctx, residual_host, hidden, active_rows).expect("residual");
         let dense = HiddenStates::from_host(&ctx, dense_host, hidden, active_rows).expect("dense");
-        let mut scratch = MoeScratch::new(&ctx, &geom, scratch_rows).expect("scratch");
         let mut out = HiddenStates::zeros(&ctx, hidden, active_rows).expect("out");
-        moe_into(&ctx, moe, &geom, &residual, &dense, &mut scratch, &mut out)
-            .expect("routed block");
+        moe_into(&ctx, moe, &geom, &residual, &dense, scratch, &mut out).expect("routed block");
         RoutedCapture {
             index: ctx
                 .stream
-                .clone_dtoh(&scratch.index.slice(..slots))
+                .clone_dtoh(&scratch.index.slice(..active_slots))
                 .expect("index"),
             weight: ctx
                 .stream
-                .clone_dtoh(&scratch.weight.slice(..slots))
+                .clone_dtoh(&scratch.weight.slice(..active_slots))
                 .expect("weight"),
             gate: ctx
                 .stream
-                .clone_dtoh(&scratch.routed_gate.data.slice(..slots * width))
+                .clone_dtoh(&scratch.routed_gate.data.slice(..active_slots * width))
                 .expect("routed gate"),
             block: ctx
                 .stream
-                .clone_dtoh(&out.data.slice(..rows * hidden))
+                .clone_dtoh(&out.data.slice(..active_rows * hidden))
                 .expect("out"),
         }
     };
+    let run = |residual_host: &[bf16], dense_host: &[bf16], scratch_rows: usize| {
+        let mut scratch = MoeScratch::new(&ctx, &geom, scratch_rows).expect("scratch");
+        capture(residual_host, dense_host, &mut scratch)
+    };
 
-    let residual_host = sample(0, rows);
-    let dense_host = sample(1, rows);
-    let baseline = run(&residual_host, &dense_host, rows);
+    let residual_host = sample(0, NARROW_TARGET_ROWS);
+    let dense_host = sample(1, NARROW_TARGET_ROWS);
+    let baseline = run(&residual_host, &dense_host, NARROW_TARGET_ROWS);
     let roomy = run(&residual_host, &dense_host, ROOMY_SCRATCH_ROWS);
     let companion = run(
         &sample(0, COMPANION_ROWS),
@@ -135,10 +182,17 @@ fn the_routed_block_matches_the_reference_formulas() {
     assert_same_target("scratch capacity", &baseline, &roomy);
     assert_same_target("companion route", &baseline, &companion);
 
-    let index = baseline.index;
-    let weight = baseline.weight;
-    let first_gemm = baseline.gate;
-    let produced = baseline.block;
+    let coarse_residual_host = sample(0, COARSE_TARGET_ROWS);
+    let coarse_dense_host = sample(1, COARSE_TARGET_ROWS);
+    let mut coarse_scratch =
+        MoeScratch::new(&ctx, &geom, COARSE_TARGET_ROWS).expect("coarse scratch");
+    let coarse = capture(
+        &coarse_residual_host,
+        &coarse_dense_host,
+        &mut coarse_scratch,
+    );
+    let reused = capture(&residual_host, &dense_host, &mut coarse_scratch);
+    assert_same_target("block 16 after block 64", &baseline, &reused);
 
     let host_vec = |v: &pegainfer_core::tensor::DeviceVec| -> Vec<f32> {
         ctx.stream
@@ -179,14 +233,15 @@ fn the_routed_block_matches_the_reference_formulas() {
             .expect("widen")
     };
 
-    let residual_f32: Vec<f32> = residual_host.iter().map(|x| x.to_f32()).collect();
-    let dense_f32: Vec<f32> = dense_host.iter().map(|x| x.to_f32()).collect();
+    let residual_f32: Vec<f32> = coarse_residual_host.iter().map(|x| x.to_f32()).collect();
+    let dense_f32: Vec<f32> = coarse_dense_host.iter().map(|x| x.to_f32()).collect();
 
-    let mut reference_index = vec![0i32; slots];
-    let mut reference_weight = vec![0.0f32; slots];
-    let mut reference_gate = vec![0.0f32; slots * width];
-    let mut reference_block = vec![0.0f32; rows * hidden];
-    for row in 0..rows {
+    let reference_slots = COARSE_TARGET_ROWS * top_k;
+    let mut reference_index = vec![0i32; reference_slots];
+    let mut reference_weight = vec![0.0f32; reference_slots];
+    let mut reference_gate = vec![0.0f32; reference_slots * width];
+    let mut reference_block = vec![0.0f32; COARSE_TARGET_ROWS * hidden];
+    for row in 0..COARSE_TARGET_ROWS {
         let residual_row = &residual_f32[row * hidden..(row + 1) * hidden];
         let router_in = rms(residual_row, Some(&router_scale), eps);
         let scale = (hidden as f32).sqrt().recip();
@@ -250,41 +305,15 @@ fn the_routed_block_matches_the_reference_formulas() {
         }
     }
 
-    assert_eq!(
-        index, reference_index,
-        "router picks differ from the reference"
-    );
     // The three numeric bounds sit an order of magnitude above what bf16
     // accumulation costs at these widths, so a breach is a different
     // computation rather than a different rounding.
-    let weight_gap = weight
-        .iter()
-        .zip(&reference_weight)
-        .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
-    assert!(
-        weight_gap <= 5e-3,
-        "router weights differ by {weight_gap:.3e}"
-    );
-    let gate_gap = relative_gap(
-        &first_gemm[..slots * width]
-            .iter()
-            .map(|x: &bf16| x.to_f32())
-            .collect::<Vec<_>>(),
-        &reference_gate,
-    );
-    assert!(
-        gate_gap <= 2e-2,
-        "the expert GEMM differs from the widened reference by {gate_gap:.3e}"
-    );
-    let block_gap = relative_gap(
-        &produced[..rows * hidden]
-            .iter()
-            .map(|x: &bf16| x.to_f32())
-            .collect::<Vec<_>>(),
-        &reference_block,
-    );
-    assert!(
-        block_gap <= 2e-2,
-        "the combined block differs from the reference by {block_gap:.3e}"
-    );
+    let reference = RoutedReference {
+        index: reference_index,
+        weight: reference_weight,
+        gate: reference_gate,
+        block: reference_block,
+    };
+    assert_matches_reference("4-row target", &baseline, &reference);
+    assert_matches_reference("40-row target", &coarse, &reference);
 }
