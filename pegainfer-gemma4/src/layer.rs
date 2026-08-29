@@ -135,7 +135,6 @@ pub(crate) struct EpilogueScratch {
     up: HiddenStates,
     act: HiddenStates,
     down: HiddenStates,
-    down_normed: HiddenStates,
     moe: Option<MoeScratch>,
 }
 
@@ -153,7 +152,6 @@ impl EpilogueScratch {
             up: wide(max_rows)?,
             act: wide(max_rows)?,
             down: hidden(max_rows)?,
-            down_normed: hidden(max_rows)?,
             moe: match geom.moe {
                 Some(_) => Some(MoeScratch::new(ctx, geom, max_rows)?),
                 None => None,
@@ -179,7 +177,6 @@ impl EpilogueScratch {
             &mut self.up,
             &mut self.act,
             &mut self.down,
-            &mut self.down_normed,
         ] {
             buf.seq_len = seq_len;
         }
@@ -284,15 +281,14 @@ pub(crate) fn attention_epilogue_into(
         (None, _) => &scratch.down,
         (Some(_), None) => anyhow::bail!("Gemma 4: a routed layer met a dense epilogue scratch"),
     };
-    ops::rms_norm_batch_into(
+    ops::rms_norm_add_scale_batch_into(
         ctx,
         feed_forward,
         &layer.post_feedforward_layernorm,
+        &scratch.h2,
+        layer.layer_scalar,
         geom.rms_norm_eps,
-        &mut scratch.down_normed,
+        out,
     );
-
-    ops::add_batch_into(ctx, &scratch.h2, &scratch.down_normed, out)?;
-    ops::scale_bf16_in_place(ctx, out, layer.layer_scalar)?;
     Ok(())
 }

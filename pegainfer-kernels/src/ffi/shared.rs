@@ -40,6 +40,20 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    /// `out = (residual + rms_norm(x, weight)) * scale`, the three standalone
+    /// ops' roundings kept in place.
+    pub fn rms_norm_add_scale_batched_cuda(
+        x: *const Half,
+        weight: *const Half,
+        residual: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale: f32,
+        stream: CUstream,
+    );
+
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,

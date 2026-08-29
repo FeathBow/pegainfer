@@ -206,6 +206,42 @@ pub fn rms_norm_batch_dual_into(
     }
 }
 
+/// The layer tail in one launch: `out = (residual + rms_norm(x, weight)) *
+/// scale`, bit-identical to the separate norm, add and scale calls it
+/// replaces.
+pub fn rms_norm_add_scale_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    residual: &HiddenStates,
+    scale: f32,
+    eps: f32,
+    out: &mut HiddenStates,
+) {
+    assert_eq!(weight.len, x.hidden_dim);
+    assert_eq!(residual.hidden_dim, x.hidden_dim);
+    assert_eq!(residual.seq_len, x.seq_len);
+    assert_eq!(out.hidden_dim, x.hidden_dim);
+    assert_eq!(out.seq_len, x.seq_len);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (r_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::rms_norm_add_scale_batched_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            r_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            x.hidden_dim as i32,
+            x.seq_len as i32,
+            eps,
+            scale,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+}
+
 /// Batched fused add + RMSNorm for HiddenStates.
 /// hidden[i] += residual[i]; out[i] = rms_norm(hidden[i], weight) for each batch element.
 pub fn fused_add_rms_norm_batch_into(
@@ -495,5 +531,26 @@ mod parity {
         rms_norm_batch_dual_into(&ctx, &x, &wa, &wb, eps, scale, &mut fused_a, &mut fused_b);
         assert_bitwise(&ctx, &split_a, &fused_a, "dual norm router branch");
         assert_bitwise(&ctx, &split_b, &fused_b, "dual norm expert branch");
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_layer_tail_matches_its_parts() {
+        let ctx = DeviceContext::new_with_device(0).expect("device");
+        let (d, rows, eps) = (2816usize, 16usize, 1e-6f32);
+        let x = seeded(&ctx, d, rows, 0);
+        let residual = seeded(&ctx, d, rows, 1);
+        let weight = seeded_weight(&ctx, d, 0);
+        let scale = 0.7383f32;
+
+        let mut normed = HiddenStates::zeros(&ctx, d, rows).expect("normed");
+        rms_norm_batch_into(&ctx, &x, &weight, eps, &mut normed);
+        let mut split = HiddenStates::zeros(&ctx, d, rows).expect("split");
+        crate::ops::add_batch_into(&ctx, &residual, &normed, &mut split).expect("add");
+        crate::ops::scale_bf16_in_place(&ctx, &mut split, scale).expect("scale");
+
+        let mut fused = HiddenStates::zeros(&ctx, d, rows).expect("fused");
+        rms_norm_add_scale_batch_into(&ctx, &x, &weight, &residual, scale, eps, &mut fused);
+        assert_bitwise(&ctx, &split, &fused, "fused layer tail");
     }
 }

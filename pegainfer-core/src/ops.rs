@@ -78,6 +78,7 @@ pub use pegainfer_kernels::ops::qk_norm_rope_prefill_hd256_plain_into;
 pub use pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into;
 pub use pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into;
 pub use pegainfer_kernels::ops::rms_norm;
+pub use pegainfer_kernels::ops::rms_norm_add_scale_batch_into;
 pub use pegainfer_kernels::ops::rms_norm_batch_dual_into;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::rms_norm_batch_into;
