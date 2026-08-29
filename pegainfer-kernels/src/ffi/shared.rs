@@ -24,6 +24,22 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    /// Two norms of one input, reduced once; each output is bitwise what a
+    /// separate `rms_norm_batched_cuda` call with that weight produces, with
+    /// `scale_a` preserving a trailing bf16 scalar multiply on the first.
+    pub fn rms_norm_batched_dual_cuda(
+        x: *const Half,
+        weight_a: *const Half,
+        weight_b: *const Half,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale_a: f32,
+        stream: CUstream,
+    );
+
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,

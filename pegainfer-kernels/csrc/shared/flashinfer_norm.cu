@@ -164,6 +164,82 @@ cudaError_t FusedAddRMSNormRound(T* hidden, const T* residual, T* weight, T* out
   return cudaSuccess;
 }
 
+// Two RMSNorms of the same input in one pass. The accumulation and each
+// output's arithmetic mirror FlashInfer's RMSNormKernel operation for
+// operation. The first branch keeps the standalone scalar multiply's bf16
+// rounding point.
+template <uint32_t VEC_SIZE, typename T>
+__global__ void DualRMSNormKernel(const T* __restrict__ input, T* __restrict__ weight_a,
+                                  T* __restrict__ weight_b, T* __restrict__ out_a,
+                                  T* __restrict__ out_b, const uint32_t d, float eps,
+                                  float scale_a) {
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  constexpr uint32_t warp_size = 32;
+  const uint32_t num_warps = blockDim.y;
+  const uint32_t thread_id = tx + ty * warp_size;
+  const uint32_t num_threads = num_warps * warp_size;
+  const uint32_t rounds = flashinfer::ceil_div(d, VEC_SIZE * num_threads);
+  extern __shared__ float smem[];
+
+  float sum_sq = 0.f;
+  for (uint32_t i = 0; i < rounds; i++) {
+    flashinfer::vec_t<T, VEC_SIZE> input_vec;
+    input_vec.fill(0.f);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      sum_sq += float(input_vec[j]) * float(input_vec[j]);
+    }
+  }
+#pragma unroll
+  for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+    sum_sq += flashinfer::math::shfl_xor_sync(sum_sq, offset);
+  }
+  smem[ty] = sum_sq;
+  __syncthreads();
+  if (ty == 0) {
+    sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
+#pragma unroll
+    for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+      sum_sq += flashinfer::math::shfl_xor_sync(sum_sq, offset);
+    }
+    smem[0] = sum_sq;
+  }
+  __syncthreads();
+
+  float rms_rcp = flashinfer::math::rsqrt(smem[0] / float(d) + eps);
+
+  for (uint32_t i = 0; i < rounds; i++) {
+    flashinfer::vec_t<T, VEC_SIZE> input_vec;
+    flashinfer::vec_t<T, VEC_SIZE> weight_a_vec;
+    flashinfer::vec_t<T, VEC_SIZE> weight_b_vec;
+    flashinfer::vec_t<T, VEC_SIZE> out_a_vec;
+    flashinfer::vec_t<T, VEC_SIZE> out_b_vec;
+    input_vec.fill(0.f);
+    weight_a_vec.fill(0.f);
+    weight_b_vec.fill(0.f);
+    const uint32_t elem = i * num_threads * VEC_SIZE + thread_id * VEC_SIZE;
+    if (elem < d) {
+      input_vec.load(input + bx * d + elem);
+      weight_a_vec.load(weight_a + elem);
+      weight_b_vec.load(weight_b + elem);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      T na = float(input_vec[j]) * rms_rcp * (0.f + float(weight_a_vec[j]));
+      out_a_vec[j] = float(na) * scale_a;
+      out_b_vec[j] = float(input_vec[j]) * rms_rcp * (0.f + float(weight_b_vec[j]));
+    }
+    if (elem < d) {
+      out_a_vec.store(out_a + bx * d + elem);
+      out_b_vec.store(out_b + bx * d + elem);
+    }
+  }
+}
+
 }  // namespace norm
 }  // namespace pegainfer
 
@@ -207,6 +283,25 @@ void rms_norm_batched_cuda(const DType *x, const DType *weight, DType *out,
     flashinfer::norm::RMSNorm<DType>(
         const_cast<DType*>(x), const_cast<DType*>(weight), out,
         seq_len, hidden_dim, hidden_dim, hidden_dim, eps, false, stream);
+}
+
+// Two norms of one input, reduced once. The router branch's scale preserves
+// the trailing standalone bf16 multiply.
+void rms_norm_batched_dual_cuda(const DType *x, const DType *weight_a, const DType *weight_b,
+                                DType *out_a, DType *out_b, int hidden_dim, int seq_len,
+                                float eps, float scale_a, cudaStream_t stream) {
+    const uint32_t d = static_cast<uint32_t>(hidden_dim);
+    const uint32_t vec_size = std::gcd<uint32_t>(16 / sizeof(DType), d);
+    const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
+    const uint32_t num_warps = flashinfer::ceil_div(block_size, 32);
+    dim3 nblks(static_cast<uint32_t>(seq_len));
+    dim3 nthrs(32, num_warps);
+    const uint32_t smem_size = num_warps * sizeof(float);
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+        pegainfer::norm::DualRMSNormKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
+            x, const_cast<DType*>(weight_a), const_cast<DType*>(weight_b), out_a, out_b, d, eps,
+            scale_a);
+    });
 }
 
 // ============================================================================

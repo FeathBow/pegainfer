@@ -215,20 +215,18 @@ pub(crate) fn moe_into(
         geom.hidden_size
     );
 
-    // The router's own norm carries no scale of its own, so the parameter
-    // multiply and the `hidden ** -0.5` that follow it are separate steps.
-    ops::rms_norm_batch_into(
+    // Both residual norms share one reduction. The router branch still
+    // rounds before its `hidden ** -0.5` scalar multiply.
+    ops::rms_norm_batch_dual_into(
         ctx,
         residual,
         &moe.router_scale,
+        &moe.pre_feedforward_layernorm_2,
         geom.rms_norm_eps,
-        &mut scratch.router_in,
-    );
-    ops::scale_bf16_in_place(
-        ctx,
-        &mut scratch.router_in,
         (geom.hidden_size as f32).powf(-0.5),
-    )?;
+        &mut scratch.router_in,
+        &mut scratch.moe_in,
+    );
     ops::gemm_rows_into_checked(
         ctx,
         &moe.router_proj,
@@ -263,14 +261,6 @@ pub(crate) fn moe_into(
             expert_cursor: &mut scratch.expert_cursor,
         },
     )?;
-
-    ops::rms_norm_batch_into(
-        ctx,
-        residual,
-        &moe.pre_feedforward_layernorm_2,
-        geom.rms_norm_eps,
-        &mut scratch.moe_in,
-    );
 
     let gather = MarlinDispatch {
         sorted_token_ids: &scratch.sorted_token_ids,

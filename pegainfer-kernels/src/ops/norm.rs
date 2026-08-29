@@ -165,6 +165,47 @@ pub fn fused_add_rms_norm_into(
     Ok(())
 }
 
+/// Two RMSNorms of the same input in one read: `out_a = rms(x) * weight_a *
+/// scale_a` and `out_b = rms(x) * weight_b`, each bitwise what its standalone
+/// operations produce.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_batch_dual_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight_a: &DeviceVec,
+    weight_b: &DeviceVec,
+    eps: f32,
+    scale_a: f32,
+    out_a: &mut HiddenStates,
+    out_b: &mut HiddenStates,
+) {
+    assert_eq!(weight_a.len, x.hidden_dim);
+    assert_eq!(weight_b.len, x.hidden_dim);
+    assert_eq!(out_a.hidden_dim, x.hidden_dim);
+    assert_eq!(out_b.hidden_dim, x.hidden_dim);
+    assert_eq!(out_a.seq_len, x.seq_len);
+    assert_eq!(out_b.seq_len, x.seq_len);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (wa_ptr, _ga) = weight_a.data.device_ptr(&ctx.stream);
+    let (wb_ptr, _gb) = weight_b.data.device_ptr(&ctx.stream);
+    let (oa_ptr, _goa) = out_a.data.device_ptr_mut(&ctx.stream);
+    let (ob_ptr, _gob) = out_b.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::rms_norm_batched_dual_cuda(
+            x_ptr as *const ffi::Half,
+            wa_ptr as *const ffi::Half,
+            wb_ptr as *const ffi::Half,
+            oa_ptr as *mut ffi::Half,
+            ob_ptr as *mut ffi::Half,
+            x.hidden_dim as i32,
+            x.seq_len as i32,
+            eps,
+            scale_a,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+}
+
 /// Batched fused add + RMSNorm for HiddenStates.
 /// hidden[i] += residual[i]; out[i] = rms_norm(hidden[i], weight) for each batch element.
 pub fn fused_add_rms_norm_batch_into(
@@ -394,5 +435,65 @@ pub fn rms_norm_gated_batch_into(
             eps,
             crate::tensor::active_cu_stream(ctx),
         );
+    }
+}
+
+#[cfg(test)]
+mod parity {
+    use super::*;
+
+    fn assert_bitwise(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates, what: &str) {
+        let a = ctx.stream.clone_dtoh(&a.data).expect("a D2H");
+        let b = ctx.stream.clone_dtoh(&b.data).expect("b D2H");
+        let diffs = a
+            .iter()
+            .zip(&b)
+            .enumerate()
+            .filter(|(_, (u, v))| u.to_bits() != v.to_bits())
+            .take(4)
+            .map(|(i, (u, v))| format!("[{i}] {u:?} vs {v:?}"))
+            .collect::<Vec<_>>();
+        assert!(diffs.is_empty(), "{what} diverges: {diffs:?}");
+    }
+
+    fn seeded(ctx: &DeviceContext, d: usize, rows: usize, seed: usize) -> HiddenStates {
+        let host: Vec<bf16> = (0..d * rows)
+            .map(|i| bf16::from_f32((((i * 131 + seed * 17) % 4093) as f32 - 2046.0) / 512.0))
+            .collect();
+        let mut x = HiddenStates::zeros(ctx, d, rows).expect("buf");
+        ctx.stream.memcpy_htod(&host, &mut x.data).expect("up");
+        x
+    }
+
+    fn seeded_weight(ctx: &DeviceContext, d: usize, seed: usize) -> DeviceVec {
+        let host: Vec<bf16> = (0..d)
+            .map(|i| bf16::from_f32((((i * 37 + seed * 13) % 511) as f32 - 255.0) / 256.0))
+            .collect();
+        DeviceVec {
+            data: ctx.stream.clone_htod(&host).expect("w up"),
+            len: d,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_dual_norm_matches_two_standalone_norms() {
+        let ctx = DeviceContext::new_with_device(0).expect("device");
+        let (d, rows, eps) = (2816usize, 16usize, 1e-6f32);
+        let x = seeded(&ctx, d, rows, 4);
+        let wa = seeded_weight(&ctx, d, 4);
+        let wb = seeded_weight(&ctx, d, 5);
+        let scale = (d as f32).powf(-0.5);
+        let mut split_a = HiddenStates::zeros(&ctx, d, rows).expect("sa");
+        let mut split_b = HiddenStates::zeros(&ctx, d, rows).expect("sb");
+        rms_norm_batch_into(&ctx, &x, &wa, eps, &mut split_a);
+        rms_norm_batch_into(&ctx, &x, &wb, eps, &mut split_b);
+        crate::ops::scale_bf16_in_place(&ctx, &mut split_a, scale).expect("scale");
+
+        let mut fused_a = HiddenStates::zeros(&ctx, d, rows).expect("fa");
+        let mut fused_b = HiddenStates::zeros(&ctx, d, rows).expect("fb");
+        rms_norm_batch_dual_into(&ctx, &x, &wa, &wb, eps, scale, &mut fused_a, &mut fused_b);
+        assert_bitwise(&ctx, &split_a, &fused_a, "dual norm router branch");
+        assert_bitwise(&ctx, &split_b, &fused_b, "dual norm expert branch");
     }
 }
