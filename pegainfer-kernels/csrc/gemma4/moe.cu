@@ -49,6 +49,8 @@ __global__ void gemma4_moe_router_topk_kernel(
   }
 
   float selected = 0.0f;
+  float my_win = 0.0f;
+  int my_taken = 0;
   for (int k = 0; k < top_k; ++k) {
     float best = -FLT_MAX;
     int best_at = experts;
@@ -69,9 +71,9 @@ __global__ void gemma4_moe_router_topk_kernel(
     }
     const float win = __shfl_sync(0xffffffff, best, 0);
     const int taken = __shfl_sync(0xffffffff, best_at, 0);
-    if (lane == 0) {
-      index_out[(long long)row * top_k + k] = taken;
-      weight_out[(long long)row * top_k + k] = win;
+    if (lane == k) {
+      my_win = win;
+      my_taken = taken;
     }
     if (taken % kRouterBlock == lane) {
       held[taken / kRouterBlock] = -FLT_MAX;
@@ -79,15 +81,11 @@ __global__ void gemma4_moe_router_topk_kernel(
     selected += win;
   }
 
-  // The selected probabilities are renormalized among themselves before the
-  // per-expert scale lands, so a token's expert weights sum to one first.
-  if (lane == 0) {
-    for (int k = 0; k < top_k; ++k) {
-      const long long at = (long long)row * top_k + k;
-      const int expert = index_out[at];
-      weight_out[at] =
-          weight_out[at] / selected * __bfloat162float(per_expert_scale[expert]);
-    }
+  if (lane < top_k) {
+    const long long at = (long long)row * top_k + lane;
+    index_out[at] = my_taken;
+    weight_out[at] =
+        my_win / selected * __bfloat162float(per_expert_scale[my_taken]);
   }
 }
 
@@ -120,11 +118,11 @@ CUresult gemma4_moe_router_topk_cuda(const __nv_bfloat16 *logits,
                                      cudaStream_t stream) {
   if (logits == nullptr || per_expert_scale == nullptr ||
       index_out == nullptr || weight_out == nullptr || rows <= 0 ||
-      experts != kRouterExperts || top_k <= 0 || top_k > experts) {
+      experts != kRouterExperts || top_k <= 0 || top_k > experts ||
+      top_k > kRouterBlock) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  const size_t shared = (size_t)experts * sizeof(float);
-  gemma4_moe_router_topk_kernel<<<rows, kRouterBlock, shared, stream>>>(
+  gemma4_moe_router_topk_kernel<<<rows, kRouterBlock, 0, stream>>>(
       logits, per_expert_scale, experts, top_k, index_out, weight_out);
   return (CUresult)cudaGetLastError();
 }
