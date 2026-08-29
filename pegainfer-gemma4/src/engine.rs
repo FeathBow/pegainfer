@@ -817,19 +817,9 @@ impl EngineState {
         // Refuse an unservable global GQA shape, a bad lane mode or a bad
         // ceiling before the multi-GiB load.
         let config = crate::config::Gemma4Config::from_file(dir)?;
-        let graph_enabled = if graph_enabled && config.moe.is_some() {
-            log::warn!("Gemma 4 routed checkpoints do not support CUDA Graph; serving eagerly");
-            false
-        } else {
-            graph_enabled
-        };
         let global_split = crate::serve::global_split_factor(&config)?;
         let max_context = serving_context(config.max_position_embeddings)?;
         let lane_mode = async_prefill_mode()?;
-        anyhow::ensure!(
-            config.moe.is_none() || lane_mode.is_none(),
-            "PEGAINFER_ASYNC_PREFILL is unsupported for routed Gemma 4 checkpoints"
-        );
         let mix_chunk = mix_chunk_tokens(max_context)?;
         let slots = decode_slots()?;
         if max_context > MAX_CONTEXT {

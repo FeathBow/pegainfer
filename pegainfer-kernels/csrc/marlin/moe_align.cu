@@ -149,25 +149,27 @@ __global__ void marlin_moe_align_prefix_kernel(
   num_tokens_post_padded[0] = total;
 }
 
-__global__ void marlin_moe_align_fill_kernel(
+__global__ void marlin_moe_align_stable_fill_kernel(
     const int* __restrict__ topk_idx,
     int* __restrict__ sorted_token_ids,
-    uint32_t* __restrict__ expert_offsets,
+    const uint32_t* __restrict__ expert_offsets,
     uint32_t* __restrict__ expert_cursor,
     int route_elems,
     int global_start,
-    int local_experts,
-    int max_padded_tokens) {
-  int route_offset = blockIdx.x * blockDim.x + threadIdx.x;
-  if (route_offset >= route_elems) return;
-  int expert = topk_idx[route_offset];
-  if (expert < global_start || expert >= global_start + local_experts) return;
-  int local_expert = expert - global_start;
-  uint32_t rank = atomicAdd(&expert_cursor[local_expert], 1u);
-  uint32_t pos = expert_offsets[local_expert] + rank;
-  if (pos < static_cast<uint32_t>(max_padded_tokens)) {
-    sorted_token_ids[pos] = route_offset;
+    int local_experts) {
+  int local_expert = blockIdx.x * blockDim.x + threadIdx.x;
+  if (local_expert >= local_experts) return;
+  int expert = global_start + local_expert;
+  uint32_t rank = 0;
+  uint32_t start = expert_offsets[local_expert];
+  // M-tile row placement is numerically observable, so each expert follows input order.
+  for (int route_offset = 0; route_offset < route_elems; ++route_offset) {
+    if (topk_idx[route_offset] == expert) {
+      sorted_token_ids[start + rank] = route_offset;
+      ++rank;
+    }
   }
+  expert_cursor[local_expert] = rank;
 }
 
 
@@ -240,9 +242,10 @@ CUresult marlin_moe_align_block_size_cuda(
   err = cudaGetLastError();
   if (err != cudaSuccess) return CUDA_ERROR_LAUNCH_FAILED;
 
-  marlin_moe_align_fill_kernel<<<route_blocks, threads, 0, stream>>>(
+  int expert_blocks = (local_experts + threads - 1) / threads;
+  marlin_moe_align_stable_fill_kernel<<<expert_blocks, threads, 0, stream>>>(
       topk_idx, sorted_token_ids, expert_offsets, expert_cursor, route_elems, global_start,
-      local_experts, max_padded_tokens);
+      local_experts);
   err = cudaGetLastError();
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
