@@ -45,15 +45,17 @@ fn marlin_block(slots: usize) -> usize {
     }
 }
 
-/// Marlin's lock array is one int per 64-wide output tile per row block.
-const TILE_N: usize = 64;
+// The shared launcher wants at most four lock words per SM and a non-null
+// fp32 staging buffer; Gemma's whole-column schedule reduces each output
+// element inside one CTA, so neither is ever written. The lock count covers
+// any device up to 1024 SMs.
+const MARLIN_LOCKS: usize = 4 * 1024;
+const MARLIN_STAGING_ELEMS: usize = 1024;
 
 struct MoeScratchSizes {
     slots: usize,
     blocks: usize,
     padded: usize,
-    locks: usize,
-    c_tmp: usize,
 }
 
 fn checked_mul(left: usize, right: usize, quantity: &str) -> Result<usize> {
@@ -66,7 +68,7 @@ fn checked_add(left: usize, right: usize, quantity: &str) -> Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("Gemma 4: MoE scratch {quantity} overflows usize"))
 }
 
-fn scratch_sizes(max_rows: usize, moe: &MoeConfig, hidden_size: usize) -> Result<MoeScratchSizes> {
+fn scratch_sizes(max_rows: usize, moe: &MoeConfig) -> Result<MoeScratchSizes> {
     let slots = checked_mul(max_rows, moe.top_k, "routed slots")?;
     let blocks = checked_add(
         slots.div_ceil(DECODE_BLOCK),
@@ -85,8 +87,6 @@ fn scratch_sizes(max_rows: usize, moe: &MoeConfig, hidden_size: usize) -> Result
         slots,
         blocks,
         padded,
-        locks: checked_mul(hidden_size / TILE_N, blocks, "Marlin lock elements")?,
-        c_tmp: checked_mul(hidden_size, padded, "Marlin c_tmp elements")?,
     })
 }
 
@@ -122,7 +122,7 @@ impl MoeScratch {
             .ok_or_else(|| anyhow::anyhow!("Gemma 4: no MoE scratch without a routed config"))?;
         let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
         let narrow = |rows| HiddenStates::zeros(ctx, moe.intermediate_size, rows);
-        let sizes = scratch_sizes(max_rows, moe, geom.hidden_size)?;
+        let sizes = scratch_sizes(max_rows, moe)?;
         Ok(Self {
             max_rows,
             router_in: hidden(max_rows)?,
@@ -132,10 +132,8 @@ impl MoeScratch {
             sorted_token_ids: ctx.stream.alloc_zeros::<i32>(sizes.padded)?,
             expert_ids: ctx.stream.alloc_zeros::<i32>(sizes.blocks)?,
             padded_total: ctx.stream.alloc_zeros::<i32>(1)?,
-            locks: ctx.stream.alloc_zeros::<i32>(sizes.locks)?,
-            // The shared launcher refuses null staging even though Gemma's
-            // whole-column schedule never writes it.
-            c_tmp: ctx.stream.alloc_zeros::<f32>(sizes.c_tmp)?,
+            locks: ctx.stream.alloc_zeros::<i32>(MARLIN_LOCKS)?,
+            c_tmp: ctx.stream.alloc_zeros::<f32>(MARLIN_STAGING_ELEMS)?,
             moe_in: hidden(max_rows)?,
             routed_gate: narrow(sizes.slots)?,
             routed_up: narrow(sizes.slots)?,
