@@ -1642,11 +1642,11 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn kimi_marlin_large_align_block_size_matches_vllm_contract() {
-        const ACTIVE_TOKENS: usize = 128;
+    fn kimi_marlin_align_boundary_matches_vllm_contract() {
         const BATCH_SIZE: usize = 16;
         const BLOCK_SIZE: usize = 8;
         const GLOBAL_START: usize = 96;
+        const SMALL_PATH_ROUTES: usize = 1016;
         const LARGE_PATH_ROUTES: usize = 1024;
         const LOCAL_GROUP_A: usize = 13;
         const LOCAL_GROUP_B: usize = 17;
@@ -1658,109 +1658,120 @@ mod tests {
         const STRIDE_ABOVE: usize = 7;
 
         let ctx = crate::tensor::DeviceContext::new().expect("CUDA context");
-        let topk = KIMI_K2_TOPK;
-        let route_elems = ACTIVE_TOKENS * topk;
-        assert_eq!(route_elems, LARGE_PATH_ROUTES);
-        let first_non_local = GLOBAL_START + KIMI_K2_LOCAL_EXPERTS;
-        let topk_host = (0..ACTIVE_TOKENS)
-            .flat_map(|token| {
-                [
-                    GLOBAL_START + token % LOCAL_GROUP_A,
-                    token % BELOW_GROUP,
-                    GLOBAL_START + LOCAL_GROUP_A + (token * STRIDE_B) % LOCAL_GROUP_B,
-                    first_non_local + token % ABOVE_GROUP,
-                    GLOBAL_START
-                        + LOCAL_GROUP_A
-                        + LOCAL_GROUP_B
-                        + (token * STRIDE_C) % LOCAL_GROUP_C,
-                    BELOW_GROUP + (token * STRIDE_B) % BELOW_GROUP,
-                    first_non_local + ABOVE_GROUP + (token * STRIDE_ABOVE) % ABOVE_GROUP,
-                    2 * BELOW_GROUP + (token * STRIDE_C) % BELOW_GROUP,
-                ]
-                .map(|expert| i32::try_from(expert).expect("expert id"))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(topk_host.len(), route_elems);
-
-        let topk_dev = ctx.stream.clone_htod(&topk_host).expect("topk H2D");
         let mut workspace =
-            KimiMarlinRouteWorkspace::new(&ctx, ACTIVE_TOKENS, BLOCK_SIZE).expect("workspace");
-        let (num_tokens, sorted, expert_ids, call) = {
-            let routing = kimi_moe_marlin_align_block_size(
-                &ctx,
-                &mut workspace,
-                &topk_dev,
-                BATCH_SIZE,
-                ACTIVE_TOKENS,
-                GLOBAL_START,
-            )
-            .expect("align");
-            let num_tokens = ctx
-                .stream
-                .clone_dtoh(routing.num_tokens_post_padded)
-                .expect("num_tokens D2H");
-            let sorted = ctx
-                .stream
-                .clone_dtoh(routing.sorted_token_ids)
-                .expect("sorted D2H");
-            let expert_ids = ctx
-                .stream
-                .clone_dtoh(routing.expert_ids)
-                .expect("expert_ids D2H");
-            (num_tokens, sorted, expert_ids, routing.manifest_call())
-        };
-        let expert_offsets = ctx
-            .stream
-            .clone_dtoh(&workspace.expert_offsets)
-            .expect("expert_offsets D2H");
-        let total = usize::try_from(num_tokens[0]).expect("nonnegative padded tokens");
-        assert!(total.is_multiple_of(BLOCK_SIZE));
-
-        let mut expected_sorted = Vec::<i32>::new();
-        let mut expected_expert_ids = Vec::<i32>::new();
-        let mut expected_offsets = Vec::<u32>::with_capacity(KIMI_K2_LOCAL_EXPERTS + 1);
-        let sentinel = i32::try_from(route_elems).expect("route sentinel");
-        for local_expert in 0..KIMI_K2_LOCAL_EXPERTS {
-            expected_offsets.push(u32::try_from(expected_sorted.len()).expect("expert offset"));
-            let global_expert = GLOBAL_START + local_expert;
-            let mut routes = topk_host
-                .iter()
-                .enumerate()
-                .filter(|&(_, &expert)| usize::try_from(expert).ok() == Some(global_expert))
-                .map(|(route_offset, _)| i32::try_from(route_offset).expect("route offset"))
+            KimiMarlinRouteWorkspace::new(&ctx, LARGE_PATH_ROUTES / KIMI_K2_TOPK, BLOCK_SIZE)
+                .expect("workspace");
+        let first_non_local = GLOBAL_START + KIMI_K2_LOCAL_EXPERTS;
+        for route_elems in [SMALL_PATH_ROUTES, LARGE_PATH_ROUTES] {
+            let active_tokens = route_elems / KIMI_K2_TOPK;
+            let topk_host = (0..active_tokens)
+                .flat_map(|token| {
+                    [
+                        GLOBAL_START + token % LOCAL_GROUP_A,
+                        token % BELOW_GROUP,
+                        GLOBAL_START + LOCAL_GROUP_A + (token * STRIDE_B) % LOCAL_GROUP_B,
+                        first_non_local + token % ABOVE_GROUP,
+                        GLOBAL_START
+                            + LOCAL_GROUP_A
+                            + LOCAL_GROUP_B
+                            + (token * STRIDE_C) % LOCAL_GROUP_C,
+                        BELOW_GROUP + (token * STRIDE_B) % BELOW_GROUP,
+                        first_non_local + ABOVE_GROUP + (token * STRIDE_ABOVE) % ABOVE_GROUP,
+                        2 * BELOW_GROUP + (token * STRIDE_C) % BELOW_GROUP,
+                    ]
+                    .map(|expert| i32::try_from(expert).expect("expert id"))
+                })
                 .collect::<Vec<_>>();
-            if routes.is_empty() {
-                continue;
+            assert_eq!(topk_host.len(), route_elems);
+
+            let topk_dev = ctx.stream.clone_htod(&topk_host).expect("topk H2D");
+            let (num_tokens, sorted, expert_ids, call) = {
+                let routing = kimi_moe_marlin_align_block_size(
+                    &ctx,
+                    &mut workspace,
+                    &topk_dev,
+                    BATCH_SIZE,
+                    active_tokens,
+                    GLOBAL_START,
+                )
+                .expect("align");
+                let num_tokens = ctx
+                    .stream
+                    .clone_dtoh(routing.num_tokens_post_padded)
+                    .expect("num_tokens D2H");
+                let sorted = ctx
+                    .stream
+                    .clone_dtoh(routing.sorted_token_ids)
+                    .expect("sorted D2H");
+                let expert_ids = ctx
+                    .stream
+                    .clone_dtoh(routing.expert_ids)
+                    .expect("expert_ids D2H");
+                (num_tokens, sorted, expert_ids, routing.manifest_call())
+            };
+            let expert_offsets = ctx
+                .stream
+                .clone_dtoh(&workspace.expert_offsets)
+                .expect("expert_offsets D2H");
+            let total = usize::try_from(num_tokens[0]).expect("nonnegative padded tokens");
+            assert!(total.is_multiple_of(BLOCK_SIZE));
+
+            let mut expected_sorted = Vec::<i32>::new();
+            let mut expected_expert_ids = Vec::<i32>::new();
+            let mut expected_offsets = Vec::<u32>::with_capacity(KIMI_K2_LOCAL_EXPERTS + 1);
+            let mut expected_cursor = Vec::<u32>::with_capacity(KIMI_K2_LOCAL_EXPERTS);
+            let sentinel = i32::try_from(route_elems).expect("route sentinel");
+            for local_expert in 0..KIMI_K2_LOCAL_EXPERTS {
+                expected_offsets.push(u32::try_from(expected_sorted.len()).expect("expert offset"));
+                let global_expert = GLOBAL_START + local_expert;
+                let mut routes = topk_host
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &expert)| usize::try_from(expert).ok() == Some(global_expert))
+                    .map(|(route_offset, _)| i32::try_from(route_offset).expect("route offset"))
+                    .collect::<Vec<_>>();
+                expected_cursor.push(u32::try_from(routes.len()).expect("expert routes"));
+                if routes.is_empty() {
+                    continue;
+                }
+                let padded = routes.len().div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
+                expected_expert_ids.extend(std::iter::repeat_n(
+                    i32::try_from(local_expert).expect("local expert"),
+                    padded / BLOCK_SIZE,
+                ));
+                routes.extend(std::iter::repeat_n(sentinel, padded - routes.len()));
+                expected_sorted.extend(routes);
             }
-            let padded = routes.len().div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
-            expected_expert_ids.extend(std::iter::repeat_n(
-                i32::try_from(local_expert).expect("local expert"),
-                padded / BLOCK_SIZE,
-            ));
-            routes.extend(std::iter::repeat_n(sentinel, padded - routes.len()));
-            expected_sorted.extend(routes);
+            expected_offsets.push(u32::try_from(expected_sorted.len()).expect("padded total"));
+
+            assert_eq!(total, expected_sorted.len());
+            assert_eq!(&sorted[..total], expected_sorted.as_slice());
+            assert_eq!(
+                &expert_ids[..expected_expert_ids.len()],
+                expected_expert_ids.as_slice()
+            );
+            assert_eq!(expert_offsets, expected_offsets);
+            if route_elems == SMALL_PATH_ROUTES {
+                let expert_cursor = ctx
+                    .stream
+                    .clone_dtoh(&workspace.expert_cursor)
+                    .expect("expert_cursor D2H");
+                assert_eq!(expert_cursor, expected_cursor);
+            }
+
+            let attrs: std::collections::HashMap<&str, &str> = call
+                .attrs
+                .iter()
+                .map(|a| (a.name.as_str(), a.value.as_str()))
+                .collect();
+            let route_elems_attr = route_elems.to_string();
+            assert_eq!(attrs.get("device_resident_metadata"), Some(&"true"));
+            assert_eq!(attrs.get("decode_step_d2h"), Some(&"forbidden"));
+            assert_eq!(
+                attrs.get("sentinel_token_id"),
+                Some(&route_elems_attr.as_str())
+            );
         }
-        expected_offsets.push(u32::try_from(expected_sorted.len()).expect("padded total"));
-
-        assert_eq!(total, expected_sorted.len());
-        expected_sorted.resize(sorted.len(), sentinel);
-        expected_expert_ids.resize(expert_ids.len(), -1);
-        assert_eq!(sorted, expected_sorted);
-        assert_eq!(expert_ids, expected_expert_ids);
-        assert_eq!(expert_offsets, expected_offsets);
-
-        let attrs: std::collections::HashMap<&str, &str> = call
-            .attrs
-            .iter()
-            .map(|a| (a.name.as_str(), a.value.as_str()))
-            .collect();
-        let route_elems_attr = route_elems.to_string();
-        assert_eq!(attrs.get("device_resident_metadata"), Some(&"true"));
-        assert_eq!(attrs.get("decode_step_d2h"), Some(&"forbidden"));
-        assert_eq!(
-            attrs.get("sentinel_token_id"),
-            Some(&route_elems_attr.as_str())
-        );
     }
 
     #[test]

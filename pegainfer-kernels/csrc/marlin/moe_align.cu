@@ -26,60 +26,57 @@ __global__ void marlin_moe_align_small_kernel(
     int route_elems,
     int global_start,
     int local_experts,
-    int block_size,
-    int max_padded_tokens,
-    int max_m_blocks) {
+    int block_size) {
+  extern __shared__ uint32_t metadata[];
+  uint32_t* counts = metadata;
+  uint32_t* starts = counts + local_experts;
   int tid = static_cast<int>(threadIdx.x);
-  for (int idx = tid; idx < max_padded_tokens; idx += blockDim.x) {
-    sorted_token_ids[idx] = route_elems;
-  }
-  for (int idx = tid; idx < max_m_blocks; idx += blockDim.x) {
-    expert_ids[idx] = -1;
-  }
-  for (int idx = tid; idx <= local_experts; idx += blockDim.x) {
-    expert_offsets[idx] = 0;
-    if (idx < local_experts) {
-      expert_cursor[idx] = 0;
-    }
-  }
-  if (tid == 0) {
-    num_tokens_post_padded[0] = 0;
+  for (int expert = tid; expert < local_experts; expert += blockDim.x) {
+    counts[expert] = 0;
   }
   __syncthreads();
 
   for (int route_offset = tid; route_offset < route_elems; route_offset += blockDim.x) {
     int expert = topk_idx[route_offset];
     if (expert >= global_start && expert < global_start + local_experts) {
-      atomicAdd(&expert_offsets[expert - global_start + 1], 1u);
+      atomicAdd(&counts[expert - global_start], 1u);
     }
   }
   __syncthreads();
 
-  if (tid != 0) return;
-
-  int total = 0;
-  for (int expert = 0; expert < local_experts; ++expert) {
-    int count = static_cast<int>(expert_offsets[expert + 1]);
-    int padded = round_up_to_block(count, block_size);
-    expert_offsets[expert] = static_cast<uint32_t>(total);
-    expert_cursor[expert] = 0;
-    for (int pos = total; pos < total + padded; pos += block_size) {
-      expert_ids[pos / block_size] = expert;
+  if (tid == 0) {
+    int total = 0;
+    for (int expert = 0; expert < local_experts; ++expert) {
+      starts[expert] = static_cast<uint32_t>(total);
+      total += round_up_to_block(static_cast<int>(counts[expert]), block_size);
     }
-    total += padded;
+    starts[local_experts] = static_cast<uint32_t>(total);
+    expert_offsets[local_experts] = static_cast<uint32_t>(total);
+    num_tokens_post_padded[0] = total;
   }
-  expert_offsets[local_experts] = static_cast<uint32_t>(total);
-  num_tokens_post_padded[0] = total;
+  __syncthreads();
 
-  for (int route_offset = 0; route_offset < route_elems; ++route_offset) {
-    int expert = topk_idx[route_offset];
-    if (expert < global_start || expert >= global_start + local_experts) continue;
-    int local_expert = expert - global_start;
-    int pos = static_cast<int>(expert_offsets[local_expert] + expert_cursor[local_expert]);
-    expert_cursor[local_expert] += 1;
-    if (pos < max_padded_tokens) {
-      sorted_token_ids[pos] = route_offset;
+  for (int local_expert = tid; local_expert < local_experts;
+       local_expert += blockDim.x) {
+    int start = static_cast<int>(starts[local_expert]);
+    int count = static_cast<int>(counts[local_expert]);
+    int padded = round_up_to_block(count, block_size);
+    for (int pos = start; pos < start + padded; pos += block_size) {
+      expert_ids[pos / block_size] = local_expert;
     }
+    int rank = 0;
+    int global_expert = global_start + local_expert;
+    for (int route_offset = 0; route_offset < route_elems; ++route_offset) {
+      if (topk_idx[route_offset] == global_expert) {
+        sorted_token_ids[start + rank] = route_offset;
+        ++rank;
+      }
+    }
+    for (int pos = start + count; pos < start + padded; ++pos) {
+      sorted_token_ids[pos] = route_elems;
+    }
+    expert_offsets[local_expert] = starts[local_expert];
+    expert_cursor[local_expert] = counts[local_expert];
   }
 }
 
@@ -204,10 +201,10 @@ CUresult marlin_moe_align_block_size_cuda(
 
   constexpr int threads = 256;
   if (route_elems < 1024) {
-    marlin_moe_align_small_kernel<<<1, threads, 0, stream>>>(
+    size_t shared = (2ull * static_cast<size_t>(local_experts) + 1) * sizeof(uint32_t);
+    marlin_moe_align_small_kernel<<<1, threads, shared, stream>>>(
         topk_idx, sorted_token_ids, expert_ids, num_tokens_post_padded, expert_offsets,
-        expert_cursor, route_elems, global_start, local_experts, block_size, max_padded_tokens,
-        max_m_blocks);
+        expert_cursor, route_elems, global_start, local_experts, block_size);
     cudaError_t err = cudaGetLastError();
     return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
   }

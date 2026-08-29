@@ -271,9 +271,8 @@ pub struct MoeAlignScratch<'a> {
 
 /// Group the routed slots into the kernel's fixed-width blocks, on the device.
 ///
-/// The capacities are the whole allocations, not this step's extent: the
-/// builder clears them before it fills, so a step never reads what the last
-/// one left behind.
+/// Entries beyond `num_tokens_post_padded` may remain stale; consumers use
+/// that device-resident extent.
 pub fn marlin_moe_align_block_size(
     ctx: &DeviceContext,
     topk_idx: &CudaSlice<i32>,
