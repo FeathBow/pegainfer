@@ -48,18 +48,10 @@ const ThreadConfig kSmallBatch[] = {
     {64, 128, 128},
 };
 
-// The two entries the 26B shapes select: the 256-thread, 256-wide tile for
-// the 2816-wide down projection, and the 128-thread, 64-wide tile the
-// 704-wide gate and up projections admit. A 256-thread kernel over a
-// 64-wide tile computed the wrong product (the routed-block gate's 40-row
-// arm read a first projection a full unit off the reference), so no such
-// entry exists.
-const ThreadConfig kLargeBatch[] = {
-    {64, 256, 256},
-    {128, 64, 128},
-};
-
-const ThreadConfigs kTables{kSmallBatch, 2, kLargeBatch, 2};
+// Prefill-sized dispatches share decode's tiles: a 64-wide tile has no
+// correct 256-thread specialization, and a 256-thread, 256-wide tile for the
+// down projection is byte-identical and no faster.
+const ThreadConfigs kTables{kSmallBatch, 2, kSmallBatch, 2};
 
 MarlinFuncPtr get_nvfp4_kernel(
     int thread_m_blocks,
@@ -73,8 +65,8 @@ MarlinFuncPtr get_nvfp4_kernel(
   }
   GEMMA4_MARLIN_GET_IF_M1(4, 8, 128)
   GEMMA4_MARLIN_GET_IF_M1(8, 4, 128)
-  GEMMA4_MARLIN_GET_IF(4, 16, 4, false, 256)
   GEMMA4_MARLIN_GET_IF(4, 4, 8, false, 128)
+  GEMMA4_MARLIN_GET_IF(4, 8, 4, false, 128)
   return kernel;
 }
 

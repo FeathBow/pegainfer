@@ -28,13 +28,11 @@ use crate::config::MoeConfig;
 use crate::layer::LayerGeometry;
 use crate::weights::Gemma4Moe;
 
-// Sixteen is the narrowest M block with a complete compiled kernel table.
+// Decode's M tile; a thin step pads the least.
 const DECODE_BLOCK: usize = 16;
-// The `thread_m_blocks = 4` instantiations let one weight stripe serve four
-// times as many rows through their 64-row M block.
+// The `thread_m_blocks = 4` tile: one weight stripe serves four times the rows.
 const PREFILL_BLOCK: usize = 64;
-// This first power of two above decode's 16 rows x 8 picks = 128 slots is a
-// floor that keeps decode out, not a measured crossover.
+// Above decode's 16 rows x 8 picks, so a decode step never changes block.
 const PREFILL_MIN_SLOTS: usize = 256;
 
 fn marlin_block(slots: usize) -> usize {
