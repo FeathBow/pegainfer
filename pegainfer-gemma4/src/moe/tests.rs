@@ -42,13 +42,22 @@ fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
 }
 
 struct RoutedCapture {
+    /// Router logits as the router GEMM stored them, `[rows, experts]`.
+    logits: Vec<half::bf16>,
     index: Vec<i32>,
     weight: Vec<f32>,
     gate: Vec<half::bf16>,
+    /// Each route's down projection with the router weight applied, before
+    /// the top-k sum and the post norm fold it into the block.
+    down: Vec<half::bf16>,
     block: Vec<half::bf16>,
 }
 
 fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapture) {
+    assert!(
+        actual.logits.starts_with(&expected.logits),
+        "{label}: router logits moved"
+    );
     assert!(
         actual.index.starts_with(&expected.index),
         "{label}: router picks moved"
@@ -62,125 +71,212 @@ fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapt
         "{label}: gate bytes moved"
     );
     assert!(
+        actual.down.starts_with(&expected.down),
+        "{label}: down bytes moved"
+    );
+    assert!(
         actual.block.starts_with(&expected.block),
         "{label}: block bytes moved"
     );
 }
 
-struct RoutedReference {
-    experts: usize,
-    top_k: usize,
+/// The host side of the block: checkpoint weights widened on the host, the
+/// norm vectors, and the expert matrices decoded on demand.
+struct HostBlock<'a> {
     hidden: usize,
     width: usize,
-    /// Router logits per row, rounded to bf16 as the router GEMM stores them.
-    logits: Vec<f32>,
-    index: Vec<i32>,
-    weight: Vec<f32>,
-    gate: Vec<f32>,
-    block: Vec<f32>,
+    top_k: usize,
+    experts: usize,
+    eps: f32,
+    router_scale: Vec<f32>,
+    per_expert_scale: Vec<f32>,
+    pre_norm: Vec<f32>,
+    post_dense_norm: Vec<f32>,
+    post_routed_norm: Vec<f32>,
+    router_proj: Vec<f32>,
+    plans: &'a crate::manifest::schema::MoeTensors,
+    shards: &'a [safetensors::SafeTensors<'a>],
+    widened: std::cell::RefCell<std::collections::HashMap<usize, [Vec<f32>; 3]>>,
 }
 
-/// One bf16 spacing at `x`'s magnitude. Two logits this close land on the
-/// same or adjacent bf16 values under a different accumulation order, so a
-/// top-k that swaps them is a tie decided by rounding, not a different
-/// computation.
-fn bf16_ulp(x: f32) -> f32 {
-    let magnitude = x.abs().max(f32::MIN_POSITIVE);
-    2f32.powi(magnitude.log2().floor() as i32 - 7)
-}
-
-fn assert_matches_reference(label: &str, capture: &RoutedCapture, reference: &RoutedReference) {
-    const WEIGHT_TOLERANCE: f32 = 5e-3;
-    const RELATIVE_TOLERANCE: f32 = 2e-2;
-    // Rows whose pick set differs by a bf16-level tie leave the numeric
-    // comparison (their expert set is not the reference's); more than one
-    // row in this many says the input, not the arithmetic, is at fault.
-    const TIED_ROWS_ONE_IN: usize = 8;
-
-    let (experts, top_k, hidden, width) = (
-        reference.experts,
-        reference.top_k,
-        reference.hidden,
-        reference.width,
-    );
-    let rows = capture.index.len() / top_k;
-    let mut tied_rows = Vec::new();
-    let mut reordered_rows = Vec::new();
-    for row in 0..rows {
-        let slots = row * top_k..(row + 1) * top_k;
-        let mine = &capture.index[slots.clone()];
-        let theirs = &reference.index[slots.clone()];
-        // Reference slot `j` compares against capture slot `order[j]`: the
-        // identity when the picks agree, the matching expert when only the
-        // order differs.
-        let mut order: Vec<usize> = (0..top_k).collect();
-        if mine != theirs {
-            let logits = &reference.logits[row * experts..(row + 1) * experts];
-            let tie = mine
-                .iter()
-                .zip(theirs)
-                .filter(|(a, b)| a != b)
-                .all(|(a, b)| {
-                    let (la, lb) = (logits[*a as usize], logits[*b as usize]);
-                    (la - lb).abs() <= bf16_ulp(la.abs().max(lb.abs()))
-                });
-            assert!(
-                tie,
-                "{label}: row {row} router picks {mine:?} differ from the reference {theirs:?} \
-                 beyond a bf16 tie"
+impl HostBlock<'_> {
+    fn expert(&self, expert: usize) -> std::cell::Ref<'_, [Vec<f32>; 3]> {
+        if !self.widened.borrow().contains_key(&expert) {
+            let widen = |plan: &crate::manifest::schema::QuantMatrix| -> Vec<f32> {
+                let (rows, values) = plan.geometry().expect("geometry");
+                QuantSource::read(self.shards, plan)
+                    .expect("quant source")
+                    .widen(rows, values)
+                    .expect("widen")
+            };
+            let plan = &self.plans.experts[expert];
+            self.widened.borrow_mut().insert(
+                expert,
+                [widen(&plan.gate), widen(&plan.up), widen(&plan.down)],
             );
-            let same_set = theirs.iter().all(|e| mine.contains(e));
-            if !same_set {
-                tied_rows.push(row);
-                continue;
-            }
-            for (j, expert) in theirs.iter().enumerate() {
-                order[j] = mine.iter().position(|e| e == expert).expect("same set");
-            }
-            reordered_rows.push(row);
         }
-        let weight_gap = (0..top_k).fold(0.0f32, |acc, j| {
-            acc.max(abs_gap(
-                capture.weight[row * top_k + order[j]],
-                reference.weight[row * top_k + j],
-            ))
-        });
-        assert!(
-            weight_gap <= WEIGHT_TOLERANCE,
-            "{label}: row {row} router weights differ by {weight_gap:.3e}"
-        );
-        let gate: Vec<f32> = (0..top_k)
-            .flat_map(|j| {
-                let at = (row * top_k + order[j]) * width;
-                capture.gate[at..at + width].iter().map(|x| x.to_f32())
+        std::cell::Ref::map(self.widened.borrow(), |m| &m[&expert])
+    }
+}
+
+/// The capture against the block's formulas, one row and one quantity at a
+/// time. The host router projection is compared to the device's stored bf16
+/// logits with a tolerance; the pick and weight contract is then evaluated
+/// exactly on those stored logits, which is what the kernel consumes, so a
+/// bf16 logit larger by one spacing is larger, not tied. The expert path is
+/// checked for the device's picks: the first projection, each route's
+/// weighted down projection before any norm, and the combined block. The
+/// relative bounds sit an order of magnitude above bf16 accumulation at these
+/// widths, so a breach is a different computation, not a different rounding.
+fn assert_matches_reference(
+    label: &str,
+    capture: &RoutedCapture,
+    residual_host: &[half::bf16],
+    dense_host: &[half::bf16],
+    host: &HostBlock<'_>,
+) {
+    use half::bf16;
+    const LOGIT_TOLERANCE: f32 = 1e-2;
+    const WEIGHT_TOLERANCE: f32 = 1e-4;
+    const RELATIVE_TOLERANCE: f32 = 2e-2;
+
+    let (hidden, width, top_k, experts, eps) =
+        (host.hidden, host.width, host.top_k, host.experts, host.eps);
+    let rows = capture.index.len() / top_k;
+    let residual_f32: Vec<f32> = residual_host.iter().map(|x| x.to_f32()).collect();
+    let dense_f32: Vec<f32> = dense_host.iter().map(|x| x.to_f32()).collect();
+    for row in 0..rows {
+        let residual_row = &residual_f32[row * hidden..(row + 1) * hidden];
+
+        // The host projection rounds where the device does: the norm's
+        // store, the scalar multiply, and the stored logits.
+        let scale = (hidden as f32).sqrt().recip();
+        let router_in: Vec<f32> = rms(residual_row, Some(&host.router_scale), eps)
+            .iter()
+            .map(|v| bf16::from_f32(bf16::from_f32(*v).to_f32() * scale).to_f32())
+            .collect();
+        let host_logits: Vec<f32> = (0..experts)
+            .map(|expert| {
+                let logit: f32 = (0..hidden)
+                    .map(|i| router_in[i] * host.router_proj[expert * hidden + i])
+                    .sum();
+                bf16::from_f32(logit).to_f32()
             })
             .collect();
-        let gate_span = row * top_k * width..(row + 1) * top_k * width;
-        let gate_gap = relative_gap(&gate, &reference.gate[gate_span]);
-        assert!(
-            gate_gap <= RELATIVE_TOLERANCE,
-            "{label}: row {row} expert GEMM differs from the widened reference by {gate_gap:.3e}"
-        );
-        let block_span = row * hidden..(row + 1) * hidden;
-        let block = capture.block[block_span.clone()]
+        let device_logits: Vec<f32> = capture.logits[row * experts..(row + 1) * experts]
             .iter()
             .map(|x| x.to_f32())
-            .collect::<Vec<_>>();
-        let block_gap = relative_gap(&block, &reference.block[block_span]);
+            .collect();
+        let logit_gap = relative_gap(&device_logits, &host_logits);
+        assert!(
+            logit_gap <= LOGIT_TOLERANCE,
+            "{label}: row {row} router projection differs from the host by {logit_gap:.3e}"
+        );
+
+        let top = device_logits
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, b| a.max(*b));
+        let exponentials: Vec<f32> = device_logits.iter().map(|v| (v - top).exp()).collect();
+        let total: f32 = exponentials.iter().sum();
+        let mut ranked: Vec<usize> = (0..experts).collect();
+        ranked.sort_by(|a, b| {
+            exponentials[*b]
+                .partial_cmp(&exponentials[*a])
+                .expect("finite")
+                .then(a.cmp(b))
+        });
+        let expected_picks: Vec<i32> = ranked[..top_k]
+            .iter()
+            .map(|e| i32::try_from(*e).expect("expert id"))
+            .collect();
+        let picks = &capture.index[row * top_k..(row + 1) * top_k];
+        assert_eq!(
+            picks, expected_picks,
+            "{label}: row {row} router picks differ from the exact contract on the stored logits"
+        );
+        let picked_total: f32 = picks
+            .iter()
+            .map(|e| exponentials[*e as usize] / total)
+            .sum();
+        for (pick, &expert) in picks.iter().enumerate() {
+            let expected = (exponentials[expert as usize] / total) / picked_total
+                * host.per_expert_scale[expert as usize];
+            let gap = abs_gap(capture.weight[row * top_k + pick], expected);
+            assert!(
+                gap <= WEIGHT_TOLERANCE,
+                "{label}: row {row} pick {pick} router weight differs from the contract by {gap:.3e}"
+            );
+        }
+
+        let expert_in = rms(residual_row, Some(&host.pre_norm), eps);
+        let mut routed_row = vec![0.0f32; hidden];
+        for (pick, &expert) in picks.iter().enumerate() {
+            let at = row * top_k + pick;
+            let matrices = host.expert(expert as usize);
+            let [gate, up, down] = &*matrices;
+            let mut reference_gate = vec![0.0f32; width];
+            let mut activated = vec![0.0f32; width];
+            for column in 0..width {
+                let g: f32 = (0..hidden)
+                    .map(|i| expert_in[i] * gate[column * hidden + i])
+                    .sum();
+                let u: f32 = (0..hidden)
+                    .map(|i| expert_in[i] * up[column * hidden + i])
+                    .sum();
+                reference_gate[column] = g;
+                activated[column] = gelu_tanh(g) * u;
+            }
+            let device_gate: Vec<f32> = capture.gate[at * width..(at + 1) * width]
+                .iter()
+                .map(|x| x.to_f32())
+                .collect();
+            let gate_gap = relative_gap(&device_gate, &reference_gate);
+            assert!(
+                gate_gap <= RELATIVE_TOLERANCE,
+                "{label}: row {row} pick {pick} expert GEMM differs from the widened reference by \
+                 {gate_gap:.3e}"
+            );
+            // With the device's own weight applied, only the GEMM is compared.
+            let weight = capture.weight[at];
+            let reference_down: Vec<f32> = (0..hidden)
+                .map(|i| {
+                    let projected: f32 = (0..width)
+                        .map(|column| activated[column] * down[i * width + column])
+                        .sum();
+                    weight * projected
+                })
+                .collect();
+            let device_down: Vec<f32> = capture.down[at * hidden..(at + 1) * hidden]
+                .iter()
+                .map(|x| x.to_f32())
+                .collect();
+            let down_gap = relative_gap(&device_down, &reference_down);
+            assert!(
+                down_gap <= RELATIVE_TOLERANCE,
+                "{label}: row {row} pick {pick} down projection differs from the widened reference \
+                 by {down_gap:.3e}"
+            );
+            for (slot, value) in routed_row.iter_mut().zip(&reference_down) {
+                *slot += value;
+            }
+        }
+        let dense_normed = rms(
+            &dense_f32[row * hidden..(row + 1) * hidden],
+            Some(&host.post_dense_norm),
+            eps,
+        );
+        let routed_normed = rms(&routed_row, Some(&host.post_routed_norm), eps);
+        let reference_block: Vec<f32> = (0..hidden)
+            .map(|i| dense_normed[i] + routed_normed[i])
+            .collect();
+        let device_block: Vec<f32> = capture.block[row * hidden..(row + 1) * hidden]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
+        let block_gap = relative_gap(&device_block, &reference_block);
         assert!(
             block_gap <= RELATIVE_TOLERANCE,
             "{label}: row {row} combined block differs from the reference by {block_gap:.3e}"
-        );
-    }
-    assert!(
-        tied_rows.len() <= rows / TIED_ROWS_ONE_IN,
-        "{label}: {} of {rows} rows tied at bf16: {tied_rows:?}",
-        tied_rows.len()
-    );
-    if !tied_rows.is_empty() || !reordered_rows.is_empty() {
-        eprintln!(
-            "{label}: bf16 ties — rows {tied_rows:?} left the numeric comparison, rows \
-             {reordered_rows:?} compared by expert"
         );
     }
 }
@@ -236,6 +332,15 @@ fn the_routed_block_matches_the_reference_formulas() {
         let mut out = HiddenStates::zeros(&ctx, hidden, active_rows).expect("out");
         moe_into(&ctx, moe, &geom, &residual, &dense, scratch, &mut out).expect("routed block");
         RoutedCapture {
+            logits: ctx
+                .stream
+                .clone_dtoh(
+                    &scratch
+                        .logits
+                        .data
+                        .slice(..active_rows * routed.num_experts),
+                )
+                .expect("logits"),
             index: ctx
                 .stream
                 .clone_dtoh(&scratch.index.slice(..active_slots))
@@ -248,6 +353,10 @@ fn the_routed_block_matches_the_reference_formulas() {
                 .stream
                 .clone_dtoh(&scratch.routed_gate.data.slice(..active_slots * width))
                 .expect("routed gate"),
+            down: ctx
+                .stream
+                .clone_dtoh(&scratch.routed_down.data.slice(..active_slots * hidden))
+                .expect("routed down"),
             block: ctx
                 .stream
                 .clone_dtoh(&out.data.slice(..active_rows * hidden))
@@ -291,11 +400,6 @@ fn the_routed_block_matches_the_reference_formulas() {
             .map(|x: &bf16| x.to_f32())
             .collect()
     };
-    let router_scale = host_vec(&moe.router_scale);
-    let per_expert_scale = host_vec(&moe.router_per_expert_scale);
-    let pre_norm = host_vec(&moe.pre_feedforward_layernorm_2);
-    let post_dense_norm = host_vec(&moe.post_feedforward_layernorm_1);
-    let post_routed_norm = host_vec(&moe.post_feedforward_layernorm_2);
     let router_proj: Vec<f32> = ctx
         .stream
         .clone_dtoh(&moe.router_proj.data)
@@ -303,7 +407,6 @@ fn the_routed_block_matches_the_reference_formulas() {
         .iter()
         .map(|x: &bf16| x.to_f32())
         .collect();
-    let experts_out = router_proj.len() / hidden;
 
     // The reference's expert weights come from the checkpoint's bytes,
     // widened on the host rather than read in the packed form.
@@ -314,110 +417,34 @@ fn the_routed_block_matches_the_reference_formulas() {
         .moe
         .as_ref()
         .expect("manifest routes layer 0");
-    let widen = |plan: &crate::manifest::schema::QuantMatrix| -> Vec<f32> {
-        let (rows, values) = plan.geometry().expect("geometry");
-        QuantSource::read(&shards, plan)
-            .expect("quant source")
-            .widen(rows, values)
-            .expect("widen")
-    };
-
-    let residual_f32: Vec<f32> = coarse_residual_host.iter().map(|x| x.to_f32()).collect();
-    let dense_f32: Vec<f32> = coarse_dense_host.iter().map(|x| x.to_f32()).collect();
-
-    let reference_slots = COARSE_TARGET_ROWS * top_k;
-    let mut reference_index = vec![0i32; reference_slots];
-    let mut reference_weight = vec![0.0f32; reference_slots];
-    let mut reference_gate = vec![0.0f32; reference_slots * width];
-    let mut reference_block = vec![0.0f32; COARSE_TARGET_ROWS * hidden];
-    let mut reference_logits = vec![0.0f32; COARSE_TARGET_ROWS * experts_out];
-    for row in 0..COARSE_TARGET_ROWS {
-        let residual_row = &residual_f32[row * hidden..(row + 1) * hidden];
-        // The device rounds the router's input to bf16 twice — the norm's
-        // store and the standalone scalar multiply — and stores its logits as
-        // bf16; the reference rounds at the same three points so a top-k
-        // over near-equal logits is decided on the same values.
-        let scale = (hidden as f32).sqrt().recip();
-        let router_in: Vec<f32> = rms(residual_row, Some(&router_scale), eps)
-            .iter()
-            .map(|v| bf16::from_f32(bf16::from_f32(*v).to_f32() * scale).to_f32())
-            .collect();
-        let logits: Vec<f32> = (0..experts_out)
-            .map(|expert| {
-                let logit: f32 = (0..hidden)
-                    .map(|i| router_in[i] * router_proj[expert * hidden + i])
-                    .sum();
-                bf16::from_f32(logit).to_f32()
-            })
-            .collect();
-        reference_logits[row * experts_out..(row + 1) * experts_out].copy_from_slice(&logits);
-        let top = logits.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
-        let exponentials: Vec<f32> = logits.iter().map(|v| (v - top).exp()).collect();
-        let total: f32 = exponentials.iter().sum();
-        let mut ranked: Vec<usize> = (0..experts_out).collect();
-        ranked.sort_by(|a, b| {
-            exponentials[*b]
-                .partial_cmp(&exponentials[*a])
-                .expect("finite")
-                .then(a.cmp(b))
-        });
-        let picked = &ranked[..top_k];
-        let picked_total: f32 = picked.iter().map(|e| exponentials[*e] / total).sum();
-
-        let expert_in = rms(residual_row, Some(&pre_norm), eps);
-        let mut routed_row = vec![0.0f32; hidden];
-        for (pick, &expert) in picked.iter().enumerate() {
-            let at = row * top_k + pick;
-            reference_index[at] = i32::try_from(expert).expect("expert id");
-            let share = (exponentials[expert] / total) / picked_total;
-            reference_weight[at] = share * per_expert_scale[expert];
-
-            let gate = widen(&plans.experts[expert].gate);
-            let up = widen(&plans.experts[expert].up);
-            let down = widen(&plans.experts[expert].down);
-            let mut activated = vec![0.0f32; width];
-            for column in 0..width {
-                let g: f32 = (0..hidden)
-                    .map(|i| expert_in[i] * gate[column * hidden + i])
-                    .sum();
-                let u: f32 = (0..hidden)
-                    .map(|i| expert_in[i] * up[column * hidden + i])
-                    .sum();
-                reference_gate[at * width + column] = g;
-                activated[column] = gelu_tanh(g) * u;
-            }
-            for (i, slot) in routed_row.iter_mut().enumerate() {
-                let projected: f32 = (0..width)
-                    .map(|column| activated[column] * down[i * width + column])
-                    .sum();
-                *slot += reference_weight[at] * projected;
-            }
-        }
-        let dense_normed = rms(
-            &dense_f32[row * hidden..(row + 1) * hidden],
-            Some(&post_dense_norm),
-            eps,
-        );
-        let routed_normed = rms(&routed_row, Some(&post_routed_norm), eps);
-        for i in 0..hidden {
-            reference_block[row * hidden + i] = dense_normed[i] + routed_normed[i];
-        }
-    }
-
-    // The three numeric bounds sit an order of magnitude above what bf16
-    // accumulation costs at these widths, so a breach is a different
-    // computation rather than a different rounding.
-    let reference = RoutedReference {
-        experts: experts_out,
-        top_k,
+    let host = HostBlock {
         hidden,
         width,
-        logits: reference_logits,
-        index: reference_index,
-        weight: reference_weight,
-        gate: reference_gate,
-        block: reference_block,
+        top_k,
+        experts: routed.num_experts,
+        eps,
+        router_scale: host_vec(&moe.router_scale),
+        per_expert_scale: host_vec(&moe.router_per_expert_scale),
+        pre_norm: host_vec(&moe.pre_feedforward_layernorm_2),
+        post_dense_norm: host_vec(&moe.post_feedforward_layernorm_1),
+        post_routed_norm: host_vec(&moe.post_feedforward_layernorm_2),
+        router_proj,
+        plans,
+        shards: &shards,
+        widened: std::cell::RefCell::new(std::collections::HashMap::new()),
     };
-    assert_matches_reference("4-row target", &baseline, &reference);
-    assert_matches_reference("40-row target", &coarse, &reference);
+    assert_matches_reference(
+        "4-row target",
+        &baseline,
+        &residual_host,
+        &dense_host,
+        &host,
+    );
+    assert_matches_reference(
+        "40-row target",
+        &coarse,
+        &coarse_residual_host,
+        &coarse_dense_host,
+        &host,
+    );
 }
