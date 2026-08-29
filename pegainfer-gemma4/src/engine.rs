@@ -2817,13 +2817,13 @@ mod lane_tests {
     }
 
     #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
     fn the_shared_lane_lifecycle_completes() {
         lane_lifecycle_script("shared");
     }
 
     #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
     fn the_green_lane_lifecycle_completes() {
         lane_lifecycle_script("green:35");
     }

@@ -53,8 +53,7 @@ pub(crate) fn generate_fixture_prompts() -> Vec<Vec<u32>> {
 
 pub(crate) fn model_path() -> String {
     std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
-        "PEGAINFER_TEST_MODEL_PATH must point at the pinned 12B Gemma 4 \
-         checkpoint the fixture was dumped from",
+        "PEGAINFER_TEST_MODEL_PATH must point at the Gemma 4 checkpoint selected for this gate",
     )
 }
 

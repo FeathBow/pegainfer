@@ -163,8 +163,11 @@ PEGAINFER_TEST_MODEL_PATH=<12b-checkpoint> \
   PEGAINFER_GATE_GPU=<index-or-UUID> scripts/gemma4_gates.sh [name-filter]
 ```
 
-An unfiltered run owns both checkpoint-backed suites. A filter only requires the inputs declared
-by the selected gates.
+An unfiltered run owns both checkpoint-backed suites. The sync/lane parity, ragged graph/eager
+parity and shared/green lifecycle gates run once with the dense checkpoint and once with the routed
+checkpoint; the runner binds `PEGAINFER_TEST_MODEL_PATH` to the selected profile for each process.
+Fixture-backed and raised-context gates remain dense-only. A filter requires the inputs declared by
+all execution profiles selected for that gate.
 
 The isolated routed-block diagnostic uses the 26B checkpoint separately:
 
@@ -183,7 +186,7 @@ device to its stable UUID, exports that UUID as the sole `CUDA_VISIBLE_DEVICES` 
 non-blocking cross-process lock on it until the suite exits. Lock contention refuses the run before
 the first gate; when no selector is supplied the runner uses an existing single-device
 `CUDA_VISIBLE_DEVICES`, then physical device 0. This ownership and one-process execution are not
-stylistic choices: repeated 12B loads inside one test binary exhaust a 48 GiB device, while two
+stylistic choices: repeated checkpoint loads inside one test binary exhaust a 48 GiB device, while two
 runners sharing a card can fail each other's gates on allocation rather than on any assertion.
 
 ## Why hooks rather than `output_hidden_states`

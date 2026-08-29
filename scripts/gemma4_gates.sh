@@ -6,7 +6,7 @@
 # unless every prerequisite is present, it holds the discovered gate set
 # against the manifest here so a gate cannot quietly leave the suite. It
 # claims one physical device for the suite's lifetime and runs one gate per
-# process — repeated 12B loads in one test binary exhaust a 48 GiB card.
+# process — repeated checkpoint loads in one test binary exhaust a 48 GiB card.
 #
 #   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
 #     PEGAINFER_NVFP4_MODEL=<routed-checkpoint> \
@@ -43,12 +43,18 @@ GATES_ADMISSION=(
   "gpu,ckpt,prompts engine::lane_tests::the_gathered_walk_matches_the_serial_path"
   "gpu,ckpt,prompts engine::lane_tests::the_gathered_transient_leaves_headroom"
 )
+# These production contracts apply to both checkpoint geometries. They stay
+# unique in the ignored-test manifest and expand into two execution profiles.
+GATES_DENSE_AND_ROUTED=(
+  "gpu,ckpt engine::lane_tests::the_shared_lane_lifecycle_completes"
+  "gpu,ckpt engine::lane_tests::the_green_lane_lifecycle_completes"
+  "gpu,ckpt serve::oracle::overlapped_prefill_matches_the_sync_step"
+  "gpu,ckpt serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
+)
 # The roster-edge gate borrows the generate fixture's prompts too; the raise
 # refusals are settled by `EngineState::load` before it opens a device or
 # reads a weight, so that one needs the config and nothing else.
 GATES_SERVING_CONTRACT=(
-  "gpu,ckpt engine::lane_tests::the_shared_lane_lifecycle_completes"
-  "gpu,ckpt engine::lane_tests::the_green_lane_lifecycle_completes"
   "gpu,ckpt engine::lane_tests::the_gathered_lifecycle_completes"
   "gpu,ckpt,prompts engine::lane_tests::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
   "gpu,ckpt engine::lane_tests::the_raise_reaches_the_frontend"
@@ -57,8 +63,6 @@ GATES_SERVING_CONTRACT=(
 GATES_KV_AND_LANES=(
   "gpu,ckpt serve::oracle::eviction_is_footprint_only"
   "gpu,ckpt serve::oracle::prefix_restore_matches_cold_path"
-  "gpu,ckpt serve::oracle::overlapped_prefill_matches_the_sync_step"
-  "gpu,ckpt serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
 )
 # The disagreeing-config gate deliberately fails before any device is opened.
 GATES_LOADER=(
@@ -75,6 +79,7 @@ GATES_ROUTED=(
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
   "${GATES_ADMISSION[@]}"
+  "${GATES_DENSE_AND_ROUTED[@]}"
   "${GATES_SERVING_CONTRACT[@]}"
   "${GATES_KV_AND_LANES[@]}"
   "${GATES_LOADER[@]}"
@@ -265,14 +270,36 @@ declared=$(printf '%s\n' "${INTEGRATION_TARGETS[@]}" | sort)
   "integration binaries disagree with INTEGRATION_TARGETS:"$'\n'"on disk: $discovered"$'\n'"declared: $declared"
 
 all_gates=()
-for entry in "${MANIFEST_LIB[@]}"; do all_gates+=("${entry%% *}|lib|${entry##* }"); done
+append_gate() {
+  local needs=$1 target=$2 gate=$3 profile=${4:-}
+  if [ -z "$profile" ]; then
+    case ",$needs," in
+      *,moeckpt,*) profile=routed ;;
+      *,ckpt,*) profile=dense ;;
+      *) profile=device ;;
+    esac
+  fi
+  all_gates+=("$needs|$target|$profile|$gate")
+}
+
+for entry in "${MANIFEST_LIB[@]}"; do
+  append_gate "${entry%% *}" lib "${entry##* }"
+done
 for target in "${INTEGRATION_TARGETS[@]}"; do
   group="GATES_$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')[@]"
   target_names=()
   for entry in "${!group}"; do target_names+=("${entry##* }"); done
   check_membership "integration binary $target" \
     "$(ignored_in --test "$target")" "$(printf '%s\n' "${target_names[@]}" | sort)"
-  for entry in "${!group}"; do all_gates+=("${entry%% *}|$target|${entry##* }"); done
+  for entry in "${!group}"; do
+    append_gate "${entry%% *}" "$target" "${entry##* }"
+  done
+done
+manifest_gate_count=${#all_gates[@]}
+for entry in "${GATES_DENSE_AND_ROUTED[@]}"; do
+  routed_needs=${entry%% *}
+  routed_needs=${routed_needs/ckpt/moeckpt}
+  append_gate "$routed_needs" lib "${entry##* }" routed
 done
 
 filter=${1:-}
@@ -296,25 +323,36 @@ echo "gemma4 gates: prerequisites$demanded"
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"
 [ -z "$ckpt" ] || echo "gemma4 gates: checkpoint $ckpt"
 [ -z "$moe_ckpt" ] || echo "gemma4 gates: routed checkpoint $moe_ckpt"
-echo "gemma4 gates: ${#selected[@]} selected of ${#all_gates[@]} in the manifest"
-printf '  %s\n' "${selected[@]##*|}"
+echo "gemma4 gates: ${#selected[@]} selected executions from $manifest_gate_count manifest gates"
+for entry in "${selected[@]}"; do
+  IFS='|' read -r _needs _target profile gate <<<"$entry"
+  printf '  [%s] %s\n' "$profile" "$gate"
+done
 
 # --- execution: one gate per process, serialized --------------------------
 completed=0
 failed=()
 for entry in "${selected[@]}"; do
-  IFS='|' read -r _needs target gate <<<"$entry"
+  IFS='|' read -r _needs target profile gate <<<"$entry"
   if [ "$target" = lib ]; then
     target_args=(--lib)
   else
     target_args=(--test "$target")
   fi
-  echo "--- $gate"
-  if cargo test --release -p "$CRATE" --features "$FEATURE" "${target_args[@]}" -- \
+  model_env=()
+  case "$profile" in
+    dense) model_env=(env "PEGAINFER_TEST_MODEL_PATH=$ckpt") ;;
+    routed) model_env=(env "PEGAINFER_TEST_MODEL_PATH=$moe_ckpt") ;;
+    device) ;;
+    *) die "unknown execution profile $profile" ;;
+  esac
+  echo "--- [$profile] $gate"
+  if "${model_env[@]}" cargo test --release -p "$CRATE" --features "$FEATURE" \
+      "${target_args[@]}" -- \
       --ignored --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
     completed=$((completed + 1))
   else
-    failed+=("$gate")
+    failed+=("[$profile] $gate")
   fi
 done
 

@@ -17,7 +17,8 @@ use crate::testkit::u32_tensor;
 fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
     let config = Gemma4Config::from_file(&dir).expect("config");
-    let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0, config).expect("load 12B weights");
+    let (weights, _) =
+        Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
     let serve = GemmaServe::new(&ctx, weights, max_context, pages, pages).expect("serve");
     (ctx, serve, dir)
@@ -741,7 +742,7 @@ fn mixed_step_matches_serial() {
 /// lane-written KV matching the sync arm token for token — for a short
 /// prompt and one crossing the sliding window.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint and a GPU"]
+#[ignore = "requires a Gemma 4 checkpoint and a GPU"]
 fn overlapped_prefill_matches_the_sync_step() {
     let (ctx, serve, _dir) = stack_with(2048, 512);
     let mut arena = serve.alloc_step_arena(&ctx, 1, false).expect("step arena");
@@ -1044,7 +1045,7 @@ fn argmax_last(ctx: &DeviceContext, logits: &HiddenStates) -> Result<u32> {
 /// A fixed-width ragged batch must preserve each request's logits as rows move
 /// between steps. Distinct token streams make cross-row reads observable.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint and a GPU"]
+#[ignore = "requires a Gemma 4 checkpoint and a GPU"]
 fn a_ragged_batch_does_not_depend_on_row_order() {
     const STEPS: usize = 10;
     // Three real requests in a four-row arena: the fourth row is the pad
