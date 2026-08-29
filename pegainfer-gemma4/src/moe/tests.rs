@@ -58,42 +58,112 @@ fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapt
 }
 
 struct RoutedReference {
+    experts: usize,
+    top_k: usize,
+    hidden: usize,
+    width: usize,
+    /// Router logits per row, rounded to bf16 as the router GEMM stores them.
+    logits: Vec<f32>,
     index: Vec<i32>,
     weight: Vec<f32>,
     gate: Vec<f32>,
     block: Vec<f32>,
 }
 
+/// One bf16 spacing at `x`'s magnitude. Two logits this close land on the
+/// same or adjacent bf16 values under a different accumulation order, so a
+/// top-k that swaps them is a tie decided by rounding, not a different
+/// computation.
+fn bf16_ulp(x: f32) -> f32 {
+    let magnitude = x.abs().max(f32::MIN_POSITIVE);
+    2f32.powi(magnitude.log2().floor() as i32 - 7)
+}
+
 fn assert_matches_reference(label: &str, capture: &RoutedCapture, reference: &RoutedReference) {
     const WEIGHT_TOLERANCE: f32 = 5e-3;
     const RELATIVE_TOLERANCE: f32 = 2e-2;
+    // Rows whose picks differ only by a bf16-level tie leave the numeric
+    // comparison (their expert set is not the reference's); more than one
+    // row in this many says the input, not the arithmetic, is at fault.
+    const TIED_ROWS_ONE_IN: usize = 8;
 
-    assert_eq!(
-        capture.index,
-        reference.index[..capture.index.len()],
-        "{label}: router picks differ from the reference"
+    let (experts, top_k, hidden, width) = (
+        reference.experts,
+        reference.top_k,
+        reference.hidden,
+        reference.width,
     );
-    let weight_gap = capture
-        .weight
-        .iter()
-        .zip(&reference.weight)
-        .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+    let rows = capture.index.len() / top_k;
+    let mut tied_rows = Vec::new();
+    for row in 0..rows {
+        let slots = row * top_k..(row + 1) * top_k;
+        let mine = &capture.index[slots.clone()];
+        let theirs = &reference.index[slots.clone()];
+        if mine != theirs {
+            let logits = &reference.logits[row * experts..(row + 1) * experts];
+            let only_mine: Vec<i32> = mine
+                .iter()
+                .copied()
+                .filter(|e| !theirs.contains(e))
+                .collect();
+            let only_theirs: Vec<i32> = theirs
+                .iter()
+                .copied()
+                .filter(|e| !mine.contains(e))
+                .collect();
+            let tie = !only_mine.is_empty()
+                && only_mine.len() == only_theirs.len()
+                && only_mine.iter().all(|a| {
+                    only_theirs.iter().all(|b| {
+                        let (la, lb) = (logits[*a as usize], logits[*b as usize]);
+                        (la - lb).abs() <= bf16_ulp(la.abs().max(lb.abs()))
+                    })
+                });
+            assert!(
+                tie,
+                "{label}: row {row} router picks {mine:?} differ from the reference {theirs:?} \
+                 beyond a bf16 tie"
+            );
+            tied_rows.push(row);
+            continue;
+        }
+        let weight_gap = capture.weight[slots.clone()]
+            .iter()
+            .zip(&reference.weight[slots.clone()])
+            .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+        assert!(
+            weight_gap <= WEIGHT_TOLERANCE,
+            "{label}: row {row} router weights differ by {weight_gap:.3e}"
+        );
+        let gate_span = row * top_k * width..(row + 1) * top_k * width;
+        let gate = capture.gate[gate_span.clone()]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect::<Vec<_>>();
+        let gate_gap = relative_gap(&gate, &reference.gate[gate_span]);
+        assert!(
+            gate_gap <= RELATIVE_TOLERANCE,
+            "{label}: row {row} expert GEMM differs from the widened reference by {gate_gap:.3e}"
+        );
+        let block_span = row * hidden..(row + 1) * hidden;
+        let block = capture.block[block_span.clone()]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect::<Vec<_>>();
+        let block_gap = relative_gap(&block, &reference.block[block_span]);
+        assert!(
+            block_gap <= RELATIVE_TOLERANCE,
+            "{label}: row {row} combined block differs from the reference by {block_gap:.3e}"
+        );
+    }
     assert!(
-        weight_gap <= WEIGHT_TOLERANCE,
-        "{label}: router weights differ by {weight_gap:.3e}"
+        tied_rows.len() <= rows / TIED_ROWS_ONE_IN,
+        "{label}: {} of {rows} rows tied at bf16: {tied_rows:?}",
+        tied_rows.len()
     );
-    let gate = capture.gate.iter().map(|x| x.to_f32()).collect::<Vec<_>>();
-    let gate_gap = relative_gap(&gate, &reference.gate[..gate.len()]);
-    assert!(
-        gate_gap <= RELATIVE_TOLERANCE,
-        "{label}: the expert GEMM differs from the widened reference by {gate_gap:.3e}"
-    );
-    let block = capture.block.iter().map(|x| x.to_f32()).collect::<Vec<_>>();
-    let block_gap = relative_gap(&block, &reference.block[..block.len()]);
-    assert!(
-        block_gap <= RELATIVE_TOLERANCE,
-        "{label}: the combined block differs from the reference by {block_gap:.3e}"
-    );
+    if !tied_rows.is_empty() {
+        eprintln!("{label}: rows {tied_rows:?} tied at bf16 and left the numeric comparison");
+    }
 }
 
 /// The routed block against the formulas the reference implements, with
@@ -241,17 +311,27 @@ fn the_routed_block_matches_the_reference_formulas() {
     let mut reference_weight = vec![0.0f32; reference_slots];
     let mut reference_gate = vec![0.0f32; reference_slots * width];
     let mut reference_block = vec![0.0f32; COARSE_TARGET_ROWS * hidden];
+    let mut reference_logits = vec![0.0f32; COARSE_TARGET_ROWS * experts_out];
     for row in 0..COARSE_TARGET_ROWS {
         let residual_row = &residual_f32[row * hidden..(row + 1) * hidden];
-        let router_in = rms(residual_row, Some(&router_scale), eps);
+        // The device rounds the router's input to bf16 twice — the norm's
+        // store and the standalone scalar multiply — and stores its logits as
+        // bf16; the reference rounds at the same three points so a top-k
+        // over near-equal logits is decided on the same values.
         let scale = (hidden as f32).sqrt().recip();
+        let router_in: Vec<f32> = rms(residual_row, Some(&router_scale), eps)
+            .iter()
+            .map(|v| bf16::from_f32(bf16::from_f32(*v).to_f32() * scale).to_f32())
+            .collect();
         let logits: Vec<f32> = (0..experts_out)
             .map(|expert| {
-                (0..hidden)
-                    .map(|i| router_in[i] * scale * router_proj[expert * hidden + i])
-                    .sum()
+                let logit: f32 = (0..hidden)
+                    .map(|i| router_in[i] * router_proj[expert * hidden + i])
+                    .sum();
+                bf16::from_f32(logit).to_f32()
             })
             .collect();
+        reference_logits[row * experts_out..(row + 1) * experts_out].copy_from_slice(&logits);
         let top = logits.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
         let exponentials: Vec<f32> = logits.iter().map(|v| (v - top).exp()).collect();
         let total: f32 = exponentials.iter().sum();
@@ -309,6 +389,11 @@ fn the_routed_block_matches_the_reference_formulas() {
     // accumulation costs at these widths, so a breach is a different
     // computation rather than a different rounding.
     let reference = RoutedReference {
+        experts: experts_out,
+        top_k,
+        hidden,
+        width,
+        logits: reference_logits,
         index: reference_index,
         weight: reference_weight,
         gate: reference_gate,
