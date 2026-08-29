@@ -73,15 +73,20 @@ __global__ void gemma4_moe_router_topk_kernel(
     float win = __shfl_sync(0xffffffff, best, 0);
     int taken = __shfl_sync(0xffffffff, best_at, 0);
     if (taken >= experts) {
+      // No candidate compared true: a non-finite logit poisoned the whole
+      // row through the softmax. The pick stays valid and row-unique and
+      // its weight goes out NaN, so nothing indexes past the arrays.
       taken = k;
       win = NAN;
+    } else if (taken % kRouterBlock == lane) {
+      // A taken slot must lose every later pick, including the lower-expert
+      // tie against `best`'s floor that a -FLT_MAX clear would win once the
+      // rest of the row is NaN; NaN compares false everywhere.
+      held[taken / kRouterBlock] = NAN;
     }
     if (lane == k) {
       my_win = win;
       my_taken = taken;
-    }
-    if (taken < experts && taken % kRouterBlock == lane) {
-      held[taken / kRouterBlock] = -FLT_MAX;
     }
     selected += win;
   }
