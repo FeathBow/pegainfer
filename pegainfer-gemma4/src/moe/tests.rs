@@ -20,6 +20,16 @@ fn gelu_tanh(x: f32) -> f32 {
     0.5 * x * (1.0 + inner.tanh())
 }
 
+/// `f32::max` drops a NaN operand, so a non-finite production value would
+/// vanish from a plain fold; it counts as infinite error here instead.
+fn abs_gap(a: f32, b: f32) -> f32 {
+    if a.is_finite() && b.is_finite() {
+        (a - b).abs()
+    } else {
+        f32::INFINITY
+    }
+}
+
 fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
     let scale = reference
         .iter()
@@ -27,7 +37,7 @@ fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
         .max(1e-6);
     mine.iter()
         .zip(reference)
-        .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()))
+        .fold(0.0f32, |acc, (a, b)| acc.max(abs_gap(*a, *b)))
         / scale
 }
 
@@ -130,7 +140,7 @@ fn assert_matches_reference(label: &str, capture: &RoutedCapture, reference: &Ro
         let weight_gap = capture.weight[slots.clone()]
             .iter()
             .zip(&reference.weight[slots.clone()])
-            .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+            .fold(0.0f32, |acc, (a, b)| acc.max(abs_gap(*a, *b)));
         assert!(
             weight_gap <= WEIGHT_TOLERANCE,
             "{label}: row {row} router weights differ by {weight_gap:.3e}"
