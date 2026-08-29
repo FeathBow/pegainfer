@@ -10,6 +10,9 @@ use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
 
+const GEMMA4_ROUTER_EXPERTS: usize = 128;
+const GEMMA4_ROUTER_MAX_TOP_K: usize = 32;
+
 /// Softmax the router logits over every expert, take the top `top_k`,
 /// renormalize those among themselves, and apply the per-expert scale.
 pub fn gemma4_moe_router_topk_into(
@@ -22,6 +25,11 @@ pub fn gemma4_moe_router_topk_into(
 ) -> Result<()> {
     let rows = logits.seq_len;
     let experts = logits.hidden_dim;
+    ensure!(
+        experts == GEMMA4_ROUTER_EXPERTS && (1..=GEMMA4_ROUTER_MAX_TOP_K).contains(&top_k),
+        "gemma4_moe_router_topk_into: the 128-expert register-router contract requires exactly \
+         128 experts and 1..=32 picks, got {experts} experts and top {top_k}"
+    );
     ensure!(
         rows > 0 && top_k > 0 && top_k <= experts,
         "gemma4_moe_router_topk_into: {rows} rows and top {top_k} of {experts} experts is not \
@@ -333,9 +341,8 @@ mod tests {
 
     use super::*;
 
-    const EXPERTS: usize = 128;
+    const EXPERTS: usize = GEMMA4_ROUTER_EXPERTS;
     const TOP_K: usize = 8;
-    const ROWS: usize = 2;
     const SELECTED: [usize; TOP_K] = [3, 10, 34, 41, 65, 72, 96, 127];
     const SELECTED_LOGIT: f32 = 1.0;
     const BASE_SCALE: f32 = 0.5;
@@ -343,29 +350,73 @@ mod tests {
     const TOP_K_F32: f32 = 8.0;
     const WEIGHT_TOLERANCE: f32 = 2.0e-6;
 
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn router_topk_matches_the_exact_128_expert_contract() {
-        let ctx = DeviceContext::new().expect("CUDA context");
-        let mut logits_host = vec![bf16::ZERO; ROWS * EXPERTS];
-        for expert in SELECTED {
-            logits_host[expert] = bf16::from_f32(SELECTED_LOGIT);
-        }
-        let scale_host = (0..EXPERTS)
+    fn scale_host() -> Vec<bf16> {
+        (0..EXPERTS)
             .map(|expert| {
                 let bucket = u8::try_from(expert % TOP_K).expect("scale bucket");
                 bf16::from_f32(BASE_SCALE + f32::from(bucket) * SCALE_STEP)
             })
-            .collect::<Vec<_>>();
-        let logits = HiddenStates::from_host(&ctx, &logits_host, EXPERTS, ROWS).expect("logits");
-        let scale = DeviceVec::from_host(&ctx, &scale_host).expect("scale");
-        let mut index = ctx.stream.alloc_zeros::<i32>(ROWS * TOP_K).expect("index");
-        let mut weight = ctx.stream.alloc_zeros::<f32>(ROWS * TOP_K).expect("weight");
+            .collect()
+    }
 
-        gemma4_moe_router_topk_into(&ctx, &logits, &scale, TOP_K, &mut index, &mut weight)
+    fn finite_row() -> Vec<bf16> {
+        let mut row = vec![bf16::ZERO; EXPERTS];
+        for expert in SELECTED {
+            row[expert] = bf16::from_f32(SELECTED_LOGIT);
+        }
+        row
+    }
+
+    fn run_router(
+        ctx: &DeviceContext,
+        scale: &DeviceVec,
+        logits_host: &[bf16],
+    ) -> (Vec<i32>, Vec<f32>) {
+        let rows = logits_host.len() / EXPERTS;
+        let logits = HiddenStates::from_host(ctx, logits_host, EXPERTS, rows).expect("logits");
+        let mut index = ctx.stream.alloc_zeros::<i32>(rows * TOP_K).expect("index");
+        let mut weight = ctx.stream.alloc_zeros::<f32>(rows * TOP_K).expect("weight");
+        gemma4_moe_router_topk_into(ctx, &logits, scale, TOP_K, &mut index, &mut weight)
             .expect("router");
-        let index_host = ctx.stream.clone_dtoh(&index).expect("index D2H");
-        let weight_host = ctx.stream.clone_dtoh(&weight).expect("weight D2H");
+        (
+            ctx.stream.clone_dtoh(&index).expect("index D2H"),
+            ctx.stream.clone_dtoh(&weight).expect("weight D2H"),
+        )
+    }
+
+    fn assert_non_finite_row_fails_closed(
+        ctx: &DeviceContext,
+        scale: &DeviceVec,
+        non_finite: &[bf16],
+    ) {
+        let finite = finite_row();
+        let paired_logits = finite.iter().chain(non_finite).copied().collect::<Vec<_>>();
+        let (paired_index, paired_weight) = run_router(ctx, scale, &paired_logits);
+        let (alone_index, alone_weight) = run_router(ctx, scale, &finite);
+        assert_eq!(&paired_index[..TOP_K], alone_index);
+        assert_eq!(
+            paired_weight[..TOP_K]
+                .iter()
+                .map(|weight| weight.to_bits())
+                .collect::<Vec<_>>(),
+            alone_weight
+                .iter()
+                .map(|weight| weight.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let expected_indices = (0..TOP_K as i32).collect::<Vec<_>>();
+        assert_eq!(&paired_index[TOP_K..], expected_indices);
+        assert!(paired_weight[TOP_K..].iter().all(|weight| weight.is_nan()));
+    }
+
+    fn assert_finite_contract(ctx: &DeviceContext, scale: &DeviceVec, scale_host: &[bf16]) {
+        let finite = finite_row();
+        let logits_host = finite
+            .iter()
+            .chain(std::iter::repeat(&bf16::ZERO).take(EXPERTS))
+            .copied()
+            .collect::<Vec<_>>();
+        let (index_host, weight_host) = run_router(ctx, scale, &logits_host);
         let expected_index = SELECTED
             .into_iter()
             .chain(0..TOP_K)
@@ -380,29 +431,53 @@ mod tests {
                 "slot {slot}: {actual} != {expected}"
             );
         }
+    }
 
+    fn assert_invalid_expert_contract(ctx: &DeviceContext) {
         let invalid_experts = EXPERTS - 1;
         let invalid_logits =
-            HiddenStates::from_host(&ctx, &vec![bf16::ZERO; invalid_experts], invalid_experts, 1)
+            HiddenStates::from_host(ctx, &vec![bf16::ZERO; invalid_experts], invalid_experts, 1)
                 .expect("invalid logits");
         let invalid_scale =
-            DeviceVec::from_host(&ctx, &vec![bf16::from_f32(SELECTED_LOGIT); invalid_experts])
+            DeviceVec::from_host(ctx, &vec![bf16::from_f32(SELECTED_LOGIT); invalid_experts])
                 .expect("invalid scale");
         let mut invalid_index = ctx.stream.alloc_zeros::<i32>(TOP_K).expect("invalid index");
         let mut invalid_weight = ctx
             .stream
             .alloc_zeros::<f32>(TOP_K)
             .expect("invalid weight");
-        assert!(
-            gemma4_moe_router_topk_into(
-                &ctx,
-                &invalid_logits,
-                &invalid_scale,
-                TOP_K,
-                &mut invalid_index,
-                &mut invalid_weight,
-            )
-            .is_err()
+        let error = gemma4_moe_router_topk_into(
+            ctx,
+            &invalid_logits,
+            &invalid_scale,
+            TOP_K,
+            &mut invalid_index,
+            &mut invalid_weight,
         );
+        assert_eq!(
+            error.expect_err("127 experts must be rejected").to_string(),
+            "gemma4_moe_router_topk_into: the 128-expert register-router contract requires exactly \
+             128 experts and 1..=32 picks, got 127 experts and top 8"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn router_topk_matches_the_exact_128_expert_contract() {
+        let ctx = DeviceContext::new().expect("CUDA context");
+        let scale_host = scale_host();
+        let scale = DeviceVec::from_host(&ctx, &scale_host).expect("scale");
+        assert_finite_contract(&ctx, &scale, &scale_host);
+
+        let all_negative_infinity = vec![bf16::from_f32(f32::NEG_INFINITY); EXPERTS];
+        assert_non_finite_row_fails_closed(&ctx, &scale, &all_negative_infinity);
+        let finite = finite_row();
+        let mut positive_infinity = finite.clone();
+        positive_infinity[SELECTED[0]] = bf16::from_f32(f32::INFINITY);
+        assert_non_finite_row_fails_closed(&ctx, &scale, &positive_infinity);
+        let mut nan = finite;
+        nan[SELECTED[0]] = bf16::from_f32(f32::NAN);
+        assert_non_finite_row_fails_closed(&ctx, &scale, &nan);
+        assert_invalid_expert_contract(&ctx);
     }
 }

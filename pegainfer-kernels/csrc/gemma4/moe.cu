@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <float.h>
+#include <math.h>
 
 namespace {
 
@@ -69,13 +70,17 @@ __global__ void gemma4_moe_router_topk_kernel(
         best_at = other_at;
       }
     }
-    const float win = __shfl_sync(0xffffffff, best, 0);
-    const int taken = __shfl_sync(0xffffffff, best_at, 0);
+    float win = __shfl_sync(0xffffffff, best, 0);
+    int taken = __shfl_sync(0xffffffff, best_at, 0);
+    if (taken >= experts) {
+      taken = k;
+      win = NAN;
+    }
     if (lane == k) {
       my_win = win;
       my_taken = taken;
     }
-    if (taken % kRouterBlock == lane) {
+    if (taken < experts && taken % kRouterBlock == lane) {
       held[taken / kRouterBlock] = -FLT_MAX;
     }
     selected += win;
