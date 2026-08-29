@@ -510,7 +510,6 @@ pub struct KimiMarlinRouteWorkspace {
     expert_ids: CudaSlice<i32>,
     num_tokens_post_padded: CudaSlice<i32>,
     expert_offsets: CudaSlice<u32>,
-    expert_cursor: CudaSlice<u32>,
     max_active_tokens: usize,
     max_padded_tokens: usize,
     pub max_m_blocks: usize,
@@ -533,7 +532,6 @@ impl KimiMarlinRouteWorkspace {
             expert_ids: ctx.stream.alloc_zeros(max_m_blocks)?,
             num_tokens_post_padded: ctx.stream.alloc_zeros(1)?,
             expert_offsets: ctx.stream.alloc_zeros(KIMI_K2_LOCAL_EXPERTS + 1)?,
-            expert_cursor: ctx.stream.alloc_zeros(KIMI_K2_LOCAL_EXPERTS)?,
             max_active_tokens,
             max_padded_tokens,
             max_m_blocks,
@@ -582,12 +580,6 @@ impl KimiMarlinRouteWorkspace {
             "expert_offsets len must be {}, got {}",
             KIMI_K2_LOCAL_EXPERTS + 1,
             self.expert_offsets.len()
-        );
-        ensure!(
-            self.expert_cursor.len() == KIMI_K2_LOCAL_EXPERTS,
-            "expert_cursor len must be {}, got {}",
-            KIMI_K2_LOCAL_EXPERTS,
-            self.expert_cursor.len()
         );
         ensure!(
             self.topk == KIMI_K2_TOPK && self.local_experts == KIMI_K2_LOCAL_EXPERTS,
@@ -812,7 +804,6 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
         let (num_tokens_ptr, _num_tokens_guard) =
             workspace.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
         let (offsets_ptr, _offsets_guard) = workspace.expert_offsets.device_ptr_mut(&ctx.stream);
-        let (cursor_ptr, _cursor_guard) = workspace.expert_cursor.device_ptr_mut(&ctx.stream);
         let result = unsafe {
             ffi::kimi_moe_marlin_align_block_size_cuda(
                 topk_ptr as *const i32,
@@ -820,7 +811,6 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
                 expert_ids_ptr as *mut i32,
                 num_tokens_ptr as *mut i32,
                 offsets_ptr as *mut u32,
-                cursor_ptr as *mut u32,
                 active_tokens as i32,
                 KIMI_K2_TOPK as i32,
                 global_expert_start as i32,
@@ -1719,7 +1709,6 @@ mod tests {
             let mut expected_sorted = Vec::<i32>::new();
             let mut expected_expert_ids = Vec::<i32>::new();
             let mut expected_offsets = Vec::<u32>::with_capacity(KIMI_K2_LOCAL_EXPERTS + 1);
-            let mut expected_cursor = Vec::<u32>::with_capacity(KIMI_K2_LOCAL_EXPERTS);
             let sentinel = i32::try_from(route_elems).expect("route sentinel");
             for local_expert in 0..KIMI_K2_LOCAL_EXPERTS {
                 expected_offsets.push(u32::try_from(expected_sorted.len()).expect("expert offset"));
@@ -1730,7 +1719,6 @@ mod tests {
                     .filter(|&(_, &expert)| usize::try_from(expert).ok() == Some(global_expert))
                     .map(|(route_offset, _)| i32::try_from(route_offset).expect("route offset"))
                     .collect::<Vec<_>>();
-                expected_cursor.push(u32::try_from(routes.len()).expect("expert routes"));
                 if routes.is_empty() {
                     continue;
                 }
@@ -1751,13 +1739,6 @@ mod tests {
                 expected_expert_ids.as_slice()
             );
             assert_eq!(expert_offsets, expected_offsets);
-            if route_elems == SMALL_PATH_ROUTES {
-                let expert_cursor = ctx
-                    .stream
-                    .clone_dtoh(&workspace.expert_cursor)
-                    .expect("expert_cursor D2H");
-                assert_eq!(expert_cursor, expected_cursor);
-            }
 
             let attrs: std::collections::HashMap<&str, &str> = call
                 .attrs

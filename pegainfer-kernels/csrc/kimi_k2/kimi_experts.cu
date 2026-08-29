@@ -43,7 +43,6 @@ CUresult kimi_moe_marlin_align_block_size_cuda(
     int* expert_ids,
     int* num_tokens_post_padded,
     uint32_t* expert_offsets,
-    uint32_t* expert_cursor,
     int active_tokens,
     int topk,
     int global_start,
@@ -57,8 +56,8 @@ CUresult kimi_moe_marlin_align_block_size_cuda(
   }
   return marlin_moe_align_block_size_cuda(
       topk_idx, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      expert_offsets, expert_cursor, active_tokens, topk, global_start,
-      local_experts, block_size, max_padded_tokens, max_m_blocks, stream);
+      expert_offsets, active_tokens, topk, global_start, local_experts,
+      block_size, max_padded_tokens, max_m_blocks, stream);
 }
 
 CUresult kimi_add_f32_bf16_to_bf16_cuda(

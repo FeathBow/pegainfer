@@ -22,7 +22,6 @@ __global__ void marlin_moe_align_small_kernel(
     int* __restrict__ expert_ids,
     int* __restrict__ num_tokens_post_padded,
     uint32_t* __restrict__ expert_offsets,
-    uint32_t* __restrict__ expert_cursor,
     int route_elems,
     int global_start,
     int local_experts,
@@ -76,7 +75,6 @@ __global__ void marlin_moe_align_small_kernel(
       sorted_token_ids[pos] = route_elems;
     }
     expert_offsets[local_expert] = starts[local_expert];
-    expert_cursor[local_expert] = counts[local_expert];
   }
 }
 
@@ -172,7 +170,6 @@ CUresult marlin_moe_align_block_size_cuda(
     int* expert_ids,
     int* num_tokens_post_padded,
     uint32_t* expert_offsets,
-    uint32_t* expert_cursor,
     int active_tokens,
     int topk,
     int global_start,
@@ -182,8 +179,7 @@ CUresult marlin_moe_align_block_size_cuda(
     int max_m_blocks,
     cudaStream_t stream) {
   if (topk_idx == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
-      num_tokens_post_padded == nullptr || expert_offsets == nullptr ||
-      expert_cursor == nullptr) {
+      num_tokens_post_padded == nullptr || expert_offsets == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (active_tokens <= 0 || topk <= 0 || global_start < 0 || local_experts <= 0) {
@@ -204,7 +200,7 @@ CUresult marlin_moe_align_block_size_cuda(
     size_t shared = (2ull * static_cast<size_t>(local_experts) + 1) * sizeof(uint32_t);
     marlin_moe_align_small_kernel<<<1, threads, shared, stream>>>(
         topk_idx, sorted_token_ids, expert_ids, num_tokens_post_padded, expert_offsets,
-        expert_cursor, route_elems, global_start, local_experts, block_size);
+        route_elems, global_start, local_experts, block_size);
     cudaError_t err = cudaGetLastError();
     return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
   }

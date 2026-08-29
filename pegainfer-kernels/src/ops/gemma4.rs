@@ -274,7 +274,6 @@ pub struct MoeAlignScratch<'a> {
     pub expert_ids: &'a mut CudaSlice<i32>,
     pub num_tokens_post_padded: &'a mut CudaSlice<i32>,
     pub expert_offsets: &'a mut CudaSlice<u32>,
-    pub expert_cursor: &'a mut CudaSlice<u32>,
 }
 
 /// Group the routed slots into the kernel's fixed-width blocks, on the device.
@@ -298,8 +297,7 @@ pub fn marlin_moe_align_block_size(
     ensure!(
         topk_idx.len() >= routes
             && !out.num_tokens_post_padded.is_empty()
-            && out.expert_offsets.len() > experts
-            && out.expert_cursor.len() >= experts,
+            && out.expert_offsets.len() > experts,
         "marlin_moe_align_block_size scratch too small for {routes} routes over {experts} experts"
     );
     ensure!(
@@ -312,7 +310,6 @@ pub fn marlin_moe_align_block_size(
     let (expert_ptr, _expert_guard) = out.expert_ids.device_ptr_mut(&ctx.stream);
     let (padded_ptr, _padded_guard) = out.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
     let (offsets_ptr, _offsets_guard) = out.expert_offsets.device_ptr_mut(&ctx.stream);
-    let (cursor_ptr, _cursor_guard) = out.expert_cursor.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::marlin_moe_align_block_size_cuda(
             idx_ptr as *const i32,
@@ -320,7 +317,6 @@ pub fn marlin_moe_align_block_size(
             expert_ptr as *mut i32,
             padded_ptr as *mut i32,
             offsets_ptr as *mut u32,
-            cursor_ptr as *mut u32,
             i32::try_from(rows)?,
             i32::try_from(top_k)?,
             0,

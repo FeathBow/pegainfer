@@ -112,7 +112,6 @@ pub(crate) struct MoeScratch {
     dense_normed: HiddenStates,
     expert_normed: HiddenStates,
     expert_offsets: CudaSlice<u32>,
-    expert_cursor: CudaSlice<u32>,
 }
 
 impl MoeScratch {
@@ -146,7 +145,6 @@ impl MoeScratch {
             dense_normed: hidden(max_rows)?,
             expert_normed: hidden(max_rows)?,
             expert_offsets: ctx.stream.alloc_zeros::<u32>(moe.num_experts + 1)?,
-            expert_cursor: ctx.stream.alloc_zeros::<u32>(moe.num_experts)?,
         })
     }
 
@@ -262,7 +260,6 @@ pub(crate) fn moe_into(
             expert_ids: &mut scratch.expert_ids,
             num_tokens_post_padded: &mut scratch.padded_total,
             expert_offsets: &mut scratch.expert_offsets,
-            expert_cursor: &mut scratch.expert_cursor,
         },
     )?;
 
