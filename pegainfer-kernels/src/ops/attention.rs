@@ -602,9 +602,19 @@ pub fn prefill_attention_paged_into(
     let kv_dim = num_kv_heads * head_dim;
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "paged prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
 
     let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
     let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
@@ -1237,9 +1247,19 @@ pub fn paged_attention_batch_decode_into(
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -1387,9 +1407,19 @@ pub fn paged_attention_batch_decode_split_kv_into(
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch split-K decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -1505,9 +1535,19 @@ fn scatter_decode_kv_into_paged(
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        op_name,
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
@@ -1577,9 +1617,19 @@ pub fn paged_attention_batch_decode_hd256_into(
     debug_assert_eq!(head_dim, 256);
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -1684,9 +1734,19 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
         "batch hd256 decode via prefill",
     )?;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 decode via prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
@@ -2124,9 +2184,19 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
         "batch hd512 decode via prefill",
     )?;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd512 decode via prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -2276,9 +2346,19 @@ pub fn batch_prefill_paged_hd512_into(
         kernel_cta_tile_q
     );
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "hd512 prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -2775,12 +2855,19 @@ fn checked_paged_geometry(
         "{what} layout.num_kv_heads {} != num_kv_heads {num_kv_heads}",
         layout.num_kv_heads
     );
+    // A zero head_dim makes every stride zero, and `pool_len / page_stride`
+    // below would panic on a layout that is otherwise self-consistent.
     anyhow::ensure!(
-        layout.page_size > 0 && layout.num_kv_heads > 0 && layout.num_layers > 0,
-        "{what} layout dims must be positive: page_size {} num_kv_heads {} num_layers {}",
+        layout.page_size > 0
+            && layout.num_kv_heads > 0
+            && layout.num_layers > 0
+            && layout.head_dim > 0,
+        "{what} layout dims must be positive: page_size {} num_kv_heads {} num_layers {} \
+         head_dim {}",
         layout.page_size,
         layout.num_kv_heads,
-        layout.num_layers
+        layout.num_layers,
+        layout.head_dim
     );
     let kv_block_len = layout
         .page_size
