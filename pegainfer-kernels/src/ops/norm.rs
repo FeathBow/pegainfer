@@ -206,6 +206,44 @@ pub fn rms_norm_batch_dual_into(
     }
 }
 
+/// The MoE combine tail in one launch: `out = rms_norm(a, weight_a) +
+/// rms_norm(b, weight_b)`, bitwise what the two separate norms and the add
+/// it replaces produce.
+pub fn dual_rms_norm_add_batch_into(
+    ctx: &DeviceContext,
+    a: &HiddenStates,
+    weight_a: &DeviceVec,
+    b: &HiddenStates,
+    weight_b: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) {
+    assert_eq!(weight_a.len, a.hidden_dim);
+    assert_eq!(weight_b.len, a.hidden_dim);
+    assert_eq!(b.hidden_dim, a.hidden_dim);
+    assert_eq!(b.seq_len, a.seq_len);
+    assert_eq!(out.hidden_dim, a.hidden_dim);
+    assert_eq!(out.seq_len, a.seq_len);
+    let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
+    let (wa_ptr, _gwa) = weight_a.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
+    let (wb_ptr, _gwb) = weight_b.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::dual_rms_norm_add_batched_cuda(
+            a_ptr as *const ffi::Half,
+            wa_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            wb_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            a.hidden_dim as i32,
+            a.seq_len as i32,
+            eps,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+}
+
 /// The attention epilogue's norm pair in one launch:
 /// `residual_out = bf16(rms_norm(x, weight_post) + res_in)` then
 /// `out = rms_norm(residual_out, weight_pre)`, bitwise what the separate
@@ -637,5 +675,27 @@ mod parity {
         .expect("fused pair");
         assert_bitwise(&ctx, &residual, &fused_res, "fused epilogue residual");
         assert_bitwise(&ctx, &mlp_in, &fused_mlp, "fused epilogue mlp input");
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_moe_combine_tail_matches_its_parts() {
+        let ctx = DeviceContext::new_with_device(0).expect("device");
+        let (d, rows, eps) = (2816usize, 16usize, 1e-6f32);
+        let a = seeded(&ctx, d, rows, 0);
+        let b = seeded(&ctx, d, rows, 1);
+        let wa = seeded_weight(&ctx, d, 0);
+        let wb = seeded_weight(&ctx, d, 1);
+
+        let mut na = HiddenStates::zeros(&ctx, d, rows).expect("na");
+        let mut nb = HiddenStates::zeros(&ctx, d, rows).expect("nb");
+        rms_norm_batch_into(&ctx, &a, &wa, eps, &mut na);
+        rms_norm_batch_into(&ctx, &b, &wb, eps, &mut nb);
+        let mut split = HiddenStates::zeros(&ctx, d, rows).expect("split");
+        crate::ops::add_batch_into(&ctx, &na, &nb, &mut split).expect("add");
+
+        let mut fused = HiddenStates::zeros(&ctx, d, rows).expect("fused");
+        dual_rms_norm_add_batch_into(&ctx, &a, &wa, &b, &wb, eps, &mut fused);
+        assert_bitwise(&ctx, &split, &fused, "fused MoE combine");
     }
 }
