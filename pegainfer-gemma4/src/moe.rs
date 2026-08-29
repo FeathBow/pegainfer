@@ -24,11 +24,17 @@ use pegainfer_kernels::ops::gemma4_moe_router_topk_into;
 use pegainfer_kernels::ops::gemma4_moe_sum_topk_into;
 use pegainfer_kernels::ops::marlin_moe_align_block_size;
 
+use crate::config::MoeConfig;
 use crate::layer::LayerGeometry;
 use crate::weights::Gemma4Moe;
 
+// Sixteen is the narrowest M block with a complete compiled kernel table.
 const DECODE_BLOCK: usize = 16;
+// The `thread_m_blocks = 4` instantiations let one weight stripe serve four
+// times as many rows through their 64-row M block.
 const PREFILL_BLOCK: usize = 64;
+// This first power of two above decode's 16 rows x 8 picks = 128 slots is a
+// floor that keeps decode out, not a measured crossover.
 const PREFILL_MIN_SLOTS: usize = 256;
 
 fn marlin_block(slots: usize) -> usize {
@@ -41,6 +47,48 @@ fn marlin_block(slots: usize) -> usize {
 
 /// Marlin's lock array is one int per 64-wide output tile per row block.
 const TILE_N: usize = 64;
+
+struct MoeScratchSizes {
+    slots: usize,
+    blocks: usize,
+    padded: usize,
+    locks: usize,
+    c_tmp: usize,
+}
+
+fn checked_mul(left: usize, right: usize, quantity: &str) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: MoE scratch {quantity} overflows usize"))
+}
+
+fn checked_add(left: usize, right: usize, quantity: &str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: MoE scratch {quantity} overflows usize"))
+}
+
+fn scratch_sizes(max_rows: usize, moe: &MoeConfig, hidden_size: usize) -> Result<MoeScratchSizes> {
+    let slots = checked_mul(max_rows, moe.top_k, "routed slots")?;
+    let blocks = checked_add(
+        slots.div_ceil(DECODE_BLOCK),
+        moe.num_experts,
+        "expert blocks",
+    )?;
+    let narrow_padded = checked_mul(blocks, DECODE_BLOCK, "decode padded rows")?;
+    let padded = if slots >= PREFILL_MIN_SLOTS {
+        let expert_padding = checked_mul(moe.num_experts, PREFILL_BLOCK, "prefill expert padding")?;
+        let coarse_padded = checked_add(slots, expert_padding, "prefill padded rows")?;
+        narrow_padded.max(coarse_padded)
+    } else {
+        narrow_padded
+    };
+    Ok(MoeScratchSizes {
+        slots,
+        blocks,
+        padded,
+        locks: checked_mul(hidden_size / TILE_N, blocks, "Marlin lock elements")?,
+        c_tmp: checked_mul(hidden_size, padded, "Marlin c_tmp elements")?,
+    })
+}
 
 /// Buffers one [`moe_into`] call needs, sized for the widest step the server
 /// admits.
@@ -75,29 +123,25 @@ impl MoeScratch {
             .ok_or_else(|| anyhow::anyhow!("Gemma 4: no MoE scratch without a routed config"))?;
         let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
         let narrow = |rows| HiddenStates::zeros(ctx, moe.intermediate_size, rows);
-        let slots = max_rows * moe.top_k;
-        let max_blocks = slots.div_ceil(DECODE_BLOCK) + moe.num_experts;
-        let max_padded = (max_blocks * DECODE_BLOCK).max(slots + moe.num_experts * PREFILL_BLOCK);
+        let sizes = scratch_sizes(max_rows, moe, geom.hidden_size)?;
         Ok(Self {
             max_rows,
             router_in: hidden(max_rows)?,
             logits: HiddenStates::zeros(ctx, moe.num_experts, max_rows)?,
-            index: ctx.stream.alloc_zeros::<i32>(slots)?,
-            weight: ctx.stream.alloc_zeros::<f32>(slots)?,
-            sorted_token_ids: ctx.stream.alloc_zeros::<i32>(max_padded)?,
-            expert_ids: ctx.stream.alloc_zeros::<i32>(max_blocks)?,
+            index: ctx.stream.alloc_zeros::<i32>(sizes.slots)?,
+            weight: ctx.stream.alloc_zeros::<f32>(sizes.slots)?,
+            sorted_token_ids: ctx.stream.alloc_zeros::<i32>(sizes.padded)?,
+            expert_ids: ctx.stream.alloc_zeros::<i32>(sizes.blocks)?,
             padded_total: ctx.stream.alloc_zeros::<i32>(1)?,
-            locks: ctx
-                .stream
-                .alloc_zeros::<i32>(geom.hidden_size / TILE_N * max_blocks)?,
-            c_tmp: ctx
-                .stream
-                .alloc_zeros::<f32>(geom.hidden_size * max_padded)?,
+            locks: ctx.stream.alloc_zeros::<i32>(sizes.locks)?,
+            // The shared launcher refuses null staging even though Gemma's
+            // whole-column schedule never writes it.
+            c_tmp: ctx.stream.alloc_zeros::<f32>(sizes.c_tmp)?,
             moe_in: hidden(max_rows)?,
-            routed_gate: narrow(slots)?,
-            routed_up: narrow(slots)?,
-            routed_act: narrow(slots)?,
-            routed_down: hidden(slots)?,
+            routed_gate: narrow(sizes.slots)?,
+            routed_up: narrow(sizes.slots)?,
+            routed_act: narrow(sizes.slots)?,
+            routed_down: hidden(sizes.slots)?,
             expert_out: hidden(max_rows)?,
             dense_normed: hidden(max_rows)?,
             expert_normed: hidden(max_rows)?,
