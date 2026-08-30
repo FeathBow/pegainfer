@@ -294,36 +294,59 @@ pub fn select_batch(
     Ok(tokens)
 }
 
-fn validate_greedy_stage(
+fn validate_greedy_shape(
     logits: &HiddenStates,
     rows: usize,
-    slot: usize,
     scratch: &SampleScratch,
 ) -> Result<()> {
-    ensure!(rows > 0, "greedy_stage_resident: empty batch");
+    ensure!(rows > 0, "greedy_argmax_ids: empty batch");
     ensure!(
         rows <= scratch.max_rows,
-        "greedy_stage_resident: {rows} rows exceeds scratch capacity {}",
+        "greedy_argmax_ids: {rows} rows exceeds scratch capacity {}",
         scratch.max_rows
     );
     ensure!(
         logits.seq_len >= rows && logits.hidden_dim == scratch.vocab,
-        "greedy_stage_resident: logits shape {}x{} cannot serve {rows} rows x vocab {}",
+        "greedy_argmax_ids: logits shape {}x{} cannot serve {rows} rows x vocab {}",
         logits.seq_len,
         logits.hidden_dim,
         scratch.vocab
     );
-    ensure!(
-        slot < STAGED_READBACK_SLOTS,
-        "greedy_stage_resident: slot {slot} out of range"
-    )
+    Ok(())
 }
 
-fn stage_greedy_readback(
+/// Capturable argmax and device copy into the next embedding's id buffer.
+pub fn greedy_argmax_ids(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    rows: usize,
+    ids_out: &mut CudaSlice<u32>,
+    scratch: &mut SampleScratch,
+) -> Result<()> {
+    validate_greedy_shape(logits, rows, scratch)?;
+    argmax_batch_bf16_split_indexed_into(
+        ctx,
+        logits,
+        &scratch.identity_rows,
+        rows,
+        &mut scratch.argmax_partial_values,
+        &mut scratch.argmax_partial_indices,
+        &mut scratch.top1_values,
+        &mut scratch.argmax_out,
+    )?;
+    pegainfer_kernels::tensor::memcpy_dtod_u32_from_i32(ctx, &scratch.argmax_out, ids_out, rows)
+}
+
+/// Queue the pinned readback outside the sampler graph.
+pub fn greedy_stage_readback(
     ctx: &DeviceContext,
     slot: usize,
     scratch: &mut SampleScratch,
 ) -> Result<()> {
+    ensure!(
+        slot < STAGED_READBACK_SLOTS,
+        "greedy_stage_readback: slot {slot} out of range"
+    );
     let host = if slot == 0 {
         &mut scratch.argmax_host
     } else {
@@ -331,7 +354,7 @@ fn stage_greedy_readback(
     };
     ctx.stream
         .memcpy_dtoh(&scratch.argmax_out, host)
-        .map_err(|e| anyhow!("greedy_stage_resident D2H stage failed: {e}"))
+        .map_err(|e| anyhow!("greedy_stage_readback D2H stage failed: {e}"))
 }
 
 /// Argmax every row, leave the picks in the next embedding's id buffer, and
@@ -344,19 +367,8 @@ pub fn greedy_stage_resident(
     slot: usize,
     scratch: &mut SampleScratch,
 ) -> Result<()> {
-    validate_greedy_stage(logits, rows, slot, scratch)?;
-    argmax_batch_bf16_split_indexed_into(
-        ctx,
-        logits,
-        &scratch.identity_rows,
-        rows,
-        &mut scratch.argmax_partial_values,
-        &mut scratch.argmax_partial_indices,
-        &mut scratch.top1_values,
-        &mut scratch.argmax_out,
-    )?;
-    pegainfer_kernels::tensor::memcpy_dtod_u32_from_i32(ctx, &scratch.argmax_out, ids_out, rows)?;
-    stage_greedy_readback(ctx, slot, scratch)
+    greedy_argmax_ids(ctx, logits, rows, ids_out, scratch)?;
+    greedy_stage_readback(ctx, slot, scratch)
 }
 
 /// Collect a readback staged into one of the two pinned slots.

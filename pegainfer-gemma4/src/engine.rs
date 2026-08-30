@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
+use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
@@ -802,6 +803,8 @@ struct EngineState {
     sample_nonce: u64,
     /// Present only while the active row order is frozen.
     pipeline: Option<PendingDecode>,
+    /// Captured suppression, argmax and id-copy chain per decode bucket.
+    sampler_graphs: Vec<CudaGraphState>,
     /// The overlap lane; `None` unless `PEGAINFER_ASYNC_PREFILL` opted in
     /// at startup.
     lane: Option<AsyncPrefillLane>,
@@ -956,10 +959,28 @@ impl EngineState {
                 ))
             })?;
         let prefix_cache = cache_cap.map(|k| PrefixCache::new(k, sliding_window));
-        let scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
+        let mut scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
         let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
         serve.precapture_decode_graphs(&ctx, &mut arena)?;
         let suppress_ids = ops::SuppressIds::upload(&ctx, &policy.suppress, vocab)?;
+        let mut sampler_graphs = Vec::new();
+        if graph_enabled {
+            let (logits, ids) = arena.logits_and_ids();
+            let mut bucket = 1usize;
+            while bucket <= arena_rows {
+                logits.seq_len = bucket;
+                ops::suppress_logits_bf16_in_place(&ctx, logits, &suppress_ids)?;
+                pegainfer_sample::greedy_argmax_ids(&ctx, logits, bucket, ids, &mut scratch)?;
+                let mut graph = CudaGraphState::new();
+                graph.capture_only(&ctx, || {
+                    ops::suppress_logits_bf16_in_place(&ctx, logits, &suppress_ids)?;
+                    pegainfer_sample::greedy_argmax_ids(&ctx, logits, bucket, ids, &mut scratch)
+                })?;
+                sampler_graphs.push(graph);
+                bucket *= 2;
+            }
+            ctx.sync()?;
+        }
         let lane = lane_mode
             .map(|mode| AsyncPrefillLane::new(&ctx, mode))
             .transpose()?;
@@ -974,6 +995,7 @@ impl EngineState {
             base_seed,
             sample_nonce: 0,
             pipeline: None,
+            sampler_graphs,
             lane,
             mix_chunk,
             max_context,
@@ -1789,19 +1811,29 @@ impl EngineState {
                     .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)?;
             }
         }
-        let (logits, ids) = self.arena.logits_and_ids();
-        ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
-            .context("suppression")?;
-        self.sample_nonce = self.sample_nonce.wrapping_add(1);
-        pegainfer_sample::greedy_stage_resident(
-            &self.ctx,
-            logits,
-            rows,
-            ids,
-            slot,
-            &mut self.scratch,
-        )
-        .context("stage greedy picks")?;
+        let graph_slot = rows.next_power_of_two().trailing_zeros() as usize;
+        if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {
+            graph
+                .launch_captured(&self.ctx)
+                .context("launch sampler graph")?;
+            self.sample_nonce = self.sample_nonce.wrapping_add(1);
+            pegainfer_sample::greedy_stage_readback(&self.ctx, slot, &mut self.scratch)
+                .context("stage greedy readback")?;
+        } else {
+            let (logits, ids) = self.arena.logits_and_ids();
+            ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
+                .context("suppression")?;
+            self.sample_nonce = self.sample_nonce.wrapping_add(1);
+            pegainfer_sample::greedy_stage_resident(
+                &self.ctx,
+                logits,
+                rows,
+                ids,
+                slot,
+                &mut self.scratch,
+            )
+            .context("stage greedy picks")?;
+        }
         Ok(rows)
     }
 
