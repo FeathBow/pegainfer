@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Maintainer runner for the Gemma 4 checkpoint-backed gates.
+# Maintainer runner for the Gemma 4 checkpoint-backed gates and the kernels
+# crate's Gemma router contract.
 #
-# The gates below need a real checkpoint, its fixtures and a device, so CI
-# only compiles them. This script owns their execution: it refuses to start
-# unless every prerequisite is present, it holds the discovered gate set
-# against the manifest here so a gate cannot quietly leave the suite. It
-# claims one physical device for the suite's lifetime and runs one gate per
-# process — repeated checkpoint loads in one test binary exhaust a 48 GiB card.
+# The checkpoint-backed gates need real weights, fixtures and a device; the
+# kernels router contract needs only a device. This script owns their execution:
+# it refuses to start unless every prerequisite is present, it holds each
+# discovered gate set against the manifest here so a gate cannot quietly leave
+# the suite. It claims one physical device for the suite's lifetime and runs one
+# gate per process — repeated checkpoint loads in one test binary exhaust a
+# 48 GiB card.
 #
 #   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
 #     PEGAINFER_NVFP4_MODEL=<routed-checkpoint> \
@@ -17,6 +19,7 @@
 set -uo pipefail
 
 CRATE=pegainfer-gemma4
+KERNELS_CRATE=pegainfer-kernels
 FEATURE=gemma4
 GPU_LOCK_ROOT=/tmp
 
@@ -75,6 +78,10 @@ GATES_DEVICE=(
 )
 GATES_ROUTED=(
   "gpu,moeckpt moe::tests::the_routed_block_matches_the_reference_formulas"
+)
+# These live in pegainfer-kernels under the gemma4 feature and need no checkpoint.
+GATES_KERNELS=(
+  "gpu ops::gemma4::tests::router_topk_matches_the_exact_128_expert_contract"
 )
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
@@ -244,7 +251,9 @@ PY
 
 # --- membership: the crate's ignored set must be exactly the manifest ------
 ignored_in() {
-  cargo test --release -p "$CRATE" --features "$FEATURE" "$@" -- \
+  local crate=$1
+  shift
+  cargo test --release -p "$crate" --features "$FEATURE" "$@" -- \
     --ignored --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
 }
 
@@ -256,11 +265,18 @@ check_membership() {
   [ -z "$extra" ] || die "$what has ignored gates the manifest does not name:"$'\n'"$extra"
 }
 
-lib_listing=$(ignored_in --lib)
+lib_listing=$(ignored_in "$CRATE" --lib)
 [ -n "$lib_listing" ] || die "could not list the library's ignored gates"
 lib_names=()
 for entry in "${MANIFEST_LIB[@]}"; do lib_names+=("${entry##* }"); done
 check_membership "library" "$lib_listing" "$(printf '%s\n' "${lib_names[@]}" | sort)"
+
+kernels_listing=$(ignored_in "$KERNELS_CRATE" --lib)
+[ -n "$kernels_listing" ] || die "could not list the kernels library's ignored gates"
+kernels_names=()
+for entry in "${GATES_KERNELS[@]}"; do kernels_names+=("${entry##* }"); done
+check_membership "kernels library" "$kernels_listing" \
+  "$(printf '%s\n' "${kernels_names[@]}" | sort)"
 
 # The integration binaries the crate actually has, so adding one without a
 # manifest entry fails here instead of leaving its gates unowned.
@@ -290,10 +306,13 @@ for target in "${INTEGRATION_TARGETS[@]}"; do
   target_names=()
   for entry in "${!group}"; do target_names+=("${entry##* }"); done
   check_membership "integration binary $target" \
-    "$(ignored_in --test "$target")" "$(printf '%s\n' "${target_names[@]}" | sort)"
+    "$(ignored_in "$CRATE" --test "$target")" "$(printf '%s\n' "${target_names[@]}" | sort)"
   for entry in "${!group}"; do
     append_gate "${entry%% *}" "$target" "${entry##* }"
   done
+done
+for entry in "${GATES_KERNELS[@]}"; do
+  append_gate "${entry%% *}" kernels "${entry##* }"
 done
 manifest_gate_count=${#all_gates[@]}
 for entry in "${GATES_DENSE_AND_ROUTED[@]}"; do
@@ -334,7 +353,11 @@ completed=0
 failed=()
 for entry in "${selected[@]}"; do
   IFS='|' read -r _needs target profile gate <<<"$entry"
-  if [ "$target" = lib ]; then
+  test_crate=$CRATE
+  if [ "$target" = kernels ]; then
+    test_crate=$KERNELS_CRATE
+    target_args=(--lib)
+  elif [ "$target" = lib ]; then
     target_args=(--lib)
   else
     target_args=(--test "$target")
@@ -347,7 +370,7 @@ for entry in "${selected[@]}"; do
     *) die "unknown execution profile $profile" ;;
   esac
   echo "--- [$profile] $gate"
-  if "${model_env[@]}" cargo test --release -p "$CRATE" --features "$FEATURE" \
+  if "${model_env[@]}" cargo test --release -p "$test_crate" --features "$FEATURE" \
       "${target_args[@]}" -- \
       --ignored --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
     completed=$((completed + 1))
