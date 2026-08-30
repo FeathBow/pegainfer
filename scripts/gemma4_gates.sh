@@ -90,6 +90,15 @@ GATES_KERNELS=(
   "gpu ops::norm::parity::the_epilogue_norm_pair_matches_its_parts"
   "gpu ops::norm::parity::the_moe_combine_tail_matches_its_parts"
 )
+GATES_KERNELS_HD256_FP8_POOL=(
+  "gpu fp8_prep_stores_exact_bytes_at_layout_offsets"
+  "gpu fp8_decode_prep_stores_exact_bytes_at_layout_offsets"
+  "gpu fp8_window_read_matches_bf16_for_exact_values"
+  "gpu fp8_finite_window_read_matches_bf16_and_changes_the_result"
+  "gpu fp8_window_read_is_geometry_invariant_for_the_probed_row"
+  "gpu varied_fp8_window_read_is_geometry_invariant_for_the_probed_row"
+  "gpu decode_wrapper_without_fp8_twin_refuses_e4m3"
+)
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
   "${GATES_ADMISSION[@]}"
@@ -267,6 +276,13 @@ ignored_in() {
     --ignored --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
 }
 
+listed_in() {
+  local crate=$1
+  shift
+  cargo test --release -p "$crate" --features "$FEATURE" "$@" -- \
+    --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
+}
+
 check_membership() {
   local what=$1 listing=$2 expected=$3 missing extra
   missing=$(comm -13 <(printf '%s\n' "$listing") <(printf '%s\n' "$expected"))
@@ -287,6 +303,13 @@ kernels_names=()
 for entry in "${GATES_KERNELS[@]}"; do kernels_names+=("${entry##* }"); done
 check_membership "kernels library" "$kernels_listing" \
   "$(printf '%s\n' "${kernels_names[@]}" | sort)"
+
+kernels_pool_listing=$(listed_in "$KERNELS_CRATE" --test hd256_fp8_pool)
+[ -n "$kernels_pool_listing" ] || die "could not list the kernels hd256_fp8_pool integration gates"
+kernels_pool_names=()
+for entry in "${GATES_KERNELS_HD256_FP8_POOL[@]}"; do kernels_pool_names+=("${entry##* }"); done
+check_membership "kernels integration binary hd256_fp8_pool" "$kernels_pool_listing" \
+  "$(printf '%s\n' "${kernels_pool_names[@]}" | sort)"
 
 # The integration binaries the crate actually has, so adding one without a
 # manifest entry fails here instead of leaving its gates unowned.
@@ -323,6 +346,9 @@ for target in "${INTEGRATION_TARGETS[@]}"; do
 done
 for entry in "${GATES_KERNELS[@]}"; do
   append_gate "${entry%% *}" kernels "${entry##* }"
+done
+for entry in "${GATES_KERNELS_HD256_FP8_POOL[@]}"; do
+  append_gate "${entry%% *}" kernels:hd256_fp8_pool "${entry##* }"
 done
 manifest_gate_count=${#all_gates[@]}
 for entry in "${GATES_DENSE_AND_ROUTED[@]}"; do
@@ -364,9 +390,16 @@ failed=()
 for entry in "${selected[@]}"; do
   IFS='|' read -r _needs target profile gate <<<"$entry"
   test_crate=$CRATE
+  require_gpu_env=0
+  ignored_args=(--ignored)
   if [ "$target" = kernels ]; then
     test_crate=$KERNELS_CRATE
     target_args=(--lib)
+  elif [[ $target == kernels:* ]]; then
+    test_crate=$KERNELS_CRATE
+    target_args=(--test "${target#kernels:}")
+    require_gpu_env=1
+    ignored_args=()
   elif [ "$target" = lib ]; then
     target_args=(--lib)
   else
@@ -379,10 +412,13 @@ for entry in "${selected[@]}"; do
     device) ;;
     *) die "unknown execution profile $profile" ;;
   esac
+  if [ "$require_gpu_env" -eq 1 ]; then
+    model_env=(env PEGAINFER_REQUIRE_GPU=1)
+  fi
   echo "--- [$profile] $gate"
   if "${model_env[@]}" cargo test --release -p "$test_crate" --features "$FEATURE" \
       "${target_args[@]}" -- \
-      --ignored --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
+      "${ignored_args[@]}" --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
     completed=$((completed + 1))
   else
     failed+=("[$profile] $gate")

@@ -2484,12 +2484,13 @@ mod lane_tests {
         }
     }
 
-    const SERVING_KNOBS: [&str; 5] = [
+    const SERVING_KNOBS: [&str; 6] = [
         "PEGAINFER_ASYNC_PREFILL",
         "PEGAINFER_PREFIX_CACHE",
         "PEGAINFER_MIX_CHUNK_TOKENS",
         "PEGAINFER_MAX_CONTEXT",
         "PEGAINFER_DECODE_SLOTS",
+        "PEGAINFER_KV_FP8",
     ];
 
     /// Clear every serving knob, set `overrides`, and hand back the guard
