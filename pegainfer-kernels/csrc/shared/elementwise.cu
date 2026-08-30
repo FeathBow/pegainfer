@@ -929,11 +929,11 @@ CUresult advance_decode_metadata_cuda(
     int *positions, int *local_last, int *pseudo_last, int *kv_chunk,
     int rows, int factor, cudaStream_t stream) {
   if (positions == nullptr || local_last == nullptr || pseudo_last == nullptr ||
-      kv_chunk == nullptr || rows <= 0 || factor <= 0) {
+      kv_chunk == nullptr || rows <= 0 || factor <= 0 || rows > INT_MAX / factor) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   int block = ADVANCE_DECODE_METADATA_BLOCK;
-  int grid = (rows + block - 1) / block;
+  int grid = 1 + (rows - 1) / block;
   advance_decode_metadata_kernel<<<grid, block, 0, stream>>>(
       positions, local_last, pseudo_last, kv_chunk, rows, factor);
   return (CUresult)cudaGetLastError();

@@ -66,7 +66,8 @@ pub fn advance_decode_metadata(
     );
     let pseudo_rows = rows
         .checked_mul(factor)
-        .ok_or_else(|| anyhow!("advance_decode_metadata: rows x factor overflow"))?;
+        .filter(|n| i32::try_from(*n).is_ok())
+        .ok_or_else(|| anyhow!("advance_decode_metadata: rows x factor exceeds i32"))?;
     anyhow::ensure!(
         positions.len() >= rows
             && local_last.len() >= rows
