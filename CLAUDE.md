@@ -44,6 +44,7 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 - `PEGAINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
 - `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
+- `PEGAINFER_KV_FP8` — gemma4 opt-in fp8 KV: `local` stores the sliding family's K/V as e4m3 at scale 1.0 (lossy; halves the local pool; refuses an enabled prefix cache; unset = byte-identical serving)
 - `PEGAINFER_PREFIX_CACHE` — gemma4 opt-in conversation prefix cache: `K` entries of captured prompt state resume multi-turn prompts (pre-allocated page budget; unset = off, byte-identical serving)
 - `PEGAINFER_ASYNC_PREFILL` — gemma4 opt-in overlap lane: `green:NN` prefills live-batch admissions on an SM-capped stream to protect decode tails (`shared` for comparison; unset = off; bad values refuse to start)
 - `PEGAINFER_MIX_CHUNK_TOKENS` — gemma4 opt-in chunked walk: a mixed admission computes at most `N` prompt rows per step (`64 <= N <` the serving ceiling; unset = whole-prompt steps; bad values refuse to start)
