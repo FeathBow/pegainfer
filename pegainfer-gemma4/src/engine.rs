@@ -195,6 +195,36 @@ fn parse_kv_fp8(raw: Option<&str>) -> Result<KvStorage> {
     }
 }
 
+/// The admission coalesce door: `PEGAINFER_ADMIT_COALESCE_MS=N` holds
+/// arrivals that would ride a live decode batch for up to `N` ms, so one
+/// window's arrivals share a single mixed admission instead of invading
+/// the batch once each — a live stream's tail gap prices the number of
+/// admission events, not their size. An idle engine admits on sight; the
+/// door only prices arrivals that have someone to disturb. Unset (or
+/// `0`/`off`) admits on sight everywhere.
+fn admit_coalesce_ms() -> Result<Option<std::time::Duration>> {
+    match std::env::var("PEGAINFER_ADMIT_COALESCE_MS") {
+        Ok(raw) => parse_admit_coalesce_ms(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PEGAINFER_ADMIT_COALESCE_MS is not valid UTF-8")
+        }
+    }
+}
+
+fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "off" => Ok(None),
+        other => match other.parse::<u64>() {
+            Ok(ms) if (1..=2000).contains(&ms) => Ok(Some(std::time::Duration::from_millis(ms))),
+            _ => anyhow::bail!(
+                "PEGAINFER_ADMIT_COALESCE_MS={raw:?} not recognized (off | N ms, 1 <= N <= 2000)"
+            ),
+        },
+    }
+}
+
 pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
     let dir = model_path
         .to_str()
@@ -235,6 +265,7 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
             let mut pending: VecDeque<Submitted> = VecDeque::new();
             let mut active: Vec<Active> = Vec::new();
             let mut disconnected = false;
+            let mut coalesce_since: Option<std::time::Instant> = None;
             'engine: loop {
                 loop {
                     match submit_rx.try_recv() {
@@ -283,7 +314,38 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                 // flight for its whole length. Bound the attempts too, so a
                 // burst costs the streams a bounded number of prefills per
                 // token however deep it is.
-                state.admit_from_queue(&mut pending, &mut active);
+                // The coalesce door: arrivals that would invade a live decode batch wait out the
+                // window together, then share one mixed admission. A full mixed cohort releases
+                // early, and an idle engine never waits. Shallow batches skip the door: with few
+                // live streams the tail-gap count sits under the percentile on its own, and
+                // waiting for a cohort only taxes TTFT. Depth counts the arrivals too — a
+                // closed-loop arrival lands right after a completion, exactly when the active
+                // roster dips.
+                let door_open = match state.admit_coalesce {
+                    Some(window)
+                        if !pending.is_empty()
+                            && !active.is_empty()
+                            && (active.len() + pending.len()) * 2 >= state.slots =>
+                    {
+                        let cohort = MIX_MAX_PROMPTS
+                            .min(state.slots.saturating_sub(active.len()))
+                            .max(1);
+                        let gathered = pending.len() >= cohort;
+                        let since = *coalesce_since.get_or_insert_with(std::time::Instant::now);
+                        let open = gathered || since.elapsed() >= window;
+                        if open {
+                            coalesce_since = None;
+                        }
+                        open
+                    }
+                    _ => {
+                        coalesce_since = None;
+                        true
+                    }
+                };
+                if door_open {
+                    state.admit_from_queue(&mut pending, &mut active);
+                }
                 if !active.is_empty() {
                     state.decode_round(&mut active);
                 }
@@ -843,6 +905,9 @@ struct EngineState {
     /// The decode-slot count the pools are budgeted for; requests past it
     /// queue.
     slots: usize,
+    /// The admission coalesce window; `None` unless
+    /// `PEGAINFER_ADMIT_COALESCE_MS` opted in at startup.
+    admit_coalesce: Option<std::time::Duration>,
 }
 
 impl EngineState {
@@ -901,6 +966,7 @@ impl EngineState {
         let max_context = serving_context(config.max_position_embeddings)?;
         let lane_mode = async_prefill_mode()?;
         let mix_chunk = mix_chunk_tokens(max_context)?;
+        let admit_coalesce = admit_coalesce_ms()?;
         let slots = decode_slots()?;
         let local_kv_storage = kv_fp8_storage()?;
         if max_context > MAX_CONTEXT {
@@ -1036,6 +1102,7 @@ impl EngineState {
             mix_chunk,
             max_context,
             slots,
+            admit_coalesce,
         })
     }
 
@@ -2273,6 +2340,28 @@ mod knob_tests {
         assert_eq!(parse_kv_fp8(None).unwrap(), KvStorage::Bf16);
         assert_eq!(parse_kv_fp8(Some("local")).unwrap(), KvStorage::E4m3);
         assert!(parse_kv_fp8(Some("global")).is_err());
+    }
+
+    #[test]
+    fn admit_coalesce_parses_or_refuses() {
+        for off in ["off", "0", ""] {
+            assert_eq!(parse_admit_coalesce_ms(off).unwrap(), None);
+        }
+        assert_eq!(
+            parse_admit_coalesce_ms("300").unwrap(),
+            Some(std::time::Duration::from_millis(300))
+        );
+        assert_eq!(
+            parse_admit_coalesce_ms("1").unwrap(),
+            Some(std::time::Duration::from_millis(1))
+        );
+        assert_eq!(
+            parse_admit_coalesce_ms("2000").unwrap(),
+            Some(std::time::Duration::from_millis(2000))
+        );
+        for bad in ["0x", "2001", "abc"] {
+            assert!(parse_admit_coalesce_ms(bad).is_err(), "{bad:?} must refuse");
+        }
     }
 
     #[test]
