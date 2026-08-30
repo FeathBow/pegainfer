@@ -1015,7 +1015,6 @@ impl EngineState {
             return;
         }
         let mut attempts = 0;
-        let mut drained = false;
         while attempts < self.slots && active.len() < self.slots {
             // With the lane busy, arrivals wait in `pending` while decode
             // keeps stepping.
@@ -1030,13 +1029,6 @@ impl EngineState {
                 break;
             };
             attempts += 1;
-            // Only an admission that can run changes the roster; a full
-            // batch with a waiting queue keeps its pipeline and fingerprint.
-            if !drained {
-                self.arena.invalidate_decode_fingerprint();
-                self.drain_pipeline(active);
-                drained = true;
-            }
             let can_wait = !active.is_empty();
             match self.admit_and_prefill(item, can_wait, active, pending, &mut attempts) {
                 Admitted::Active(request) => active.push(*request),
@@ -1142,6 +1134,8 @@ impl EngineState {
         // weight scan — one step prefills every gathered newcomer and
         // advances every active row.
         if !active.is_empty() {
+            self.arena.invalidate_decode_fingerprint();
+            self.drain_pipeline(active);
             self.ready_decode_rows(active);
             if !active.is_empty() {
                 // Gather more admissible prompts into the same step. A
