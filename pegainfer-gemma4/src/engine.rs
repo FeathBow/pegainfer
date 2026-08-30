@@ -2771,7 +2771,7 @@ mod lane_tests {
             super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
         let prompts = walk_prompts();
         let (req_a, mut rx_a) = walk_request(prompts[0].clone(), 24);
-        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 24);
+        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 40);
         let (req_c, mut rx_c) = walk_request(prompts[2].clone(), 6);
 
         let mut pending = std::collections::VecDeque::new();
@@ -2822,7 +2822,7 @@ mod lane_tests {
             state.decode_round(&mut active);
         }
         assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 24);
-        assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 24);
+        assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 40);
         assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
     }
 
