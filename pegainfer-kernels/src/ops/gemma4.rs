@@ -385,30 +385,55 @@ mod tests {
         )
     }
 
-    fn assert_non_finite_row_fails_closed(
+    fn assert_non_finite_rows_fail_closed(
         ctx: &DeviceContext,
         scale: &DeviceVec,
         alone: &(Vec<i32>, Vec<f32>),
-        non_finite: &[bf16],
     ) {
         let finite = finite_row();
-        let paired_logits = finite.iter().chain(non_finite).copied().collect::<Vec<_>>();
-        let (paired_index, paired_weight) = run_router(ctx, scale, &paired_logits);
+        let all_negative_infinity = vec![bf16::from_f32(f32::NEG_INFINITY); EXPERTS];
+        let mut positive_infinity = finite.clone();
+        positive_infinity[SELECTED[0]] = bf16::from_f32(f32::INFINITY);
+        let mut nan = finite.clone();
+        nan[SELECTED[0]] = bf16::from_f32(f32::NAN);
+        // A lone -inf beside finite logits is the case a plain softmax would
+        // mask into ordinary weights.
+        let mut one_negative_infinity = finite.clone();
+        one_negative_infinity[SELECTED[0] + 1] = bf16::from_f32(f32::NEG_INFINITY);
+        let non_finite_rows = [
+            ("all -inf row", all_negative_infinity),
+            ("+inf row", positive_infinity),
+            ("NaN row", nan),
+            ("one -inf beside finite row", one_negative_infinity),
+        ];
+        let logits_host = std::iter::once(finite.as_slice())
+            .chain(non_finite_rows.iter().map(|(_, row)| row.as_slice()))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let (batched_index, batched_weight) = run_router(ctx, scale, &logits_host);
         let (alone_index, alone_weight) = alone;
-        assert_eq!(&paired_index[..TOP_K], alone_index);
-        assert_eq!(
-            paired_weight[..TOP_K]
+        assert_eq!(&batched_index[..TOP_K], alone_index);
+        assert!(
+            batched_weight[..TOP_K]
                 .iter()
                 .map(|weight| weight.to_bits())
-                .collect::<Vec<_>>(),
-            alone_weight
-                .iter()
-                .map(|weight| weight.to_bits())
-                .collect::<Vec<_>>()
+                .eq(alone_weight.iter().map(|weight| weight.to_bits()))
         );
         let expected_indices = (0..TOP_K as i32).collect::<Vec<_>>();
-        assert_eq!(&paired_index[TOP_K..], expected_indices);
-        assert!(paired_weight[TOP_K..].iter().all(|weight| weight.is_nan()));
+        for (offset, (name, _)) in non_finite_rows.iter().enumerate() {
+            let row = offset + 1;
+            let slots = row * TOP_K..(row + 1) * TOP_K;
+            assert_eq!(
+                &batched_index[slots.clone()],
+                expected_indices.as_slice(),
+                "{name} (row {row}) did not emit indices 0..TOP_K"
+            );
+            assert!(
+                batched_weight[slots].iter().all(|weight| weight.is_nan()),
+                "{name} (row {row}) did not emit all-NaN weights"
+            );
+        }
     }
 
     fn assert_finite_contract(
@@ -476,20 +501,7 @@ mod tests {
         let scale = DeviceVec::from_host(&ctx, &scale_host).expect("scale");
         let alone = assert_finite_contract(&ctx, &scale, &scale_host);
 
-        let finite = finite_row();
-        let all_negative_infinity = vec![bf16::from_f32(f32::NEG_INFINITY); EXPERTS];
-        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &all_negative_infinity);
-        let mut positive_infinity = finite.clone();
-        positive_infinity[SELECTED[0]] = bf16::from_f32(f32::INFINITY);
-        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &positive_infinity);
-        let mut nan = finite.clone();
-        nan[SELECTED[0]] = bf16::from_f32(f32::NAN);
-        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &nan);
-        // A lone -inf beside finite logits is the case a plain softmax would
-        // mask into ordinary weights.
-        let mut one_negative_infinity = finite;
-        one_negative_infinity[SELECTED[0] + 1] = bf16::from_f32(f32::NEG_INFINITY);
-        assert_non_finite_row_fails_closed(&ctx, &scale, &alone, &one_negative_infinity);
+        assert_non_finite_rows_fail_closed(&ctx, &scale, &alone);
         assert_invalid_expert_contract(&ctx);
     }
 }
