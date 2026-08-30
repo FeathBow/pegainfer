@@ -177,6 +177,9 @@ require_gpu() {
   exec {gpu_lock_fd}<"$lock_path" || die "cannot open device lock $lock_path"
   flock -n "$gpu_lock_fd" || die "GPU $gpu_uuid is already owned by another Gemma 4 gate runner"
   echo "gemma4 gates: claimed GPU $gpu_uuid (selector $selector)"
+  if [ -n "${PEGAINFER_KV_FP8:-}" ]; then
+    echo "gemma4 gates: PEGAINFER_KV_FP8=$PEGAINFER_KV_FP8"
+  fi
 }
 
 require_ckpt() {

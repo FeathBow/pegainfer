@@ -171,7 +171,7 @@ fn parse_prefix_cache_cap(raw: &str) -> Result<Option<usize>> {
     }
 }
 
-fn kv_fp8_storage() -> Result<KvStorage> {
+pub(crate) fn kv_fp8_storage() -> Result<KvStorage> {
     let storage = match std::env::var(KV_FP8_ENV) {
         Err(std::env::VarError::NotPresent) => parse_kv_fp8(None),
         Ok(raw) => parse_kv_fp8(Some(&raw)),

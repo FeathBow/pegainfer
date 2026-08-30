@@ -16,7 +16,11 @@ use crate::testkit::model_path;
 use crate::testkit::u32_tensor;
 
 fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
-    stack_with_storage(max_context, pages, KvStorage::Bf16)
+    stack_with_storage(
+        max_context,
+        pages,
+        crate::engine::kv_fp8_storage().expect("PEGAINFER_KV_FP8"),
+    )
 }
 
 fn stack_with_storage(
@@ -30,6 +34,7 @@ fn stack_with_storage(
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
     let serve = GemmaServe::new(&ctx, weights, max_context, storage, pages, pages).expect("serve");
+    eprintln!("oracle stack storage: {storage:?}");
     (ctx, serve, dir)
 }
 
