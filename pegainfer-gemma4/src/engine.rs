@@ -1256,6 +1256,11 @@ impl EngineState {
             });
             Admitted::Done
         };
+        // A solo admission starts a new roster: the fingerprint the retired
+        // one left would otherwise pass a new request whose frontier and
+        // page structure happen to line up, and its first step would keep
+        // the old page tables. Nothing is in flight, so no drain is needed.
+        self.arena.invalidate_decode_fingerprint();
         // Under the chunk knob a solo prompt walks its own segments too:
         // residency stays window plus segment whatever the prompt length.
         let stepped = if let Some(chunk) = self.mix_chunk {
@@ -2340,14 +2345,19 @@ mod lane_tests {
         tokens: usize,
         cached: usize,
         finish: FinishReason,
+        ids: Vec<u32>,
     }
 
     fn drain(rx: &mut TokenStreamReceiver, name: &str) -> Drained {
         let mut tokens = 0;
         let mut cached = 0;
+        let mut ids = Vec::new();
         loop {
             match rx.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Token { .. }) => tokens += 1,
+                Some(TokenEvent::Token { id, .. }) => {
+                    tokens += 1;
+                    ids.push(id);
+                }
                 Some(TokenEvent::Scheduled { cached_tokens, .. }) => cached = cached_tokens,
                 Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
                 Some(TokenEvent::Finished { finish_reason, .. }) => {
@@ -2355,6 +2365,7 @@ mod lane_tests {
                         tokens,
                         cached,
                         finish: finish_reason,
+                        ids,
                     };
                 }
                 Some(TokenEvent::Error { message, .. }) => panic!("{name}: error: {message}"),
@@ -2818,6 +2829,78 @@ mod lane_tests {
         assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 24);
         assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 40);
         assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
+    }
+
+    /// A roster that empties leaves its last fingerprint in the arena. The
+    /// solo admission that refills the idle engine must drop it: a new
+    /// request whose frontier sits one token past the retired one's, with
+    /// the same page structure, would otherwise take the regular-step skip
+    /// on its first decode and keep the retired roster's page tables.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn an_idle_refill_drops_the_retired_fingerprint() {
+        let dir = crate::testkit::model_path();
+        let policy = super::generation_policy(&dir).expect("policy");
+        let _env = scoped_engine_env(&[("PEGAINFER_DECODE_SLOTS", "2")]);
+        let prompts = walk_prompts();
+        let first_len = 64usize;
+        let budget = 8usize;
+        let first: Vec<u32> = prompts[0].iter().cycle().copied().take(first_len).collect();
+        // The retired request's last step ran at kv_len = first_len + budget - 1;
+        // this prompt's first decode step runs at exactly one more.
+        let second: Vec<u32> = prompts[1]
+            .iter()
+            .cycle()
+            .copied()
+            .take(first_len + budget - 1)
+            .collect();
+
+        let run_second_alone = |state: &mut super::EngineState| -> Drained {
+            let (req, mut rx) = walk_request(second.clone(), budget);
+            let mut pending = std::collections::VecDeque::new();
+            let mut active: Vec<super::Active> = Vec::new();
+            pending.push_back((req, pegainfer_frontend::engine::KvPrefix::none()));
+            state.admit_from_queue(&mut pending, &mut active);
+            assert_eq!(active.len(), 1, "the prompt is admitted");
+            assert!(
+                !state.arena.has_decode_fingerprint(),
+                "a solo admission starts with no fingerprint"
+            );
+            while !active.is_empty() {
+                state.admit_from_queue(&mut pending, &mut active);
+                state.decode_round(&mut active);
+            }
+            drain(&mut rx, "second")
+        };
+
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        let (req_a, mut rx_a) = walk_request(first, budget);
+        let mut pending = std::collections::VecDeque::new();
+        let mut active: Vec<super::Active> = Vec::new();
+        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
+        state.admit_from_queue(&mut pending, &mut active);
+        while !active.is_empty() {
+            state.admit_from_queue(&mut pending, &mut active);
+            state.decode_round(&mut active);
+        }
+        assert_eq!(drain(&mut rx_a, "first").tokens, budget);
+        assert!(
+            state.arena.has_decode_fingerprint(),
+            "the retired roster leaves its fingerprint behind"
+        );
+        let refilled = run_second_alone(&mut state);
+
+        drop(state);
+        let fresh_policy = super::generation_policy(&dir).expect("policy");
+        let mut fresh = super::EngineState::load(&dir, 0, fresh_policy, 0x5EED, true)
+            .expect("fresh engine state");
+        let alone = run_second_alone(&mut fresh);
+        assert_eq!(refilled.tokens, budget);
+        assert_eq!(
+            refilled.ids, alone.ids,
+            "the refill answers exactly as a fresh engine does"
+        );
     }
 
     /// The chunked pool provisions one shared segment transient, so no
