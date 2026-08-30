@@ -403,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn storage_width_sets_backing_capacity() {
+        let ctx = DeviceContext::new().expect("GPU required for kv_pool tests");
+        let pages = 3;
+        let fp8 =
+            KvPool::with_storage(&ctx, 1, 1, 1, 16, pages, KvStorage::E4m3).expect("fp8 KvPool");
+        let bf16 =
+            KvPool::with_storage(&ctx, 1, 1, 1, 16, pages, KvStorage::Bf16).expect("bf16 KvPool");
+        assert_eq!(
+            fp8.buffer().len(),
+            (pages * fp8.layout().page_stride).div_ceil(2)
+        );
+        assert_eq!(bf16.buffer().len(), pages * bf16.layout().page_stride);
+    }
+
+    #[test]
     fn stride_geometry_qwen35() {
         // Qwen3.5-4B: 8 full attn layers, 4 KV heads, head_dim=256, page_size=16
         let l = KvLayout::new(8, 4, 256, 16).expect("layout");
