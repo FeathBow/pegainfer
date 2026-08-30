@@ -132,9 +132,8 @@ impl SlidingLocalKv {
     }
 
     /// Move the frontier without releasing anything: the overlapped
-    /// prefill defers its release to join time, and the eviction A/B pins
-    /// the footprint. Everything else goes through
-    /// [`Self::advance_and_release`].
+    /// prefill defers its release to join time. Everything else goes
+    /// through [`Self::advance_and_release`].
     pub(crate) fn advance(&mut self, count: usize) {
         self.frontier += count;
     }

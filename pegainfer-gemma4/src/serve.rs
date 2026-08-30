@@ -667,8 +667,6 @@ pub(crate) struct GemmaServe {
     sliding_window: usize,
     global_split_factor: usize,
     final_logit_softcapping: f32,
-    #[cfg(test)]
-    release_enabled: bool,
     sliding_cos: DeviceVec,
     sliding_sin: DeviceVec,
     global_cos: DeviceVec,
@@ -797,8 +795,6 @@ impl GemmaServe {
             sliding_window,
             global_split_factor,
             final_logit_softcapping,
-            #[cfg(test)]
-            release_enabled: true,
             sliding_cos,
             sliding_sin,
             global_cos,
@@ -1124,19 +1120,7 @@ impl GemmaServe {
         })
     }
 
-    /// The eviction gate runs the same request twice, once with the front
-    /// held resident, to show what release does and does not change.
-    #[cfg(test)]
-    pub(crate) fn set_release_for_test(&mut self, on: bool) {
-        self.release_enabled = on;
-    }
-
     fn advance_local(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
-        #[cfg(test)]
-        if !self.release_enabled {
-            kv.local.advance(tokens);
-            return Ok(());
-        }
         kv.local.advance_and_release(tokens, self.sliding_window)
     }
 

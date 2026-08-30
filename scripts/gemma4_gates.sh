@@ -69,7 +69,7 @@ GATES_SERVING_CONTRACT=(
   "ckpt engine::lane_tests::the_raise_refuses_without_its_prerequisites"
 )
 GATES_KV_AND_LANES=(
-  "gpu,ckpt serve::oracle::eviction_is_footprint_only"
+  "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
   "gpu,ckpt serve::oracle::prefix_restore_matches_cold_path"
 )
 # The disagreeing-config gate deliberately fails before any device is opened.
@@ -117,7 +117,7 @@ GATES_FP8_PROFILE=(
   "serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
   "serve::oracle::fp8_mixed_walk_holds_its_structure"
   "serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
-  "serve::oracle::eviction_is_footprint_only"
+  "serve::oracle::incremental_serving_matches_recompute"
   "serve::oracle::overlapped_prefill_matches_the_sync_step"
 )
 

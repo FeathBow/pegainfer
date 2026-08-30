@@ -43,12 +43,6 @@ fn load_stack() -> (DeviceContext, GemmaServe, String) {
     stack_with(1024, 66)
 }
 
-fn synthetic_tokens(len: usize, salt: u32) -> Vec<u32> {
-    (0..len as u32)
-        .map(|i| 1000 + (i * 37 + salt) % 50000)
-        .collect()
-}
-
 /// What agreement is available at this depth, measured on the reference
 /// itself: the largest gap its two backends have with each other over the
 /// ids both rank, and how often they pick the same top-1. Neither certifies
@@ -396,16 +390,7 @@ fn recomputed_argmaxes(
 ) -> Vec<usize> {
     positions
         .iter()
-        .map(|&position| {
-            let mut kv = serve.alloc_kv();
-            let prefix = &prompt[..=position];
-            admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prefix.len())
-                .expect("admit recompute prefix");
-            let logits = serve.step(ctx, &mut kv, prefix).expect("recompute step");
-            let host = logits.to_host(ctx).expect("recompute logits D2H");
-            let vocab = logits.hidden_dim;
-            argmax(&host[(logits.seq_len - 1) * vocab..])
-        })
+        .map(|&position| argmax(&serving_recompute(ctx, serve, &prompt[..=position])))
         .collect()
 }
 
@@ -489,42 +474,106 @@ fn fp8_argmax_agreement_meets_the_bf16_floor() {
     }
 }
 
-/// `window_left` masks out-of-window keys whether or not their pages are
-/// still resident, so releasing them need not change a single generated
-/// token.
-#[test]
-#[ignore = "requires the pinned 12B checkpoint and a GPU"]
-fn eviction_is_footprint_only() {
-    let (ctx, mut serve, _dir) = stack_with(1300, 120);
-    let prompt = synthetic_tokens(1023, 5);
-
-    let run = |serve: &GemmaServe| -> (Vec<u32>, usize) {
-        let mut kv = serve.alloc_kv();
-        let mut arena = serve
-            .alloc_step_arena(&ctx, 1, false)
-            .expect("oracle step arena");
-        admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prompt.len())
-            .expect("admit prompt");
-        let logits = serve.step(&ctx, &mut kv, &prompt).expect("prefill");
-        let mut next = argmax_last(&ctx, &logits).expect("argmax");
-        let mut tokens = vec![next];
-        for _ in 1..30 {
-            let row = decode_serving(serve, &ctx, &mut arena, &mut kv, next).expect("decode");
-            next = u32::try_from(argmax(&row)).expect("token id");
-            tokens.push(next);
-        }
-        (tokens, kv.local.held_pages())
-    };
-
-    let (evicted, pages_evicted) = run(&serve);
-    serve.set_release_for_test(false);
-    let (retained, pages_retained) = run(&serve);
-    assert_eq!(evicted, retained, "releasing changed the generated tokens");
-    eprintln!("local pages at end: released {pages_evicted} vs retained {pages_retained}");
+/// The two arms run different launch shapes (one-token decode against a
+/// whole-prompt prefill), which this engine does not promise bit-equal, so
+/// the callers bound the raw-logit drift by the calibrated ceiling — but the
+/// decision must not move: the argmax has to be identical, measured zero
+/// flips across the fixture.
+fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> f32 {
     assert!(
-        pages_evicted < pages_retained,
-        "release must shrink the resident footprint ({pages_evicted} vs {pages_retained})"
+        ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
+        "{what}: non-finite logit"
     );
+    let (a, b) = (argmax(ours), argmax(theirs));
+    assert_eq!(a, b, "{what}: argmax diverged ({a} vs {b})");
+    ours.iter()
+        .zip(theirs)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// The whole-prefix recompute of the serving path, reduced to its last row.
+fn serving_recompute(ctx: &DeviceContext, serve: &GemmaServe, tokens: &[u32]) -> Vec<f32> {
+    let mut kv = serve.alloc_kv();
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, tokens.len())
+        .expect("admit recompute");
+    let logits = serve.step(ctx, &mut kv, tokens).expect("serving recompute");
+    let host = logits.to_host(ctx).expect("recompute D2H");
+    let vocab = logits.hidden_dim;
+    host[(logits.seq_len - 1) * vocab..].to_vec()
+}
+
+/// One forward path answers for itself: every prompt position's incremental
+/// logits (one token at a time through the decode arena) match a whole-prompt
+/// recompute of the same serving path, and four decode steps fed the
+/// recompute's own greedy picks match it too — so one divergence cannot
+/// cascade. Both arms run the production release path; this short
+/// trajectory never crosses the window — the crossing itself is pinned by
+/// the waypoint, mixed-window, overlap and ragged gates.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, the golden fixture, and a GPU"]
+fn incremental_serving_matches_recompute() {
+    let (ctx, serve, _dir) = load_stack();
+    // The golden fixture's short prompt: real text, and the tokens the
+    // ceiling below was calibrated on. Read for its prompt only.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_data/gemma4-12b-hf-golden.safetensors"
+    );
+    let bytes = std::fs::read(path).expect("read golden fixture (dump on the box first)");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+    let (_, tokens_i32) = i32_tensor(&fixture, "short_tokens");
+    let mut tokens: Vec<u32> = tokens_i32
+        .iter()
+        .map(|&t| u32::try_from(t).expect("token id"))
+        .collect();
+
+    let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(&ctx, 1, false)
+        .expect("oracle step arena");
+    let mut max_abs = 0.0f32;
+    for pos in 0..tokens.len() {
+        let incremental = if pos == 0 {
+            admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1)
+                .expect("admit first prompt token");
+            serve
+                .step(&ctx, &mut kv, &tokens[..1])
+                .expect("first prompt token")
+                .to_host(&ctx)
+                .expect("D2H")
+        } else {
+            decode_serving(&serve, &ctx, &mut arena, &mut kv, tokens[pos])
+                .expect("teacher-forced prompt token")
+        };
+        let recomputed = serving_recompute(&ctx, &serve, &tokens[..=pos]);
+        let gap = compare_row(&incremental, &recomputed, &format!("prefill pos {pos}"));
+        eprintln!("prefill pos {pos}: max |dlogit| {gap}");
+        max_abs = max_abs.max(gap);
+    }
+    eprintln!(
+        "prefill: {} positions, max |dlogit| {max_abs}",
+        tokens.len()
+    );
+    assert!(
+        max_abs <= 2.0,
+        "prefill |dlogit| {max_abs} above calibrated 2.0"
+    );
+
+    let mut oracle_last = serving_recompute(&ctx, &serve, &tokens);
+    for step in 0..4 {
+        let next = u32::try_from(argmax(&oracle_last)).expect("token id");
+        let step_host =
+            decode_serving(&serve, &ctx, &mut arena, &mut kv, next).expect("serve decode step");
+        tokens.push(next);
+        oracle_last = serving_recompute(&ctx, &serve, &tokens);
+        let gap = compare_row(&step_host, &oracle_last, &format!("decode step {step}"));
+        eprintln!("decode step {step}: max |dlogit| {gap}");
+        assert!(
+            gap <= 2.0,
+            "decode step {step} |dlogit| {gap} above calibrated 2.0"
+        );
+    }
 }
 
 /// DoD gate: greedy continuation matches HF `generate()` token for
