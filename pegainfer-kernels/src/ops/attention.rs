@@ -110,6 +110,9 @@ impl PrefillPagedPlan {
     pub fn kv_chunk_size_d(&self) -> &CudaSlice<i32> {
         &self.kv_chunk_size_d
     }
+    pub fn decode_metadata_d_mut(&mut self) -> (&mut CudaSlice<i32>, &mut CudaSlice<i32>) {
+        (&mut self.last_page_len_d, &mut self.kv_chunk_size_d)
+    }
     pub fn total_num_rows_d(&self) -> &CudaSlice<u32> {
         &self.total_num_rows_d
     }

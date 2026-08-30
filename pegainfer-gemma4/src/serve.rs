@@ -1976,8 +1976,8 @@ impl GemmaServe {
         tower: &mut TowerScratch,
         ids: &CudaSlice<u32>,
         rows: usize,
-        local_plan: &PrefillPagedPlan,
-        global_tables: &GlobalTables,
+        local_plan: &mut PrefillPagedPlan,
+        global_tables: &mut GlobalTables,
         global_split: &mut SplitKvState,
         local_origins: &CudaSlice<i32>,
         head_normed: &mut HiddenStates,
@@ -2004,12 +2004,13 @@ impl GemmaServe {
             head_normed,
             logits,
         )?;
+        let (local_last, kv_chunk) = local_plan.decode_metadata_d_mut();
         ops::advance_decode_metadata(
             ctx,
-            &global_tables.positions,
-            local_plan.last_page_len_d(),
-            &global_tables.pseudo_last,
-            local_plan.kv_chunk_size_d(),
+            &mut global_tables.positions,
+            local_last,
+            &mut global_tables.pseudo_last,
+            kv_chunk,
             rows,
             self.global_split_factor,
         )

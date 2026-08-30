@@ -52,32 +52,42 @@ pub fn add_batch_into(
 /// Advance the per-row decode tables written by a regular graph replay.
 pub fn advance_decode_metadata(
     ctx: &DeviceContext,
-    positions: &CudaSlice<i32>,
-    local_last: &CudaSlice<i32>,
-    pseudo_last: &CudaSlice<i32>,
-    kv_chunk: &CudaSlice<i32>,
+    positions: &mut CudaSlice<i32>,
+    local_last: &mut CudaSlice<i32>,
+    pseudo_last: &mut CudaSlice<i32>,
+    kv_chunk: &mut CudaSlice<i32>,
     rows: usize,
     factor: usize,
 ) -> Result<()> {
+    anyhow::ensure!(rows > 0, "advance_decode_metadata: rows must be positive");
+    anyhow::ensure!(
+        factor > 0,
+        "advance_decode_metadata: factor must be positive"
+    );
+    let pseudo_rows = rows
+        .checked_mul(factor)
+        .ok_or_else(|| anyhow!("advance_decode_metadata: rows x factor overflow"))?;
     anyhow::ensure!(
         positions.len() >= rows
             && local_last.len() >= rows
             && kv_chunk.len() >= rows
-            && pseudo_last.len() >= rows * factor,
+            && pseudo_last.len() >= pseudo_rows,
         "advance_decode_metadata: {rows} rows x {factor} exceeds a table"
     );
-    let (positions_ptr, _positions_guard) = positions.device_ptr(&ctx.stream);
-    let (local_ptr, _local_guard) = local_last.device_ptr(&ctx.stream);
-    let (pseudo_ptr, _pseudo_guard) = pseudo_last.device_ptr(&ctx.stream);
-    let (chunk_ptr, _chunk_guard) = kv_chunk.device_ptr(&ctx.stream);
+    let rows = super::checked_i32(rows, "advance decode metadata rows")?;
+    let factor = super::checked_i32(factor, "advance decode metadata factor")?;
+    let (positions_ptr, _positions_guard) = positions.device_ptr_mut(&ctx.stream);
+    let (local_ptr, _local_guard) = local_last.device_ptr_mut(&ctx.stream);
+    let (pseudo_ptr, _pseudo_guard) = pseudo_last.device_ptr_mut(&ctx.stream);
+    let (chunk_ptr, _chunk_guard) = kv_chunk.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::advance_decode_metadata_cuda(
             positions_ptr as *mut i32,
             local_ptr as *mut i32,
             pseudo_ptr as *mut i32,
             chunk_ptr as *mut i32,
-            rows as i32,
-            factor as i32,
+            rows,
+            factor,
             crate::tensor::active_cu_stream(ctx),
         )
     };
