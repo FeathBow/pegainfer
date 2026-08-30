@@ -24,9 +24,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    /// Two norms of one input, reduced once; each output is bitwise what a
-    /// separate `rms_norm_batched_cuda` call with that weight produces, with
-    /// `scale_a` preserving a trailing bf16 scalar multiply on the first.
     pub fn rms_norm_batched_dual_cuda(
         x: *const Half,
         weight_a: *const Half,
@@ -38,10 +35,8 @@ unsafe extern "C" {
         eps: f32,
         scale_a: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
-    /// `out = rms_norm(a, weight_a) + rms_norm(b, weight_b)`, bitwise what
-    /// two `rms_norm_batched_cuda` calls and an `add_cuda` produce.
     pub fn dual_rms_norm_add_batched_cuda(
         a: *const Half,
         weight_a: *const Half,
@@ -52,12 +47,8 @@ unsafe extern "C" {
         seq_len: i32,
         eps: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
-    /// `residual_out = bf16(rms_norm(x, weight_post) + res_in)` then
-    /// `out = rms_norm(residual_out, weight_pre)`, bitwise what
-    /// `rms_norm_batched_cuda` then `fused_add_rms_norm_round_batched_cuda`
-    /// produce.
     pub fn rms_norm_add_rms_norm_round_batched_cuda(
         x: *const Half,
         weight_post: *const Half,
@@ -71,8 +62,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// `out = (residual + rms_norm(x, weight)) * scale`, the three standalone
-    /// ops' roundings kept in place.
     pub fn rms_norm_add_scale_batched_cuda(
         x: *const Half,
         weight: *const Half,
@@ -83,7 +72,7 @@ unsafe extern "C" {
         eps: f32,
         scale: f32,
         stream: CUstream,
-    );
+    ) -> CUresult;
 
     pub fn add_cuda(
         a: *const Half,

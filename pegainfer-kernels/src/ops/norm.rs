@@ -165,9 +165,10 @@ pub fn fused_add_rms_norm_into(
     Ok(())
 }
 
-/// Two RMSNorms of the same input in one read: `out_a = rms(x) * weight_a *
+/// Two RMSNorms of the same input in one launch: `out_a = rms(x) * weight_a *
 /// scale_a` and `out_b = rms(x) * weight_b`, each bitwise what its standalone
-/// operations produce.
+/// operations produce. The norms share one reduction, and the input is read
+/// twice instead of four times.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_batch_dual_into(
     ctx: &DeviceContext,
@@ -178,32 +179,57 @@ pub fn rms_norm_batch_dual_into(
     scale_a: f32,
     out_a: &mut HiddenStates,
     out_b: &mut HiddenStates,
-) {
-    assert_eq!(weight_a.len, x.hidden_dim);
-    assert_eq!(weight_b.len, x.hidden_dim);
-    assert_eq!(out_a.hidden_dim, x.hidden_dim);
-    assert_eq!(out_b.hidden_dim, x.hidden_dim);
-    assert_eq!(out_a.seq_len, x.seq_len);
-    assert_eq!(out_b.seq_len, x.seq_len);
+) -> Result<()> {
+    const OP: &str = "rms_norm_batch_dual_into";
+    ensure!(
+        x.hidden_dim > 0 && x.seq_len > 0,
+        "{OP} dimensions must be non-zero"
+    );
+    ensure!(weight_a.len == x.hidden_dim, "{OP} weight_a len mismatch");
+    ensure!(weight_b.len == x.hidden_dim, "{OP} weight_b len mismatch");
+    ensure!(
+        weight_a.data.len() >= x.hidden_dim,
+        "{OP} weight_a backing too small"
+    );
+    ensure!(
+        weight_b.data.len() >= x.hidden_dim,
+        "{OP} weight_b backing too small"
+    );
+    ensure!(
+        out_a.hidden_dim == x.hidden_dim && out_a.seq_len == x.seq_len,
+        "{OP} out_a shape mismatch"
+    );
+    ensure!(
+        out_b.hidden_dim == x.hidden_dim && out_b.seq_len == x.seq_len,
+        "{OP} out_b shape mismatch"
+    );
+    ensure!(scale_a.is_finite(), "{OP} scale_a must be finite");
+    x.checked_extent("rms_norm_batch_dual_into x")?;
+    out_a.checked_extent("rms_norm_batch_dual_into out_a")?;
+    out_b.checked_extent("rms_norm_batch_dual_into out_b")?;
+    let hidden_dim = super::checked_i32(x.hidden_dim, "rms_norm_batch_dual_into hidden_dim")?;
+    let seq_len = super::checked_i32(x.seq_len, "rms_norm_batch_dual_into seq_len")?;
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (wa_ptr, _ga) = weight_a.data.device_ptr(&ctx.stream);
     let (wb_ptr, _gb) = weight_b.data.device_ptr(&ctx.stream);
     let (oa_ptr, _goa) = out_a.data.device_ptr_mut(&ctx.stream);
     let (ob_ptr, _gob) = out_b.data.device_ptr_mut(&ctx.stream);
-    unsafe {
+    let result = unsafe {
         ffi::rms_norm_batched_dual_cuda(
             x_ptr as *const ffi::Half,
             wa_ptr as *const ffi::Half,
             wb_ptr as *const ffi::Half,
             oa_ptr as *mut ffi::Half,
             ob_ptr as *mut ffi::Half,
-            x.hidden_dim as i32,
-            x.seq_len as i32,
+            hidden_dim,
+            seq_len,
             eps,
             scale_a,
             crate::tensor::active_cu_stream(ctx),
-        );
-    }
+        )
+    };
+    result.result()?;
+    Ok(())
 }
 
 /// The MoE combine tail in one launch: `out = rms_norm(a, weight_a) +
@@ -217,31 +243,55 @@ pub fn dual_rms_norm_add_batch_into(
     weight_b: &DeviceVec,
     eps: f32,
     out: &mut HiddenStates,
-) {
-    assert_eq!(weight_a.len, a.hidden_dim);
-    assert_eq!(weight_b.len, a.hidden_dim);
-    assert_eq!(b.hidden_dim, a.hidden_dim);
-    assert_eq!(b.seq_len, a.seq_len);
-    assert_eq!(out.hidden_dim, a.hidden_dim);
-    assert_eq!(out.seq_len, a.seq_len);
+) -> Result<()> {
+    const OP: &str = "dual_rms_norm_add_batch_into";
+    ensure!(
+        a.hidden_dim > 0 && a.seq_len > 0,
+        "{OP} dimensions must be non-zero"
+    );
+    ensure!(weight_a.len == a.hidden_dim, "{OP} weight_a len mismatch");
+    ensure!(weight_b.len == a.hidden_dim, "{OP} weight_b len mismatch");
+    ensure!(
+        weight_a.data.len() >= a.hidden_dim,
+        "{OP} weight_a backing too small"
+    );
+    ensure!(
+        weight_b.data.len() >= a.hidden_dim,
+        "{OP} weight_b backing too small"
+    );
+    ensure!(
+        b.hidden_dim == a.hidden_dim && b.seq_len == a.seq_len,
+        "{OP} b shape mismatch"
+    );
+    ensure!(
+        out.hidden_dim == a.hidden_dim && out.seq_len == a.seq_len,
+        "{OP} out shape mismatch"
+    );
+    a.checked_extent("dual_rms_norm_add_batch_into a")?;
+    b.checked_extent("dual_rms_norm_add_batch_into b")?;
+    out.checked_extent("dual_rms_norm_add_batch_into out")?;
+    let hidden_dim = super::checked_i32(a.hidden_dim, "dual_rms_norm_add_batch_into hidden_dim")?;
+    let seq_len = super::checked_i32(a.seq_len, "dual_rms_norm_add_batch_into seq_len")?;
     let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
     let (wa_ptr, _gwa) = weight_a.data.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
     let (wb_ptr, _gwb) = weight_b.data.device_ptr(&ctx.stream);
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
+    let result = unsafe {
         ffi::dual_rms_norm_add_batched_cuda(
             a_ptr as *const ffi::Half,
             wa_ptr as *const ffi::Half,
             b_ptr as *const ffi::Half,
             wb_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
-            a.hidden_dim as i32,
-            a.seq_len as i32,
+            hidden_dim,
+            seq_len,
             eps,
             crate::tensor::active_cu_stream(ctx),
-        );
-    }
+        )
+    };
+    result.result()?;
+    Ok(())
 }
 
 /// The attention epilogue's norm pair in one launch:
@@ -259,14 +309,48 @@ pub fn rms_norm_add_rms_norm_round_batch_into(
     residual_out: &mut HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    assert_eq!(weight_post.len, x.hidden_dim);
-    assert_eq!(weight_pre.len, x.hidden_dim);
-    assert_eq!(res_in.hidden_dim, x.hidden_dim);
-    assert_eq!(res_in.seq_len, x.seq_len);
-    assert_eq!(residual_out.hidden_dim, x.hidden_dim);
-    assert_eq!(residual_out.seq_len, x.seq_len);
-    assert_eq!(out.hidden_dim, x.hidden_dim);
-    assert_eq!(out.seq_len, x.seq_len);
+    const OP: &str = "rms_norm_add_rms_norm_round_batch_into";
+    ensure!(
+        x.hidden_dim > 0 && x.seq_len > 0,
+        "{OP} dimensions must be non-zero"
+    );
+    ensure!(
+        weight_post.len == x.hidden_dim,
+        "{OP} weight_post len mismatch"
+    );
+    ensure!(
+        weight_pre.len == x.hidden_dim,
+        "{OP} weight_pre len mismatch"
+    );
+    ensure!(
+        weight_post.data.len() >= x.hidden_dim,
+        "{OP} weight_post backing too small"
+    );
+    ensure!(
+        weight_pre.data.len() >= x.hidden_dim,
+        "{OP} weight_pre backing too small"
+    );
+    ensure!(
+        res_in.hidden_dim == x.hidden_dim && res_in.seq_len == x.seq_len,
+        "{OP} res_in shape mismatch"
+    );
+    ensure!(
+        residual_out.hidden_dim == x.hidden_dim && residual_out.seq_len == x.seq_len,
+        "{OP} residual_out shape mismatch"
+    );
+    ensure!(
+        out.hidden_dim == x.hidden_dim && out.seq_len == x.seq_len,
+        "{OP} out shape mismatch"
+    );
+    x.checked_extent("rms_norm_add_rms_norm_round_batch_into x")?;
+    res_in.checked_extent("rms_norm_add_rms_norm_round_batch_into res_in")?;
+    residual_out.checked_extent("rms_norm_add_rms_norm_round_batch_into residual_out")?;
+    out.checked_extent("rms_norm_add_rms_norm_round_batch_into out")?;
+    let hidden_dim = super::checked_i32(
+        x.hidden_dim,
+        "rms_norm_add_rms_norm_round_batch_into hidden_dim",
+    )?;
+    let seq_len = super::checked_i32(x.seq_len, "rms_norm_add_rms_norm_round_batch_into seq_len")?;
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (wp_ptr, _gwp) = weight_post.data.device_ptr(&ctx.stream);
     let (r_ptr, _gr) = res_in.data.device_ptr(&ctx.stream);
@@ -281,16 +365,13 @@ pub fn rms_norm_add_rms_norm_round_batch_into(
             wq_ptr as *const ffi::Half,
             ro_ptr as *mut ffi::Half,
             o_ptr as *mut ffi::Half,
-            x.hidden_dim as i32,
-            x.seq_len as i32,
+            hidden_dim,
+            seq_len,
             eps,
             crate::tensor::active_cu_stream(ctx),
         )
     };
-    ensure!(
-        result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-        "rms_norm_add_rms_norm_round_batched_cuda failed: {result:?}"
-    );
+    result.result()?;
     Ok(())
 }
 
@@ -305,29 +386,50 @@ pub fn rms_norm_add_scale_batch_into(
     scale: f32,
     eps: f32,
     out: &mut HiddenStates,
-) {
-    assert_eq!(weight.len, x.hidden_dim);
-    assert_eq!(residual.hidden_dim, x.hidden_dim);
-    assert_eq!(residual.seq_len, x.seq_len);
-    assert_eq!(out.hidden_dim, x.hidden_dim);
-    assert_eq!(out.seq_len, x.seq_len);
+) -> Result<()> {
+    const OP: &str = "rms_norm_add_scale_batch_into";
+    ensure!(
+        x.hidden_dim > 0 && x.seq_len > 0,
+        "{OP} dimensions must be non-zero"
+    );
+    ensure!(weight.len == x.hidden_dim, "{OP} weight len mismatch");
+    ensure!(
+        weight.data.len() >= x.hidden_dim,
+        "{OP} weight backing too small"
+    );
+    ensure!(
+        residual.hidden_dim == x.hidden_dim && residual.seq_len == x.seq_len,
+        "{OP} residual shape mismatch"
+    );
+    ensure!(
+        out.hidden_dim == x.hidden_dim && out.seq_len == x.seq_len,
+        "{OP} out shape mismatch"
+    );
+    ensure!(scale.is_finite(), "{OP} scale must be finite");
+    x.checked_extent("rms_norm_add_scale_batch_into x")?;
+    residual.checked_extent("rms_norm_add_scale_batch_into residual")?;
+    out.checked_extent("rms_norm_add_scale_batch_into out")?;
+    let hidden_dim = super::checked_i32(x.hidden_dim, "rms_norm_add_scale_batch_into hidden_dim")?;
+    let seq_len = super::checked_i32(x.seq_len, "rms_norm_add_scale_batch_into seq_len")?;
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (r_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
+    let result = unsafe {
         ffi::rms_norm_add_scale_batched_cuda(
             x_ptr as *const ffi::Half,
             w_ptr as *const ffi::Half,
             r_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
-            x.hidden_dim as i32,
-            x.seq_len as i32,
+            hidden_dim,
+            seq_len,
             eps,
             scale,
             crate::tensor::active_cu_stream(ctx),
-        );
-    }
+        )
+    };
+    result.result()?;
+    Ok(())
 }
 
 /// Batched fused add + RMSNorm for HiddenStates.
@@ -569,6 +671,7 @@ mod parity {
     fn assert_bitwise(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates, what: &str) {
         let a = ctx.stream.clone_dtoh(&a.data).expect("a D2H");
         let b = ctx.stream.clone_dtoh(&b.data).expect("b D2H");
+        assert_eq!(a.len(), b.len(), "{what} length mismatch");
         let diffs = a
             .iter()
             .zip(&b)
@@ -590,9 +693,10 @@ mod parity {
     }
 
     fn seeded_weight(ctx: &DeviceContext, d: usize, seed: usize) -> DeviceVec {
-        let host: Vec<bf16> = (0..d)
+        let mut host: Vec<bf16> = (0..d)
             .map(|i| bf16::from_f32((((i * 37 + seed * 13) % 511) as f32 - 255.0) / 256.0))
             .collect();
+        host[0] = bf16::from_f32(-0.0);
         DeviceVec {
             data: ctx.stream.clone_htod(&host).expect("w up"),
             len: d,
@@ -616,7 +720,8 @@ mod parity {
 
         let mut fused_a = HiddenStates::zeros(&ctx, d, rows).expect("fa");
         let mut fused_b = HiddenStates::zeros(&ctx, d, rows).expect("fb");
-        rms_norm_batch_dual_into(&ctx, &x, &wa, &wb, eps, scale, &mut fused_a, &mut fused_b);
+        rms_norm_batch_dual_into(&ctx, &x, &wa, &wb, eps, scale, &mut fused_a, &mut fused_b)
+            .expect("fused dual norm");
         assert_bitwise(&ctx, &split_a, &fused_a, "dual norm router branch");
         assert_bitwise(&ctx, &split_b, &fused_b, "dual norm expert branch");
     }
@@ -638,7 +743,8 @@ mod parity {
         crate::ops::scale_bf16_in_place(&ctx, &mut split, scale).expect("scale");
 
         let mut fused = HiddenStates::zeros(&ctx, d, rows).expect("fused");
-        rms_norm_add_scale_batch_into(&ctx, &x, &weight, &residual, scale, eps, &mut fused);
+        rms_norm_add_scale_batch_into(&ctx, &x, &weight, &residual, scale, eps, &mut fused)
+            .expect("fused tail");
         assert_bitwise(&ctx, &split, &fused, "fused layer tail");
     }
 
@@ -695,7 +801,8 @@ mod parity {
         crate::ops::add_batch_into(&ctx, &na, &nb, &mut split).expect("add");
 
         let mut fused = HiddenStates::zeros(&ctx, d, rows).expect("fused");
-        dual_rms_norm_add_batch_into(&ctx, &a, &wa, &b, &wb, eps, &mut fused);
+        dual_rms_norm_add_batch_into(&ctx, &a, &wa, &b, &wb, eps, &mut fused)
+            .expect("fused combine");
         assert_bitwise(&ctx, &split, &fused, "fused MoE combine");
     }
 }

@@ -164,13 +164,10 @@ cudaError_t FusedAddRMSNormRound(T* hidden, const T* residual, T* weight, T* out
   return cudaSuccess;
 }
 
-// Two RMSNorms of the same input in one pass. The accumulation and each
-// output's arithmetic mirror FlashInfer's RMSNormKernel operation for
-// operation. The first branch keeps the standalone scalar multiply's bf16
-// rounding point.
 template <uint32_t VEC_SIZE, typename T>
-__global__ void DualRMSNormKernel(const T* __restrict__ input, T* __restrict__ weight_a,
-                                  T* __restrict__ weight_b, T* __restrict__ out_a,
+__global__ void DualRMSNormKernel(const T* __restrict__ input,
+                                  const T* __restrict__ weight_a,
+                                  const T* __restrict__ weight_b, T* __restrict__ out_a,
                                   T* __restrict__ out_b, const uint32_t d, float eps,
                                   float scale_a) {
   const uint32_t bx = blockIdx.x;
@@ -229,6 +226,7 @@ __global__ void DualRMSNormKernel(const T* __restrict__ input, T* __restrict__ w
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      // Preserve the standalone bf16 norm rounding before the scalar multiply.
       T na = float(input_vec[j]) * rms_rcp * (0.f + float(weight_a_vec[j]));
       out_a_vec[j] = float(na) * scale_a;
       out_b_vec[j] = float(input_vec[j]) * rms_rcp * (0.f + float(weight_b_vec[j]));
@@ -240,14 +238,9 @@ __global__ void DualRMSNormKernel(const T* __restrict__ input, T* __restrict__ w
   }
 }
 
-// One norm, then the layer tail's residual add and scalar multiply, with
-// each standalone op's rounding kept in place: the normalized value rounds
-// to T as `rms_norm_batched_cuda` stores it, the sum rounds as `add_cuda`
-// does, and the scaled result rounds once more as `scale_bf16_in_place_cuda`
-// would. The reduction mirrors FlashInfer's RMSNormKernel operation for
-// operation.
 template <uint32_t VEC_SIZE, typename T>
-__global__ void RMSNormAddScaleKernel(const T* __restrict__ input, T* __restrict__ weight,
+__global__ void RMSNormAddScaleKernel(const T* __restrict__ input,
+                                      const T* __restrict__ weight,
                                       const T* __restrict__ residual, T* __restrict__ out,
                                       const uint32_t d, float eps, float scale) {
   const uint32_t bx = blockIdx.x;
@@ -305,6 +298,7 @@ __global__ void RMSNormAddScaleKernel(const T* __restrict__ input, T* __restrict
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      // Preserve the standalone bf16 norm and residual-add rounding boundaries.
       T normed = float(input_vec[j]) * rms_rcp * (0.f + float(weight_vec[j]));
       T summed = float(normed) + float(residual_vec[j]);
       out_vec[j] = float(summed) * scale;
@@ -315,16 +309,11 @@ __global__ void RMSNormAddScaleKernel(const T* __restrict__ input, T* __restrict
   }
 }
 
-// The attention epilogue's norm pair in one launch:
-//   residual_out = bf16(norm(x, weight_post) + res_in)
-//   out = RMSNorm(residual_out, weight_pre)
-// The first norm rounds to T as its standalone store would, the sum rounds
-// as `FusedAddRMSNormRoundKernel` does, and the second reduction reads the
-// rounded sums exactly as that kernel's smem row does.
 template <uint32_t VEC_SIZE, typename T>
-__global__ void RMSNormAddRMSNormRoundKernel(const T* __restrict__ x, T* __restrict__ weight_post,
+__global__ void RMSNormAddRMSNormRoundKernel(const T* __restrict__ x,
+                                             const T* __restrict__ weight_post,
                                              const T* __restrict__ res_in,
-                                             T* __restrict__ weight_pre,
+                                             const T* __restrict__ weight_pre,
                                              T* __restrict__ residual_out, T* __restrict__ out,
                                              const uint32_t d, float eps) {
   const uint32_t bx = blockIdx.x;
@@ -394,6 +383,7 @@ __global__ void RMSNormAddRMSNormRoundKernel(const T* __restrict__ x, T* __restr
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      // Round the first norm and residual sum before the second reduction.
       T normed = stash_vec[j] * rcp1 * (0.f + float(weight_vec[j]));
       T summed = float(normed) + float(res_vec[j]);
       float v = float(summed);
@@ -437,7 +427,8 @@ __global__ void RMSNormAddRMSNormRoundKernel(const T* __restrict__ x, T* __restr
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      out_vec[j] = stash_vec[j] * rcp2 * float(weight_vec[j]);
+      // Preserve standalone RMSNorm's signed-zero addition before the multiply.
+      out_vec[j] = stash_vec[j] * rcp2 * (0.f + float(weight_vec[j]));
     }
     if (elem < d) {
       out_vec.store(out + bx * d + elem);
@@ -445,14 +436,11 @@ __global__ void RMSNormAddRMSNormRoundKernel(const T* __restrict__ x, T* __restr
   }
 }
 
-// The MoE combine tail in one launch: `out = norm(a, weight_a) + norm(b,
-// weight_b)`, replacing two norms and an add. Each branch's reduction and
-// elementwise arithmetic mirror FlashInfer's RMSNormKernel operation for
-// operation, each normalized value rounds to T as the standalone store
-// would, and the sum rounds once as `add_cuda` does.
 template <uint32_t VEC_SIZE, typename T>
-__global__ void DualRMSNormAddKernel(const T* __restrict__ a, T* __restrict__ weight_a,
-                                     const T* __restrict__ b, T* __restrict__ weight_b,
+__global__ void DualRMSNormAddKernel(const T* __restrict__ a,
+                                     const T* __restrict__ weight_a,
+                                     const T* __restrict__ b,
+                                     const T* __restrict__ weight_b,
                                      T* __restrict__ out, const uint32_t d, float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -522,6 +510,7 @@ __global__ void DualRMSNormAddKernel(const T* __restrict__ a, T* __restrict__ we
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      // Round both standalone norms before their bf16 sum.
       T na = float(a_vec[j]) * rcp_a * (0.f + float(weight_a_vec[j]));
       T nb = float(b_vec[j]) * rcp_b * (0.f + float(weight_b_vec[j]));
       out_vec[j] = float(na) + float(nb);
@@ -577,11 +566,9 @@ void rms_norm_batched_cuda(const DType *x, const DType *weight, DType *out,
         seq_len, hidden_dim, hidden_dim, hidden_dim, eps, false, stream);
 }
 
-// Two norms of one input, reduced once. The router branch's scale preserves
-// the trailing standalone bf16 multiply.
-void rms_norm_batched_dual_cuda(const DType *x, const DType *weight_a, const DType *weight_b,
-                                DType *out_a, DType *out_b, int hidden_dim, int seq_len,
-                                float eps, float scale_a, cudaStream_t stream) {
+CUresult rms_norm_batched_dual_cuda(const DType *x, const DType *weight_a, const DType *weight_b,
+                                    DType *out_a, DType *out_b, int hidden_dim, int seq_len,
+                                    float eps, float scale_a, cudaStream_t stream) {
     const uint32_t d = static_cast<uint32_t>(hidden_dim);
     const uint32_t vec_size = std::gcd<uint32_t>(16 / sizeof(DType), d);
     const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -591,16 +578,14 @@ void rms_norm_batched_dual_cuda(const DType *x, const DType *weight_a, const DTy
     const uint32_t smem_size = num_warps * sizeof(float);
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         pegainfer::norm::DualRMSNormKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
-            x, const_cast<DType*>(weight_a), const_cast<DType*>(weight_b), out_a, out_b, d, eps,
-            scale_a);
+            x, weight_a, weight_b, out_a, out_b, d, eps, scale_a);
     });
+    return static_cast<CUresult>(cudaGetLastError());
 }
 
-// The MoE combine tail in one launch: `out = norm(a, wa) + norm(b, wb)`,
-// bitwise what two `rms_norm_batched_cuda` calls and an `add_cuda` produce.
-void dual_rms_norm_add_batched_cuda(const DType *a, const DType *weight_a, const DType *b,
-                                    const DType *weight_b, DType *out, int hidden_dim,
-                                    int seq_len, float eps, cudaStream_t stream) {
+CUresult dual_rms_norm_add_batched_cuda(const DType *a, const DType *weight_a, const DType *b,
+                                        const DType *weight_b, DType *out, int hidden_dim,
+                                        int seq_len, float eps, cudaStream_t stream) {
     const uint32_t d = static_cast<uint32_t>(hidden_dim);
     const uint32_t vec_size = std::gcd<uint32_t>(16 / sizeof(DType), d);
     const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -610,14 +595,11 @@ void dual_rms_norm_add_batched_cuda(const DType *a, const DType *weight_a, const
     const uint32_t smem_size = 2 * num_warps * sizeof(float);
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         pegainfer::norm::DualRMSNormAddKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
-            a, const_cast<DType*>(weight_a), b, const_cast<DType*>(weight_b), out, d, eps);
+            a, weight_a, b, weight_b, out, d, eps);
     });
+    return static_cast<CUresult>(cudaGetLastError());
 }
 
-// The attention epilogue's norm pair in one launch, bitwise what
-// `rms_norm_batched_cuda` then `fused_add_rms_norm_round_batched_cuda`
-// produce: `residual_out = bf16(norm(x, w_post) + res_in)`,
-// `out = norm(residual_out, w_pre)`.
 CUresult rms_norm_add_rms_norm_round_batched_cuda(const DType *x, const DType *weight_post,
                                                   const DType *res_in, const DType *weight_pre,
                                                   DType *residual_out, DType *out, int hidden_dim,
@@ -632,22 +614,24 @@ CUresult rms_norm_add_rms_norm_round_batched_cuda(const DType *x, const DType *w
     cudaError_t err = cudaSuccess;
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         auto kernel = pegainfer::norm::RMSNormAddRMSNormRoundKernel<VEC_SIZE, DType>;
-        err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        constexpr uint32_t default_smem_size = 48 * 1024;
+        if (smem_size > default_smem_size) {
+            err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       smem_size);
+        }
         if (err == cudaSuccess) {
             kernel<<<nblks, nthrs, smem_size, stream>>>(
-                x, const_cast<DType*>(weight_post), res_in, const_cast<DType*>(weight_pre),
-                residual_out, out, d, eps);
+                x, weight_post, res_in, weight_pre, residual_out, out, d, eps);
             err = cudaGetLastError();
         }
     });
     return static_cast<CUresult>(err);
 }
 
-// The layer tail in one launch: `out = (residual + norm(x, weight)) * scale`
-// with the three standalone ops' roundings kept in place.
-void rms_norm_add_scale_batched_cuda(const DType *x, const DType *weight, const DType *residual,
-                                     DType *out, int hidden_dim, int seq_len, float eps,
-                                     float scale, cudaStream_t stream) {
+CUresult rms_norm_add_scale_batched_cuda(const DType *x, const DType *weight,
+                                         const DType *residual, DType *out, int hidden_dim,
+                                         int seq_len, float eps, float scale,
+                                         cudaStream_t stream) {
     const uint32_t d = static_cast<uint32_t>(hidden_dim);
     const uint32_t vec_size = std::gcd<uint32_t>(16 / sizeof(DType), d);
     const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -657,8 +641,9 @@ void rms_norm_add_scale_batched_cuda(const DType *x, const DType *weight, const 
     const uint32_t smem_size = num_warps * sizeof(float);
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         pegainfer::norm::RMSNormAddScaleKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
-            x, const_cast<DType*>(weight), residual, out, d, eps, scale);
+            x, weight, residual, out, d, eps, scale);
     });
+    return static_cast<CUresult>(cudaGetLastError());
 }
 
 // ============================================================================

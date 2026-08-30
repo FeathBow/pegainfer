@@ -220,7 +220,7 @@ pub(crate) fn moe_into(
         (geom.hidden_size as f32).powf(-0.5),
         &mut scratch.router_in,
         &mut scratch.moe_in,
-    );
+    )?;
     ops::gemm_rows_into_checked(
         ctx,
         &moe.router_proj,
@@ -336,7 +336,7 @@ pub(crate) fn moe_into(
         &moe.post_feedforward_layernorm_2,
         geom.rms_norm_eps,
         out,
-    );
+    )?;
     Ok(())
 }
 

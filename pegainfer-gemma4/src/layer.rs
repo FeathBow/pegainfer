@@ -282,6 +282,6 @@ pub(crate) fn attention_epilogue_into(
         layer.layer_scalar,
         geom.rms_norm_eps,
         out,
-    );
+    )?;
     Ok(())
 }
