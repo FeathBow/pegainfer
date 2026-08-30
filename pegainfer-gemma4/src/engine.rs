@@ -2757,6 +2757,75 @@ mod lane_tests {
         assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
     }
 
+    /// The production loop runs an intake pass before every decode round.
+    /// With both slots held and a request queued, that pass can admit
+    /// nothing, so it must leave the staged successor and the step
+    /// fingerprint alone; the third request joins only once a slot frees.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_full_roster_keeps_its_pipeline_under_a_queue() {
+        let dir = crate::testkit::model_path();
+        let policy = super::generation_policy(&dir).expect("policy");
+        let _env = scoped_engine_env(&[("PEGAINFER_DECODE_SLOTS", "2")]);
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        let prompts = walk_prompts();
+        let (req_a, mut rx_a) = walk_request(prompts[0].clone(), 24);
+        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 24);
+        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), 6);
+
+        let mut pending = std::collections::VecDeque::new();
+        let mut active: Vec<super::Active> = Vec::new();
+        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
+        pending.push_back((req_b, pegainfer_frontend::engine::KvPrefix::none()));
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(active.len(), 2, "both slots are held by live requests");
+        pending.push_back((req_c, pegainfer_frontend::engine::KvPrefix::none()));
+
+        state.decode_round(&mut active);
+        state.decode_round(&mut active);
+        assert!(
+            state.pipeline.is_some(),
+            "a greedy batch stages a successor"
+        );
+        assert!(
+            state.arena.has_decode_fingerprint(),
+            "a regular step leaves its fingerprint"
+        );
+        for round in 0..4 {
+            state.admit_from_queue(&mut pending, &mut active);
+            assert_eq!(
+                pending.len(),
+                1,
+                "round {round}: full slots keep the third queued"
+            );
+            assert!(
+                state.pipeline.is_some(),
+                "round {round}: an intake that admits nothing keeps the pipeline"
+            );
+            assert!(
+                state.arena.has_decode_fingerprint(),
+                "round {round}: and the fingerprint"
+            );
+            state.decode_round(&mut active);
+        }
+
+        while active.len() == 2 {
+            state.admit_from_queue(&mut pending, &mut active);
+            state.decode_round(&mut active);
+        }
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(active.len(), 2, "the freed slot admits the third request");
+        assert!(pending.is_empty(), "the queue drained");
+        while !active.is_empty() {
+            state.admit_from_queue(&mut pending, &mut active);
+            state.decode_round(&mut active);
+        }
+        assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 24);
+        assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 24);
+        assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
+    }
+
     /// The chunked pool provisions one shared segment transient, so no
     /// walker may park pages ahead of its rounds: with the knob set before
     /// load — the reduced production pool, asserted against the provision
