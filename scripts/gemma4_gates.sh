@@ -152,9 +152,9 @@ gate_is_in() {
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || die "cannot enter the repository root"
 
-[ -z "${PEGAINFER_KV_FP8:-}" ] || die \
+[ -z "${PEGAINFER_KV_FP8+x}" ] || die \
   "PEGAINFER_KV_FP8 is ambient; PEGAINFER_GATE_STORAGE is the only storage switch"
-gate_storage=${PEGAINFER_GATE_STORAGE:-bf16}
+gate_storage=${PEGAINFER_GATE_STORAGE-bf16}
 case "$gate_storage" in
   bf16) ;;
   fp8) export PEGAINFER_KV_FP8=local ;;
