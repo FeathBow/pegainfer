@@ -154,7 +154,7 @@ fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>
     }
 }
 
-fn prefix_cache_cap() -> Result<Option<usize>> {
+pub(crate) fn prefix_cache_cap() -> Result<Option<usize>> {
     read_env(PREFIX_CACHE_ENV)?.map_or(Ok(None), |raw| parse_prefix_cache_cap(&raw))
 }
 

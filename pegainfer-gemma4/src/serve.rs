@@ -659,8 +659,10 @@ fn local_kv_elem_bytes() -> Result<usize> {
     match std::env::var("PEGAINFER_KV_FP8") {
         Err(std::env::VarError::NotPresent) => Ok(2),
         Ok(value) if value == "local" => {
+            // The parsed capacity, not the variable's presence: "0", "off"
+            // and an empty value all mean the cache is disabled.
             anyhow::ensure!(
-                std::env::var_os("PEGAINFER_PREFIX_CACHE").is_none(),
+                crate::engine::prefix_cache_cap()?.is_none(),
                 "PEGAINFER_KV_FP8 and PEGAINFER_PREFIX_CACHE cannot combine: the prefix cache \
                  copies pool pages in bf16 element units"
             );
