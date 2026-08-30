@@ -408,25 +408,28 @@ fn agreement(left: &[usize], right: &[usize]) -> usize {
     left.iter().zip(right).filter(|(a, b)| a == b).count()
 }
 
-#[test]
-#[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
-fn fp8_argmax_agreement_meets_the_bf16_floor() {
-    const SAMPLE_STRIDE: usize = 8;
-    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
-    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("window fixture");
-    let (_, prompt) = u32_tensor(&fixture, "w1023_prompt");
-    let sampled: Vec<usize> = (0..prompt.len()).step_by(SAMPLE_STRIDE).collect();
+fn agreement_case(
+    fixture: &safetensors::SafeTensors<'_>,
+    tensor_name: &str,
+    truncate_to: usize,
+    stride: usize,
+) -> (usize, usize, usize) {
+    let (_, mut prompt) = u32_tensor(fixture, tensor_name);
+    prompt.truncate(truncate_to);
+    let sampled: Vec<usize> = (0..prompt.len()).step_by(stride).collect();
+    let max_context = prompt.len().div_ceil(crate::kv::PAGE_SIZE) * crate::kv::PAGE_SIZE;
+    // One request at the case depth, plus each pool's padding page.
+    let pages = max_context.div_ceil(crate::kv::PAGE_SIZE) + 2;
 
-    let (ctx, bf16, _) = stack_with_storage(1024, 66, KvStorage::Bf16);
+    let (ctx, bf16, _) = stack_with_storage(max_context, pages, KvStorage::Bf16);
     let bf16_incremental = incremental_argmaxes(&ctx, &bf16, &prompt);
-    // Recompute is quadratic, so every eighth position defines the sampled floor.
     let bf16_recomputed = recomputed_argmaxes(&ctx, &bf16, &prompt, &sampled);
     let bf16_sampled: Vec<usize> = sampled.iter().map(|&pos| bf16_incremental[pos]).collect();
     let floor_matches = agreement(&bf16_sampled, &bf16_recomputed);
     drop(bf16);
     drop(ctx);
 
-    let (ctx, fp8, _) = stack_with_storage(1024, 66, KvStorage::E4m3);
+    let (ctx, fp8, _) = stack_with_storage(max_context, pages, KvStorage::E4m3);
     let fp8_incremental = incremental_argmaxes(&ctx, &fp8, &prompt);
     let fp8_sampled: Vec<usize> = sampled.iter().map(|&pos| fp8_incremental[pos]).collect();
     let fp8_matches = agreement(&fp8_sampled, &bf16_sampled);
@@ -437,15 +440,34 @@ fn fp8_argmax_agreement_meets_the_bf16_floor() {
     let fp8_rate =
         f64::from(u32::try_from(fp8_matches).expect("match count fits u32")) / samples_f64;
     eprintln!(
-        "argmax agreement: bf16 incremental/recompute {floor_rate:.6} \
+        "{tensor_name}: argmax agreement: bf16 incremental/recompute {floor_rate:.6} \
          ({floor_matches}/{samples}), fp8/bf16 incremental {fp8_rate:.6} \
          ({fp8_matches}/{samples})"
     );
-    assert!(
-        fp8_matches >= floor_matches,
-        "fp8/bf16 argmax agreement {fp8_matches}/{samples} is below the bf16 \
-         incremental/recompute floor {floor_matches}/{samples}"
-    );
+    (floor_matches, fp8_matches, samples)
+}
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
+fn fp8_argmax_agreement_meets_the_bf16_floor() {
+    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("window fixture");
+    // Recompute is quadratic; these strides keep both window depths sampled.
+    // Every case measures before any verdict, so a failing first case cannot
+    // hide the second case's numbers.
+    let results = [("w1023_prompt", usize::MAX, 2), ("w4096_prompt", 2048, 8)]
+        .map(|(name, cut, stride)| (name, agreement_case(&fixture, name, cut, stride)));
+    for (name, (floor, fp8, samples)) in results {
+        assert!(
+            floor * 2 > samples,
+            "{name}: degenerate bf16 incremental/recompute floor {floor}/{samples}"
+        );
+        assert!(
+            fp8 >= floor,
+            "{name}: fp8/bf16 argmax agreement {fp8}/{samples} is below the bf16 \
+             incremental/recompute floor {floor}/{samples}"
+        );
+    }
 }
 
 /// `window_left` masks out-of-window keys whether or not their pages are
