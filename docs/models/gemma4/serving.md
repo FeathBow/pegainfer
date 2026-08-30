@@ -110,6 +110,12 @@ The cache brings its own page budget, added to the pool lines above at startup. 
 
 At `PEGAINFER_PREFIX_CACHE=16` the idle footprint measured **39242 MiB** against the 33034 MiB baseline — the difference is the pre-allocated cache budget.
 
+## The admission coalesce door (opt-in)
+
+`PEGAINFER_ADMIT_COALESCE_MS=N` (`1..=2000`; unset, `off` or `0` admits on sight) holds arrivals that would invade a live decode batch, then releases a window's arrivals as one back-to-back admission burst. It prices the number of admission interruptions, not their size: whole prompts beyond the 512-row gather budget still take separate weight scans unless `PEGAINFER_MIX_CHUNK_TOKENS` enables the chunked walk. An idle engine admits immediately, and a shallow roster skips the door when `(active + pending) * 2 < slots`.
+
+A deep roster releases when the window expires or the pending queue reaches `min(4, slots - active)`, with a floor of one. That cohort is a capacity bound over the currently free slots, not a cross-completion batch. The door refuses to combine with `PEGAINFER_ASYNC_PREFILL`, whose single in-flight prefill could only be delayed by it. Measured under sustained load, c16 median TPOT improves about 8.5% for about +288 ms median TTFT; c8 pays about 5.7% throughput and about +19 ms TTFT. P99 ITL is flat to slightly worse everywhere, so the door remains off by default.
+
 ## The async prefill lane (opt-in)
 
 When `PEGAINFER_ASYNC_PREFILL` is unset, serving uses the normal mixed-step path; when set, a live-batch admission's prefill moves onto its own stream so decode steps keep replaying while the prompt computes. Dense and routed checkpoints share this path at the default context ceiling. `green:NN` pins the lane to roughly NN% of the SMs via a Green Context — the cap is the mechanism: a `shared` lane's full-width prefill grids starve decode steps, and is kept only for comparison. An unrecognized value or an unviable SM partition refuses to start rather than silently degrading.

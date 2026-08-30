@@ -46,6 +46,7 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
 - `PEGAINFER_KV_FP8` — gemma4 opt-in fp8 KV: `local` stores the sliding family's K/V as e4m3 at scale 1.0 (lossy; halves the local pool; refuses an enabled prefix cache; unset = byte-identical serving)
 - `PEGAINFER_PREFIX_CACHE` — gemma4 opt-in conversation prefix cache: `K` entries of captured prompt state resume multi-turn prompts (pre-allocated page budget; unset = off, byte-identical serving)
+- `PEGAINFER_ADMIT_COALESCE_MS` — gemma4 opt-in admission coalesce door: `N` ms in `1..=2000` (`off`/`0`/unset = admit on sight), holds arrivals that would invade a live decode batch so a window's arrivals land as one admission burst; refuses the async prefill lane; merging into one mixed step needs the chunked walk or a sub-budget prompt
 - `PEGAINFER_ASYNC_PREFILL` — gemma4 opt-in overlap lane: `green:NN` prefills live-batch admissions on an SM-capped stream to protect decode tails (`shared` for comparison; unset = off; bad values refuse to start)
 - `PEGAINFER_MIX_CHUNK_TOKENS` — gemma4 opt-in chunked walk: a mixed admission computes at most `N` prompt rows per step (`64 <= N <` the serving ceiling; unset = whole-prompt steps; bad values refuse to start)
 - `PEGAINFER_MAX_CONTEXT` — gemma4 serving ceiling raise (default 8192, up to the checkpoint's 262144; a raise past the default needs `PEGAINFER_MIX_CHUNK_TOKENS` and refuses the async lane)
