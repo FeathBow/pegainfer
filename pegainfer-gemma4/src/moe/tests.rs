@@ -41,23 +41,46 @@ fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
         / scale
 }
 
-fn row_span<T: cudarc::driver::DeviceRepr>(
+fn capture_rows<T: cudarc::driver::DeviceRepr>(
     ctx: &DeviceContext,
     data: &CudaSlice<T>,
-    row: usize,
-    len: usize,
-) -> Vec<T> {
-    ctx.stream
-        .clone_dtoh(&data.slice(row * len..(row + 1) * len))
-        .expect("row span")
+    row_len: usize,
+    rows: &[usize],
+) -> std::collections::HashMap<usize, Vec<T>> {
+    let mut captured = std::collections::HashMap::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len() && rows[end] == rows[end - 1] + 1 {
+            end += 1;
+        }
+        let first = rows[start];
+        let last = rows[end - 1] + 1;
+        let host = ctx
+            .stream
+            .clone_dtoh(&data.slice(first * row_len..last * row_len))
+            .expect("row run");
+        let mut values = host.into_iter();
+        for &row in &rows[start..end] {
+            captured.insert(row, values.by_ref().take(row_len).collect());
+        }
+        start = end;
+    }
+    captured
 }
 
-fn bf16_bits(values: &[half::bf16]) -> Vec<u16> {
-    values.iter().map(|value| value.to_bits()).collect()
+fn same_bits_bf16(a: &[half::bf16], b: &[half::bf16]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
-fn f32_bits(values: &[f32]) -> Vec<u32> {
-    values.iter().map(|value| value.to_bits()).collect()
+fn same_bits_f32(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
 /// One dispatch's device results. Picks come back whole because padding needs
@@ -115,38 +138,33 @@ fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapt
         "{label}: router picks moved"
     );
     for row in &expected.rows {
-        assert_eq!(
-            bf16_bits(&expected.logits[row]),
-            bf16_bits(&actual.logits[row]),
+        assert!(
+            same_bits_bf16(&expected.logits[row], &actual.logits[row]),
             "{label}: row {row} router logits moved"
         );
-        assert_eq!(
-            f32_bits(&expected.weight[row]),
-            f32_bits(&actual.weight[row]),
+        assert!(
+            same_bits_f32(&expected.weight[row], &actual.weight[row]),
             "{label}: row {row} router weights moved"
         );
-        assert_eq!(
-            bf16_bits(&expected.gate[row]),
-            bf16_bits(&actual.gate[row]),
+        assert!(
+            same_bits_bf16(&expected.gate[row], &actual.gate[row]),
             "{label}: row {row} gate bytes moved"
         );
-        assert_eq!(
-            bf16_bits(&expected.down[row]),
-            bf16_bits(&actual.down[row]),
+        assert!(
+            same_bits_bf16(&expected.down[row], &actual.down[row]),
             "{label}: row {row} down bytes moved"
         );
-        assert_eq!(
-            bf16_bits(&expected.block[row]),
-            bf16_bits(&actual.block[row]),
+        assert!(
+            same_bits_bf16(&expected.block[row], &actual.block[row]),
             "{label}: row {row} block bytes moved"
         );
     }
 }
 
-/// Proves a route's expert GEMM, its weighted down projection and the combined
-/// block are the same bits on the 16-row and the 64-row block. The router
-/// projection is a cuBLAS GEMM whose algorithm follows the batch, so its
-/// logits are matched by expert identity rather than compared as bytes.
+/// Proves that on the same input rows the 16-row and 64-row blocks pick the
+/// same experts with the same weight bits and produce the same gate,
+/// weighted-down and block bits. A router that picked differently fails loudly
+/// rather than shrinking this oracle's coverage.
 fn assert_cross_policy_bytes(
     label: &str,
     narrow: &RoutedCapture,
@@ -169,51 +187,61 @@ fn assert_cross_policy_bytes(
             .enumerate()
             .map(|(slot, &expert)| (expert, slot))
             .collect();
-        let mut common = 0usize;
-        let mut whole_row = true;
+        let narrow_experts = narrow.index[row * top_k..(row + 1) * top_k]
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let coarse_experts = coarse_slots
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            narrow_experts, coarse_experts,
+            "{label}: router picked different experts for the same input row at 1023 and 1024 \
+             rows, so the router projection is batch-dependent on this device and the \
+             block-policy oracle must be decoupled from the router before this comparison is \
+             weakened (row {row})"
+        );
         for pick in 0..top_k {
             let at = row * top_k + pick;
             let expert = narrow.index[at];
-            let Some(&coarse_pick) = coarse_slots.get(&expert) else {
-                whole_row = false;
-                continue;
-            };
-            common += 1;
+            let coarse_pick = coarse_slots[&expert];
+            assert!(
+                narrow.weight[row][pick].to_bits() == coarse.weight[row][coarse_pick].to_bits(),
+                "{label}: router weight for expert {expert} on row {row} differs between the two \
+                 dispatches"
+            );
             let narrow_gate = pick * width..(pick + 1) * width;
             let coarse_gate = coarse_pick * width..(coarse_pick + 1) * width;
-            assert_eq!(
-                bf16_bits(&narrow.gate[row][narrow_gate]),
-                bf16_bits(&coarse.gate[row][coarse_gate]),
+            assert!(
+                same_bits_bf16(
+                    &narrow.gate[row][narrow_gate],
+                    &coarse.gate[row][coarse_gate]
+                ),
                 "{label}: row {row} expert {expert} gate bytes differ across the block policy"
             );
             gate_routes += 1;
-            if narrow.weight[row][pick].to_bits() != coarse.weight[row][coarse_pick].to_bits() {
-                whole_row = false;
-                continue;
-            }
             let narrow_down = pick * hidden..(pick + 1) * hidden;
             let coarse_down = coarse_pick * hidden..(coarse_pick + 1) * hidden;
-            assert_eq!(
-                bf16_bits(&narrow.down[row][narrow_down]),
-                bf16_bits(&coarse.down[row][coarse_down]),
+            assert!(
+                same_bits_bf16(
+                    &narrow.down[row][narrow_down],
+                    &coarse.down[row][coarse_down]
+                ),
                 "{label}: row {row} expert {expert} down bytes differ across the block policy"
             );
             down_routes += 1;
         }
-        assert!(common > 0, "{label}: row {row} has no common expert");
-        if whole_row {
-            assert_eq!(
-                bf16_bits(&narrow.block[row]),
-                bf16_bits(&coarse.block[row]),
-                "{label}: row {row} block bytes differ across the block policy"
-            );
-            block_rows += 1;
-        }
+        assert!(
+            same_bits_bf16(&narrow.block[row], &coarse.block[row]),
+            "{label}: row {row} block bytes differ across the block policy"
+        );
+        block_rows += 1;
     }
-    assert!(
-        down_routes > 0,
-        "{label}: the router weights agreed on no common route, so the down bytes went untested"
-    );
+    let expected_routes = narrow.rows.len() * top_k;
+    assert_eq!(gate_routes, expected_routes);
+    assert_eq!(down_routes, expected_routes);
+    assert_eq!(block_rows, narrow.rows.len());
     eprintln!(
         "{label}: {gate_routes} gate routes, {down_routes} down routes, {block_rows} block rows over {} rows",
         narrow.rows.len()
@@ -221,7 +249,7 @@ fn assert_cross_policy_bytes(
 }
 
 /// The host side of the block: checkpoint weights widened on the host, the
-/// norm vectors, and the expert matrices decoded on demand.
+/// norm vectors, and expert matrices retained for the current row.
 struct HostBlock<'a> {
     hidden: usize,
     width: usize,
@@ -283,15 +311,20 @@ fn assert_matches_reference(
 
     let (hidden, width, top_k, experts, eps) =
         (host.hidden, host.width, host.top_k, host.experts, host.eps);
-    let residual_f32: Vec<f32> = residual_host.iter().map(|x| x.to_f32()).collect();
-    let dense_f32: Vec<f32> = dense_host.iter().map(|x| x.to_f32()).collect();
     for row in rows {
-        let residual_row = &residual_f32[row * hidden..(row + 1) * hidden];
+        let residual_row = residual_host[row * hidden..(row + 1) * hidden]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect::<Vec<_>>();
+        let dense_row = dense_host[row * hidden..(row + 1) * hidden]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect::<Vec<_>>();
 
         // The host projection rounds where the device does: the norm's
         // store, the scalar multiply, and the stored logits.
         let scale = (hidden as f32).sqrt().recip();
-        let router_in: Vec<f32> = rms(residual_row, Some(&host.router_scale), eps)
+        let router_in: Vec<f32> = rms(&residual_row, Some(&host.router_scale), eps)
             .iter()
             .map(|v| bf16::from_f32(bf16::from_f32(*v).to_f32() * scale).to_f32())
             .collect();
@@ -345,7 +378,7 @@ fn assert_matches_reference(
             );
         }
 
-        let expert_in = rms(residual_row, Some(&host.pre_norm), eps);
+        let expert_in = rms(&residual_row, Some(&host.pre_norm), eps);
         let mut routed_row = vec![0.0f32; hidden];
         for (pick, &expert) in picks.iter().enumerate() {
             let matrices = host.expert(expert as usize);
@@ -396,11 +429,7 @@ fn assert_matches_reference(
                 *slot += value;
             }
         }
-        let dense_normed = rms(
-            &dense_f32[row * hidden..(row + 1) * hidden],
-            Some(&host.post_dense_norm),
-            eps,
-        );
+        let dense_normed = rms(&dense_row, Some(&host.post_dense_norm), eps);
         let routed_normed = rms(&routed_row, Some(&host.post_routed_norm), eps);
         let reference_block: Vec<f32> = (0..hidden)
             .map(|i| dense_normed[i] + routed_normed[i])
@@ -411,6 +440,7 @@ fn assert_matches_reference(
             block_gap <= RELATIVE_TOLERANCE,
             "{label}: row {row} combined block differs from the reference by {block_gap:.3e}"
         );
+        host.widened.borrow_mut().clear();
     }
 }
 
@@ -480,46 +510,16 @@ fn the_routed_block_matches_the_reference_formulas() {
                         .expect("padded total")[0],
                 )
                 .expect("padded total"),
-                logits: rows
-                    .iter()
-                    .map(|&row| {
-                        (
-                            row,
-                            row_span(&ctx, &scratch.logits.data, row, routed.num_experts),
-                        )
-                    })
-                    .collect(),
+                logits: capture_rows(&ctx, &scratch.logits.data, routed.num_experts, rows),
                 index: ctx
                     .stream
                     .clone_dtoh(&scratch.index.slice(..active_slots))
                     .expect("index"),
-                weight: rows
-                    .iter()
-                    .map(|&row| (row, row_span(&ctx, &scratch.weight, row, top_k)))
-                    .collect(),
+                weight: capture_rows(&ctx, &scratch.weight, top_k, rows),
                 rows: rows.to_vec(),
-                gate: rows
-                    .iter()
-                    .map(|&row| {
-                        (
-                            row,
-                            row_span(&ctx, &scratch.routed_gate.data, row, top_k * width),
-                        )
-                    })
-                    .collect(),
-                down: rows
-                    .iter()
-                    .map(|&row| {
-                        (
-                            row,
-                            row_span(&ctx, &scratch.routed_down.data, row, top_k * hidden),
-                        )
-                    })
-                    .collect(),
-                block: rows
-                    .iter()
-                    .map(|&row| (row, row_span(&ctx, &out.data, row, hidden)))
-                    .collect(),
+                gate: capture_rows(&ctx, &scratch.routed_gate.data, top_k * width, rows),
+                down: capture_rows(&ctx, &scratch.routed_down.data, top_k * hidden, rows),
+                block: capture_rows(&ctx, &out.data, hidden, rows),
             }
         };
     let all_rows = |rows: usize| (0..rows).collect::<Vec<_>>();
