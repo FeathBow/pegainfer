@@ -82,10 +82,10 @@ GATES_ROUTED=(
 # These live in pegainfer-kernels under the gemma4 feature and need no checkpoint.
 GATES_KERNELS=(
   "gpu ops::gemma4::tests::router_topk_matches_the_exact_128_expert_contract"
-  "gpu ops::norm::tests::the_dual_norm_matches_two_standalone_norms"
-  "gpu ops::norm::tests::the_layer_tail_matches_its_parts"
-  "gpu ops::norm::tests::the_epilogue_norm_pair_matches_its_parts"
-  "gpu ops::norm::tests::the_moe_combine_tail_matches_its_parts"
+  "gpu ops::norm::parity::the_dual_norm_matches_two_standalone_norms"
+  "gpu ops::norm::parity::the_layer_tail_matches_its_parts"
+  "gpu ops::norm::parity::the_epilogue_norm_pair_matches_its_parts"
+  "gpu ops::norm::parity::the_moe_combine_tail_matches_its_parts"
 )
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
