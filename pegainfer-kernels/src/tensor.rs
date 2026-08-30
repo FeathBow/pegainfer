@@ -79,12 +79,7 @@ pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
         .unwrap_or_else(|| ctx.stream.cu_stream())
 }
 
-/// Bounded spin wait on the context stream. A blocking wait parks the caller
-/// and pays the OS scheduler's wake-up — low milliseconds per call on a
-/// loaded host — which a decode loop pays every step right before it reads
-/// the sampled tokens. Polling `cuStreamQuery` keeps the wake on our side;
-/// the cap falls back to the parking wait so a stuck stream still sleeps
-/// instead of burning the core forever.
+/// Poll the active stream up to a fixed cap, then synchronize that stream.
 const STREAM_SPIN_WAIT_CAP: std::time::Duration = std::time::Duration::from_millis(5);
 
 pub fn stream_spin_wait(ctx: &DeviceContext) -> anyhow::Result<()> {
@@ -95,10 +90,12 @@ pub fn stream_spin_wait(ctx: &DeviceContext) -> anyhow::Result<()> {
             cudarc::driver::sys::CUresult::CUDA_SUCCESS => return Ok(()),
             cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
                 if std::time::Instant::now() >= cap {
-                    return ctx
-                        .stream
-                        .synchronize()
-                        .map_err(|e| anyhow::anyhow!("stream sync after spin cap failed: {e}"));
+                    let result = unsafe { cudarc::driver::sys::cuStreamSynchronize(stream) };
+                    anyhow::ensure!(
+                        result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                        "stream sync after spin cap failed: {result:?}"
+                    );
+                    return Ok(());
                 }
                 std::hint::spin_loop();
             }
@@ -118,6 +115,10 @@ pub fn memcpy_dtod_u32_from_i32(
     use cudarc::driver::DevicePtrMut;
 
     anyhow::ensure!(
+        !has_stream_override(),
+        "dtod i32->u32 copy runs on the base stream only"
+    );
+    anyhow::ensure!(
         count <= src.len() && count <= dst.len(),
         "dtod i32->u32 copy of {count} exceeds src {} or dst {}",
         src.len(),
@@ -126,7 +127,6 @@ pub fn memcpy_dtod_u32_from_i32(
     if count == 0 {
         return Ok(());
     }
-    let stream = active_cu_stream(ctx);
     let (src_ptr, _src_guard) = src.device_ptr(&ctx.stream);
     let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&ctx.stream);
     let result = unsafe {
@@ -134,7 +134,7 @@ pub fn memcpy_dtod_u32_from_i32(
             dst_ptr,
             src_ptr,
             count * std::mem::size_of::<i32>(),
-            stream,
+            ctx.stream.cu_stream(),
         )
     };
     anyhow::ensure!(

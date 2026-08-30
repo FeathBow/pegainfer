@@ -315,7 +315,7 @@ fn validate_greedy_shape(
     Ok(())
 }
 
-/// Capturable argmax and device copy into the next embedding's id buffer.
+/// Capturable base-stream-only argmax and device copy into the next embedding's id buffer.
 pub fn greedy_argmax_ids(
     ctx: &DeviceContext,
     logits: &HiddenStates,
@@ -323,6 +323,10 @@ pub fn greedy_argmax_ids(
     ids_out: &mut CudaSlice<u32>,
     scratch: &mut SampleScratch,
 ) -> Result<()> {
+    ensure!(
+        !has_stream_override(),
+        "the staged sampler path runs on the base stream only"
+    );
     validate_greedy_shape(logits, rows, scratch)?;
     argmax_batch_bf16_split_indexed_into(
         ctx,
@@ -337,12 +341,16 @@ pub fn greedy_argmax_ids(
     pegainfer_kernels::tensor::memcpy_dtod_u32_from_i32(ctx, &scratch.argmax_out, ids_out, rows)
 }
 
-/// Queue the pinned readback outside the sampler graph.
+/// Queue the base-stream-only pinned readback outside the sampler graph.
 pub fn greedy_stage_readback(
     ctx: &DeviceContext,
     slot: usize,
     scratch: &mut SampleScratch,
 ) -> Result<()> {
+    ensure!(
+        !has_stream_override(),
+        "the staged sampler path runs on the base stream only"
+    );
     ensure!(
         slot < STAGED_READBACK_SLOTS,
         "greedy_stage_readback: slot {slot} out of range"
@@ -357,8 +365,8 @@ pub fn greedy_stage_readback(
         .map_err(|e| anyhow!("greedy_stage_readback D2H stage failed: {e}"))
 }
 
-/// Argmax every row, leave the picks in the next embedding's id buffer, and
-/// queue their pinned readback without waiting for it.
+/// On the base stream, argmax every row, leave the picks in the next embedding's
+/// id buffer, and queue their pinned readback without waiting for it.
 pub fn greedy_stage_resident(
     ctx: &DeviceContext,
     logits: &HiddenStates,
@@ -367,6 +375,10 @@ pub fn greedy_stage_resident(
     slot: usize,
     scratch: &mut SampleScratch,
 ) -> Result<()> {
+    ensure!(
+        !has_stream_override(),
+        "the staged sampler path runs on the base stream only"
+    );
     greedy_argmax_ids(ctx, logits, rows, ids_out, scratch)?;
     greedy_stage_readback(ctx, slot, scratch)
 }
