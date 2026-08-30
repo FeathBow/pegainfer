@@ -196,6 +196,16 @@ fn assert_cross_policy_bytes(
             .copied()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(
+            narrow_experts.len(),
+            top_k,
+            "{label}: row {row} narrow picks repeat an expert"
+        );
+        assert_eq!(
+            coarse_experts.len(),
+            top_k,
+            "{label}: row {row} coarse picks repeat an expert"
+        );
+        assert_eq!(
             narrow_experts, coarse_experts,
             "{label}: router picked different experts for the same input row at 1023 and 1024 \
              rows, so the router projection is batch-dependent on this device and the \
