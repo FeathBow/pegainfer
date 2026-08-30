@@ -5,6 +5,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::paged_kv::KvStorage;
 use crate::paged_kv::PagedKvLayout;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
@@ -2561,74 +2562,80 @@ pub fn batch_prefill_paged_window_hd256_into(
     let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
     let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
 
-    let result = if layout.elem_bytes == 1 {
-        #[cfg(feature = "gemma4")]
-        unsafe {
-            ffi::gemma4_batch_prefill_paged_window_hd256_fp8kv_cuda(
-                q_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                buf_ptr as *const core::ffi::c_void,
-                geometry.k_offset_elems,
-                geometry.v_offset_elems,
-                pi_ptr as *const i32,
-                pip_ptr as *const i32,
-                lpl_ptr as *const i32,
-                qi_ptr as *const i32,
-                ri_ptr as *const i32,
-                qti_ptr as *const i32,
-                kti_ptr as *const i32,
-                kcs_ptr as *const i32,
-                tnr_ptr as *const u32,
-                num_qo_heads_i32,
-                num_kv_heads_i32,
-                256,
-                geometry.page_size,
-                total_tokens_i32,
-                plan.batch_size(),
-                plan.num_tiles,
-                geometry.stride_page,
-                sm_scale,
-                0,
-                window_left,
-                crate::tensor::active_cu_stream(ctx),
-            )
+    let (result, entry_point) = match layout.storage {
+        KvStorage::E4m3 => {
+            #[cfg(feature = "gemma4")]
+            let result = unsafe {
+                ffi::gemma4_batch_prefill_paged_window_hd256_fp8kv_cuda(
+                    q_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    buf_ptr as *const core::ffi::c_void,
+                    geometry.k_offset_elems,
+                    geometry.v_offset_elems,
+                    pi_ptr as *const i32,
+                    pip_ptr as *const i32,
+                    lpl_ptr as *const i32,
+                    qi_ptr as *const i32,
+                    ri_ptr as *const i32,
+                    qti_ptr as *const i32,
+                    kti_ptr as *const i32,
+                    kcs_ptr as *const i32,
+                    tnr_ptr as *const u32,
+                    num_qo_heads_i32,
+                    num_kv_heads_i32,
+                    256,
+                    geometry.page_size,
+                    total_tokens_i32,
+                    plan.batch_size(),
+                    plan.num_tiles,
+                    geometry.stride_page,
+                    sm_scale,
+                    0,
+                    window_left,
+                    crate::tensor::active_cu_stream(ctx),
+                )
+            };
+            #[cfg(not(feature = "gemma4"))]
+            anyhow::bail!("hd256 windowed batch prefill: fp8 KV needs the gemma4 feature");
+            #[cfg(feature = "gemma4")]
+            (result, "gemma4_batch_prefill_paged_window_hd256_fp8kv_cuda")
         }
-        #[cfg(not(feature = "gemma4"))]
-        anyhow::bail!("hd256 windowed batch prefill: fp8 KV needs the gemma4 feature")
-    } else {
-        unsafe {
-            ffi::batch_prefill_paged_window_cuda_hd256(
-                q_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                buf_ptr as *const ffi::Half,
-                geometry.k_offset_elems,
-                geometry.v_offset_elems,
-                pi_ptr as *const i32,
-                pip_ptr as *const i32,
-                lpl_ptr as *const i32,
-                qi_ptr as *const i32,
-                ri_ptr as *const i32,
-                qti_ptr as *const i32,
-                kti_ptr as *const i32,
-                kcs_ptr as *const i32,
-                tnr_ptr as *const u32,
-                num_qo_heads_i32,
-                num_kv_heads_i32,
-                256,
-                geometry.page_size,
-                total_tokens_i32,
-                plan.batch_size(),
-                plan.num_tiles,
-                geometry.stride_page,
-                sm_scale,
-                window_left,
-                crate::tensor::active_cu_stream(ctx),
-            )
-        }
+        KvStorage::Bf16 => (
+            unsafe {
+                ffi::batch_prefill_paged_window_cuda_hd256(
+                    q_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    buf_ptr as *const ffi::Half,
+                    geometry.k_offset_elems,
+                    geometry.v_offset_elems,
+                    pi_ptr as *const i32,
+                    pip_ptr as *const i32,
+                    lpl_ptr as *const i32,
+                    qi_ptr as *const i32,
+                    ri_ptr as *const i32,
+                    qti_ptr as *const i32,
+                    kti_ptr as *const i32,
+                    kcs_ptr as *const i32,
+                    tnr_ptr as *const u32,
+                    num_qo_heads_i32,
+                    num_kv_heads_i32,
+                    256,
+                    geometry.page_size,
+                    total_tokens_i32,
+                    plan.batch_size(),
+                    plan.num_tiles,
+                    geometry.stride_page,
+                    sm_scale,
+                    window_left,
+                    crate::tensor::active_cu_stream(ctx),
+                )
+            },
+            "batch_prefill_paged_window_cuda_hd256",
+        ),
     };
     if result != 0 {
         anyhow::bail!(
-            "batch_prefill_paged_window_cuda_hd256 failed for layer {layer}, \
+            "{entry_point} failed for layer {layer}, \
              bs={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}, \
              window_left={window_left}: {result}{}",
             plan.batch_size(),
@@ -2898,15 +2905,15 @@ fn checked_paged_geometry(
     // `pool_len` counts the pool's bf16 backing slots; an e4m3 pool packs two
     // elements per slot. Only wrappers with an fp8 kernel twin may see one.
     anyhow::ensure!(
-        fp8_capable || layout.elem_bytes == 2,
+        fp8_capable || layout.storage == KvStorage::Bf16,
         "{what} has no fp8 KV path; the layout carries {}-byte elements",
-        layout.elem_bytes
+        layout.storage.elem_bytes()
     );
-    let pool_len = match layout.elem_bytes {
-        1 => pool_len
+    let pool_len = match layout.storage {
+        KvStorage::E4m3 => pool_len
             .checked_mul(2)
             .ok_or_else(|| anyhow::anyhow!("{what} fp8 pool element count overflows"))?,
-        _ => pool_len,
+        KvStorage::Bf16 => pool_len,
     };
     anyhow::ensure!(
         layout.head_dim == head_dim,
@@ -3213,10 +3220,18 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
     let pi_ptr = pi_ptr + (pages_offset * std::mem::size_of::<i32>()) as u64;
 
-    let launch = if layout.elem_bytes == 1 {
+    // Two `if`s, not a tuple-building match: a fn item only coerces to a
+    // fn pointer across plain `if` arms.
+    let fp8 = layout.storage == KvStorage::E4m3;
+    let launch = if fp8 {
         ffi::qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda
     } else {
         ffi::qkv_norm_rope_paged_prefill_hd256_plain_cuda
+    };
+    let entry_point = if fp8 {
+        "qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda"
+    } else {
+        "qkv_norm_rope_paged_prefill_hd256_plain_cuda"
     };
     let result = unsafe {
         launch(
@@ -3249,8 +3264,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     };
     if result != 0 {
         anyhow::bail!(
-            "qkv_norm_rope_paged_prefill_hd256_plain_cuda failed with error \
-             {result}{}",
+            "{entry_point} failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }
@@ -3404,10 +3418,18 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     let (og_ptr, _gog) = page_origins.device_ptr(&ctx.stream);
     let (ps_ptr, _gps) = positions.device_ptr(&ctx.stream);
 
-    let launch = if layout.elem_bytes == 1 {
+    // Two `if`s, not a tuple-building match: a fn item only coerces to a
+    // fn pointer across plain `if` arms.
+    let fp8 = layout.storage == KvStorage::E4m3;
+    let launch = if fp8 {
         ffi::qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda
     } else {
         ffi::qkv_norm_rope_paged_decode_hd256_plain_cuda
+    };
+    let entry_point = if fp8 {
+        "qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda"
+    } else {
+        "qkv_norm_rope_paged_decode_hd256_plain_cuda"
     };
     let result = unsafe {
         launch(
@@ -3441,8 +3463,7 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     };
     if result != 0 {
         anyhow::bail!(
-            "qkv_norm_rope_paged_decode_hd256_plain_cuda failed with error \
-             {result}{}",
+            "{entry_point} failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }

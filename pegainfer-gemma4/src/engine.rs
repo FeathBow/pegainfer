@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
 use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::kv_pool::KvStorage;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
@@ -44,6 +45,7 @@ const PREFIX_CACHE_ENV: &str = "PEGAINFER_PREFIX_CACHE";
 const MIX_CHUNK_TOKENS_ENV: &str = "PEGAINFER_MIX_CHUNK_TOKENS";
 const MAX_CONTEXT_ENV: &str = "PEGAINFER_MAX_CONTEXT";
 const DECODE_SLOTS_ENV: &str = "PEGAINFER_DECODE_SLOTS";
+const KV_FP8_ENV: &str = "PEGAINFER_KV_FP8";
 const MIN_CONTEXT: usize = 1024;
 const MIN_CHUNK_TOKENS: usize = 64;
 const CEILING_DOMAIN: usize = i32::MAX as usize;
@@ -166,6 +168,30 @@ fn parse_prefix_cache_cap(raw: &str) -> Result<Option<usize>> {
             Ok(cap) if cap > 0 => Ok(Some(cap)),
             _ => anyhow::bail!("{PREFIX_CACHE_ENV}={raw:?} not recognized (off | K, K > 0)"),
         },
+    }
+}
+
+fn kv_fp8_storage() -> Result<KvStorage> {
+    let storage = match std::env::var(KV_FP8_ENV) {
+        Err(std::env::VarError::NotPresent) => parse_kv_fp8(None),
+        Ok(raw) => parse_kv_fp8(Some(&raw)),
+        Err(err) => anyhow::bail!("PEGAINFER_KV_FP8 is not unicode: {err}"),
+    }?;
+    if storage == KvStorage::E4m3 {
+        anyhow::ensure!(
+            prefix_cache_cap()?.is_none(),
+            "PEGAINFER_KV_FP8 and PEGAINFER_PREFIX_CACHE cannot combine: the prefix cache \
+             copies pool pages in bf16 element units"
+        );
+    }
+    Ok(storage)
+}
+
+fn parse_kv_fp8(raw: Option<&str>) -> Result<KvStorage> {
+    match raw {
+        None => Ok(KvStorage::Bf16),
+        Some("local") => Ok(KvStorage::E4m3),
+        Some(value) => anyhow::bail!("PEGAINFER_KV_FP8 supports only \"local\", got {value:?}"),
     }
 }
 
@@ -876,6 +902,7 @@ impl EngineState {
         let lane_mode = async_prefill_mode()?;
         let mix_chunk = mix_chunk_tokens(max_context)?;
         let slots = decode_slots()?;
+        let local_kv_storage = kv_fp8_storage()?;
         if max_context > MAX_CONTEXT {
             anyhow::ensure!(
                 mix_chunk.is_some(),
@@ -950,14 +977,21 @@ impl EngineState {
              derives page or row counts past the i32 metadata domain (the global family's pseudo \
              tables carry {global_split} copies of every page)"
         );
-        let serve = GemmaServe::new(&ctx, weights, max_context, local_pages, global_pages)
-            .map_err(|err| {
-                err.context(format!(
-                    "a {max_context} token ceiling, {slots} decode slots and {cache_entries} \
+        let serve = GemmaServe::new(
+            &ctx,
+            weights,
+            max_context,
+            local_kv_storage,
+            local_pages,
+            global_pages,
+        )
+        .map_err(|err| {
+            err.context(format!(
+                "a {max_context} token ceiling, {slots} decode slots and {cache_entries} \
                      cache entries sized the pools to {local_pages} local / {global_pages} \
                      global pages"
-                ))
-            })?;
+            ))
+        })?;
         let prefix_cache = cache_cap.map(|k| PrefixCache::new(k, sliding_window));
         let mut scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
         let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
@@ -2232,6 +2266,13 @@ mod knob_tests {
         for bad in ["many", "-1", "4k"] {
             assert!(parse_prefix_cache_cap(bad).is_err(), "{bad:?} must refuse");
         }
+    }
+
+    #[test]
+    fn fp8_knob_parses_or_refuses() {
+        assert_eq!(parse_kv_fp8(None).unwrap(), KvStorage::Bf16);
+        assert_eq!(parse_kv_fp8(Some("local")).unwrap(), KvStorage::E4m3);
+        assert!(parse_kv_fp8(Some("global")).is_err());
     }
 
     #[test]

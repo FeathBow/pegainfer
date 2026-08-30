@@ -580,7 +580,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
         stride_page, stream);
 }
 
-// fp8 KV pool twin: same math, e4m3 stores at scale 1.0.
+// E4m3 KV twin.
 int qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
     const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -626,7 +626,7 @@ int qkv_norm_rope_paged_decode_hd256_plain_cuda(
         stride_page, stream);
 }
 
-// fp8 KV pool twin: same math, e4m3 stores at scale 1.0.
+// E4m3 KV twin.
 int qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
     const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,

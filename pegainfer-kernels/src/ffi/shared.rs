@@ -1217,7 +1217,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// fp8-KV twin: e4m3 stores at scale 1.0 into a one-byte-element pool.
+    /// E4m3 KV twin.
     pub fn qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
         q_batch: *const Half,
         k_batch: *const Half,
@@ -1246,7 +1246,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// fp8-KV twin: e4m3 stores at scale 1.0 into a one-byte-element pool.
+    /// E4m3 KV twin.
     pub fn qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
         q_batch: *const Half,
         k_batch: *const Half,

@@ -19,6 +19,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
+use pegainfer_core::kv_pool::KvStorage;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::rope::RopeTableSpec;
@@ -313,10 +314,9 @@ fn copy_pool_pages(
     dst: &[i32],
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
-    // Startup refuses the prefix cache alongside the fp8 pool, so a one-byte
-    // layout here means a byte-domain bug, not a configuration.
+    // Page copies index bf16 elements, so only a bf16 pool may reach them.
     anyhow::ensure!(
-        layout.elem_bytes == 2,
+        layout.storage == KvStorage::Bf16,
         "pool page copies index bf16 elements; the fp8 pool must not reach them"
     );
     anyhow::ensure!(
@@ -655,24 +655,6 @@ pub(crate) fn global_split_factor(config: &Gemma4Config) -> Result<usize> {
 }
 
 /// Everything a serving step needs that outlives requests.
-fn local_kv_elem_bytes() -> Result<usize> {
-    match std::env::var("PEGAINFER_KV_FP8") {
-        Err(std::env::VarError::NotPresent) => Ok(2),
-        Ok(value) if value == "local" => {
-            // The parsed capacity, not the variable's presence: "0", "off"
-            // and an empty value all mean the cache is disabled.
-            anyhow::ensure!(
-                crate::engine::prefix_cache_cap()?.is_none(),
-                "PEGAINFER_KV_FP8 and PEGAINFER_PREFIX_CACHE cannot combine: the prefix cache \
-                 copies pool pages in bf16 element units"
-            );
-            Ok(1)
-        }
-        Ok(value) => anyhow::bail!("PEGAINFER_KV_FP8 supports only \"local\", got {value:?}"),
-        Err(err) => anyhow::bail!("PEGAINFER_KV_FP8 is not unicode: {err}"),
-    }
-}
-
 pub(crate) struct GemmaServe {
     /// The weights these pools, rope tables and layer numbering were built
     /// for. Holding them is what makes a step's model identity structural:
@@ -738,6 +720,7 @@ impl GemmaServe {
         ctx: &DeviceContext,
         weights: Gemma4Weights,
         max_context: usize,
+        local_kv_storage: KvStorage,
         local_pages: usize,
         global_pages: usize,
     ) -> Result<Self> {
@@ -768,14 +751,14 @@ impl GemmaServe {
                 }
             })
             .collect();
-        let local_pool = KvPool::with_elem_bytes(
+        let local_pool = KvPool::with_storage(
             ctx,
             locals,
             config.num_key_value_heads,
             config.head_dim,
             PAGE_SIZE,
             local_pages,
-            local_kv_elem_bytes()?,
+            local_kv_storage,
         )?;
         let global_pool = KvPool::new(
             ctx,

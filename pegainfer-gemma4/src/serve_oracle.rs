@@ -20,7 +20,15 @@ fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, S
     let (weights, _) =
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
-    let serve = GemmaServe::new(&ctx, weights, max_context, pages, pages).expect("serve");
+    let serve = GemmaServe::new(
+        &ctx,
+        weights,
+        max_context,
+        pegainfer_core::kv_pool::KvStorage::Bf16,
+        pages,
+        pages,
+    )
+    .expect("serve");
     (ctx, serve, dir)
 }
 
