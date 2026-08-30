@@ -697,6 +697,9 @@ struct Active {
     next: u32,
     emitted: usize,
     prompt_tokens: usize,
+    /// The row has finished while a speculative step over its slot is still
+    /// in flight and retires when that step drains.
+    stopping: bool,
 }
 
 impl Active {
@@ -708,6 +711,52 @@ impl Active {
             ignore_eos: self.request.params.ignore_eos,
         }
     }
+
+    fn settle_staged(&mut self, policy: &GenerationPolicy, token: u32) {
+        if self.stopping {
+            return;
+        }
+        if policy.stops(token, self.request.params.ignore_eos) {
+            let _ = self.request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens: self.emitted,
+            });
+            self.stopping = true;
+            return;
+        }
+        self.emitted += 1;
+        if self
+            .request
+            .token_tx
+            .send(TokenEvent::Token {
+                id: token,
+                logprob: None,
+            })
+            .is_err()
+        {
+            self.stopping = true;
+            return;
+        }
+        if self.emitted >= self.request.max_tokens {
+            let _ = self.request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens: self.emitted,
+            });
+            self.stopping = true;
+            return;
+        }
+        self.next = token;
+    }
+}
+
+const DECODE_PIPELINE_DEPTH: usize = 2;
+
+/// One staged decode step whose readback has not yet been collected.
+struct PendingDecode {
+    rows: usize,
+    slot: usize,
 }
 
 enum Admitted {
@@ -751,6 +800,8 @@ struct EngineState {
     /// mixed into the per-call seed; a request's own `params.seed` replays
     /// via (seed, step) regardless of it.
     sample_nonce: u64,
+    /// Present only while the active row order is frozen.
+    pipeline: Option<PendingDecode>,
     /// The overlap lane; `None` unless `PEGAINFER_ASYNC_PREFILL` opted in
     /// at startup.
     lane: Option<AsyncPrefillLane>,
@@ -922,6 +973,7 @@ impl EngineState {
             suppress_ids,
             base_seed,
             sample_nonce: 0,
+            pipeline: None,
             lane,
             mix_chunk,
             max_context,
@@ -935,6 +987,10 @@ impl EngineState {
     /// costs the streams a bounded number of prefills per token however
     /// deep the queue is.
     fn admit_from_queue(&mut self, pending: &mut VecDeque<Submitted>, active: &mut Vec<Active>) {
+        if pending.is_empty() {
+            return;
+        }
+        self.drain_pipeline(active);
         let mut attempts = 0;
         while attempts < self.slots && active.len() < self.slots {
             // With the lane busy, arrivals wait in `pending` while decode
@@ -1302,6 +1358,13 @@ impl EngineState {
     /// release, capture into the prefix cache, and take the first-token
     /// flow the sync path uses.
     fn join_async_prefill(&mut self, active: &mut Vec<Active>) {
+        if self
+            .lane
+            .as_ref()
+            .is_some_and(|lane| lane.inflight.is_some())
+        {
+            self.drain_pipeline(active);
+        }
         let Some(lane) = self.lane.as_mut() else {
             return;
         };
@@ -1675,6 +1738,101 @@ impl EngineState {
         }
     }
 
+    fn pipeline_eligible(&self, active: &[Active]) -> bool {
+        !active.is_empty()
+            && active.len() <= self.scratch.max_rows()
+            && active.iter().all(|entry| {
+                !entry.stopping
+                    && entry.request.logprobs == 0
+                    && entry.request.max_tokens.saturating_sub(entry.emitted)
+                        >= DECODE_PIPELINE_DEPTH
+                    && pegainfer_sample::effectively_greedy(
+                        &entry.request.params,
+                        self.scratch.vocab(),
+                    )
+            })
+    }
+
+    /// Reserve the next token without retiring or reordering a row.
+    fn ready_rows_pinned(&self, active: &mut [Active]) -> bool {
+        active.iter_mut().all(|entry| {
+            !entry.request.token_tx.is_closed()
+                && admit_tokens(
+                    &self.serve.local_pool,
+                    &self.serve.global_pool,
+                    &mut entry.kv,
+                    1,
+                )
+                .is_ok()
+        })
+    }
+
+    /// Queue one decode and stage its greedy picks into the next embedding's
+    /// id buffer and one pinned readback slot.
+    fn launch_staged(
+        &mut self,
+        active: &mut [Active],
+        resident: bool,
+        slot: usize,
+    ) -> Result<usize> {
+        let rows = active.len();
+        let tokens = (!resident).then(|| active.iter().map(|entry| entry.next).collect::<Vec<_>>());
+        {
+            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            if let Some(tokens) = tokens.as_deref() {
+                self.serve
+                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)?;
+            } else {
+                self.serve
+                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)?;
+            }
+        }
+        let (logits, ids) = self.arena.logits_and_ids();
+        ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
+            .context("suppression")?;
+        self.sample_nonce = self.sample_nonce.wrapping_add(1);
+        pegainfer_sample::greedy_stage_resident(
+            &self.ctx,
+            logits,
+            rows,
+            ids,
+            slot,
+            &mut self.scratch,
+        )
+        .context("stage greedy picks")?;
+        Ok(rows)
+    }
+
+    /// Deliver a staged step without changing the row order. Finished rows
+    /// stay pinned until the speculative successor drains.
+    fn collect_pending(&mut self, active: &mut [Active], pending: &PendingDecode) -> Result<()> {
+        anyhow::ensure!(
+            pending.rows == active.len(),
+            "pipeline collected {} rows against a batch of {}",
+            pending.rows,
+            active.len()
+        );
+        let picked = pegainfer_sample::greedy_collect_resident(
+            pending.rows,
+            pending.slot,
+            &mut self.scratch,
+        )?;
+        for (entry, token) in active.iter_mut().zip(picked) {
+            entry.settle_staged(&self.policy, token);
+        }
+        Ok(())
+    }
+
+    fn drain_pipeline(&mut self, active: &mut Vec<Active>) {
+        let Some(pending) = self.pipeline.take() else {
+            return;
+        };
+        if let Err(err) = self.collect_pending(active, &pending) {
+            return fail_active_batch(active, "pipelined decode drain", &err);
+        }
+        active.retain(|entry| !entry.stopping);
+    }
+
     /// The mixed-admission tail of [`Self::admit_and_prefill`]: every
     /// gathered prompt and the live decode batch share one step, then one
     /// sampler call covers the newcomers' first tokens (logits rows `0..k`)
@@ -1776,16 +1934,7 @@ impl EngineState {
         Admitted::Done
     }
 
-    /// One batched decode step: every active request advances a token,
-    /// sharing each layer's weight pass. A cancelled request and a request
-    /// the pools cannot grow for retire before the batch is built; a finished
-    /// one retires after its token lands.
-    fn decode_round(&mut self, active: &mut Vec<Active>) {
-        self.ready_decode_rows(active);
-        if active.is_empty() {
-            return;
-        }
-
+    fn decode_round_collect(&mut self, active: &mut Vec<Active>) {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
@@ -1814,6 +1963,53 @@ impl EngineState {
             Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0),
             Err(err) => fail_active_batch(active, "batched decode", &err),
         }
+    }
+
+    /// One batched decode step. Eligible greedy batches keep one speculative
+    /// successor in flight and drain before any row-order change.
+    fn decode_round(&mut self, active: &mut Vec<Active>) {
+        if let Some(pending) = self.pipeline.take() {
+            if self.pipeline_eligible(active) && self.ready_rows_pinned(active) {
+                let next_slot = (pending.slot + 1) % DECODE_PIPELINE_DEPTH;
+                match self.launch_staged(active, true, next_slot) {
+                    Ok(rows) => {
+                        if let Err(err) = self.collect_pending(active, &pending) {
+                            fail_active_batch(active, "pipelined decode collect", &err);
+                            return;
+                        }
+                        self.pipeline = Some(PendingDecode {
+                            rows,
+                            slot: next_slot,
+                        });
+                    }
+                    Err(err) => {
+                        if let Err(collect_err) = self.collect_pending(active, &pending) {
+                            log::error!("collect during launch failure failed: {collect_err:#}");
+                        }
+                        fail_active_batch(active, "pipelined decode launch", &err);
+                    }
+                }
+                return;
+            }
+            self.pipeline = Some(pending);
+            self.drain_pipeline(active);
+            if active.is_empty() {
+                return;
+            }
+        }
+
+        self.ready_decode_rows(active);
+        if active.is_empty() {
+            return;
+        }
+        if self.pipeline_eligible(active) {
+            match self.launch_staged(active, false, 0) {
+                Ok(rows) => self.pipeline = Some(PendingDecode { rows, slot: 0 }),
+                Err(err) => fail_active_batch(active, "batched decode", &err),
+            }
+            return;
+        }
+        self.decode_round_collect(active);
     }
 }
 
@@ -1903,6 +2099,7 @@ fn settle_first_token(
         next,
         emitted: 1,
         prompt_tokens,
+        stopping: false,
     })
 }
 

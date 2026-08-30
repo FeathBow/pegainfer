@@ -51,6 +51,8 @@ use pegainfer_kernels::tensor::HiddenStates;
 use pegainfer_kernels::tensor::has_stream_override;
 use pegainfer_kernels::tensor::stream_spin_wait;
 
+const STAGED_READBACK_SLOTS: usize = 2;
+
 /// Allocate-once device buffers for [`select_batch`], sized for `max_rows` × `vocab`.
 ///
 /// Reused across decode steps — the decode path needs pointer-stable buffers, so
@@ -73,6 +75,10 @@ pub struct SampleScratch {
     /// active stream (#704). Pinned keeps the D2H async; the reader blocks
     /// only on the copy's own event.
     argmax_host: PinnedHostSlice<i32>,
+    /// Alternate landing slot used while the prior readback is collected.
+    argmax_host_alt: PinnedHostSlice<i32>,
+    /// Identity row map for the all-greedy staged path.
+    identity_rows: CudaSlice<i32>,
     sampling: BatchSamplingScratch,
     /// Vocab width every buffer above was sized for; `select_batch` rejects a
     /// logits arena whose `hidden_dim` differs, since the sizes are baked in.
@@ -110,6 +116,12 @@ impl SampleScratch {
             // but don't grow this buffer into anything read in a hot loop.
             argmax_host: unsafe { ctx.ctx.alloc_pinned::<i32>(max_rows) }
                 .map_err(|e| anyhow!("SampleScratch pinned alloc failed: {e}"))?,
+            argmax_host_alt: unsafe { ctx.ctx.alloc_pinned::<i32>(max_rows) }
+                .map_err(|e| anyhow!("SampleScratch pinned alloc failed: {e}"))?,
+            identity_rows: ctx
+                .stream
+                .clone_htod(&(0..max_rows as i32).collect::<Vec<_>>())
+                .map_err(|e| anyhow!("SampleScratch identity upload failed: {e}"))?,
             sampling: BatchSamplingScratch::new(ctx, max_rows, vocab)?,
             vocab,
             max_rows,
@@ -118,6 +130,10 @@ impl SampleScratch {
 
     pub fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.vocab
     }
 }
 
@@ -276,6 +292,95 @@ pub fn select_batch(
     }
 
     Ok(tokens)
+}
+
+fn validate_greedy_stage(
+    logits: &HiddenStates,
+    rows: usize,
+    slot: usize,
+    scratch: &SampleScratch,
+) -> Result<()> {
+    ensure!(rows > 0, "greedy_stage_resident: empty batch");
+    ensure!(
+        rows <= scratch.max_rows,
+        "greedy_stage_resident: {rows} rows exceeds scratch capacity {}",
+        scratch.max_rows
+    );
+    ensure!(
+        logits.seq_len >= rows && logits.hidden_dim == scratch.vocab,
+        "greedy_stage_resident: logits shape {}x{} cannot serve {rows} rows x vocab {}",
+        logits.seq_len,
+        logits.hidden_dim,
+        scratch.vocab
+    );
+    ensure!(
+        slot < STAGED_READBACK_SLOTS,
+        "greedy_stage_resident: slot {slot} out of range"
+    )
+}
+
+fn stage_greedy_readback(
+    ctx: &DeviceContext,
+    slot: usize,
+    scratch: &mut SampleScratch,
+) -> Result<()> {
+    let host = if slot == 0 {
+        &mut scratch.argmax_host
+    } else {
+        &mut scratch.argmax_host_alt
+    };
+    ctx.stream
+        .memcpy_dtoh(&scratch.argmax_out, host)
+        .map_err(|e| anyhow!("greedy_stage_resident D2H stage failed: {e}"))
+}
+
+/// Argmax every row, leave the picks in the next embedding's id buffer, and
+/// queue their pinned readback without waiting for it.
+pub fn greedy_stage_resident(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    rows: usize,
+    ids_out: &mut CudaSlice<u32>,
+    slot: usize,
+    scratch: &mut SampleScratch,
+) -> Result<()> {
+    validate_greedy_stage(logits, rows, slot, scratch)?;
+    argmax_batch_bf16_split_indexed_into(
+        ctx,
+        logits,
+        &scratch.identity_rows,
+        rows,
+        &mut scratch.argmax_partial_values,
+        &mut scratch.argmax_partial_indices,
+        &mut scratch.top1_values,
+        &mut scratch.argmax_out,
+    )?;
+    pegainfer_kernels::tensor::memcpy_dtod_u32_from_i32(ctx, &scratch.argmax_out, ids_out, rows)?;
+    stage_greedy_readback(ctx, slot, scratch)
+}
+
+/// Collect a readback staged into one of the two pinned slots.
+pub fn greedy_collect_resident(
+    rows: usize,
+    slot: usize,
+    scratch: &mut SampleScratch,
+) -> Result<Vec<u32>> {
+    ensure!(
+        slot < STAGED_READBACK_SLOTS,
+        "greedy_collect_resident: slot {slot} out of range"
+    );
+    ensure!(
+        rows <= scratch.max_rows,
+        "greedy_collect_resident: {rows} rows exceeds scratch capacity {}",
+        scratch.max_rows
+    );
+    let landed = if slot == 0 {
+        scratch.argmax_host.as_slice()
+    } else {
+        scratch.argmax_host_alt.as_slice()
+    }
+    .map_err(|e| anyhow!("greedy_collect_resident D2H sync failed: {e}"))?;
+    Ok(landed[..rows].iter().map(|&token| token as u32).collect())
 }
 
 /// SplitMix64 over (seed, step): a distinct, well-mixed philox seed per

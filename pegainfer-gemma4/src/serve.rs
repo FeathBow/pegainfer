@@ -575,6 +575,11 @@ impl StepArena {
         );
         self.tower.open(rows)
     }
+
+    /// Logits and the id buffer consumed by the next decode embedding.
+    pub(crate) fn logits_and_ids(&mut self) -> (&mut HiddenStates, &mut CudaSlice<u32>) {
+        (&mut self.logits, &mut self.ids)
+    }
 }
 
 /// How many pseudo-requests the global decode read presents each request
@@ -1812,6 +1817,27 @@ impl GemmaServe {
         kvs: &mut [&mut GemmaKv],
         tokens: &[u32],
     ) -> Result<&'a mut HiddenStates> {
+        self.decode_batch_step_inner(ctx, arena, kvs, Some(tokens))
+    }
+
+    /// Decode using token ids written into the arena by the prior staged
+    /// sampler. The caller keeps the row order and bucket unchanged.
+    pub(crate) fn decode_batch_step_resident<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        kvs: &mut [&mut GemmaKv],
+    ) -> Result<&'a mut HiddenStates> {
+        self.decode_batch_step_inner(ctx, arena, kvs, None)
+    }
+
+    fn decode_batch_step_inner<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        kvs: &mut [&mut GemmaKv],
+        tokens: Option<&[u32]>,
+    ) -> Result<&'a mut HiddenStates> {
         let batch = kvs.len();
         let padded = self.prepare_decode_step(ctx, arena, kvs, tokens)?;
         let StepArena {
@@ -2165,22 +2191,24 @@ impl GemmaServe {
         ctx: &DeviceContext,
         arena: &mut StepArena,
         kvs: &[&mut GemmaKv],
-        tokens: &[u32],
+        tokens: Option<&[u32]>,
     ) -> Result<usize> {
         let batch = kvs.len();
         anyhow::ensure!(batch > 0, "a decode batch needs at least one request");
-        anyhow::ensure!(
-            tokens.len() == batch,
-            "decode batch has {batch} requests but {} tokens",
-            tokens.len()
-        );
         anyhow::ensure!(
             batch <= arena.max_rows,
             "decode batch of {batch} exceeds the arena's {} row ceiling",
             arena.max_rows
         );
         self.check_stream(ctx)?;
-        validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+        if let Some(tokens) = tokens {
+            anyhow::ensure!(
+                tokens.len() == batch,
+                "decode batch has {batch} requests but {} tokens",
+                tokens.len()
+            );
+            validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+        }
 
         // A step computes at its power-of-two bucket whether or not graphs
         // are on: padding is part of the numeric contract, which is what
@@ -2189,9 +2217,11 @@ impl GemmaServe {
         let padded = batch.next_power_of_two().max(arena.min_bucket);
         arena.open(ctx, padded)?;
         self.plan_decode_batch(ctx, arena, kvs, padded)?;
-        arena.host.ids.extend_from_slice(tokens);
-        arena.host.ids.resize(padded, 0);
-        upload_prefix(ctx, &mut arena.ids, &arena.host.ids)?;
+        if let Some(tokens) = tokens {
+            arena.host.ids.extend_from_slice(tokens);
+            arena.host.ids.resize(padded, 0);
+            upload_prefix(ctx, &mut arena.ids, &arena.host.ids)?;
+        }
         Ok(padded)
     }
 
@@ -2218,7 +2248,7 @@ impl GemmaServe {
             admit_tokens(&self.local_pool, &self.global_pool, &mut kv, 1)?;
             {
                 let mut kvs: [&mut GemmaKv; 1] = [&mut kv];
-                let padded = self.prepare_decode_step(ctx, arena, &kvs, &[0])?;
+                let padded = self.prepare_decode_step(ctx, arena, &kvs, Some(&[0]))?;
                 let StepArena {
                     tower,
                     local_plan,

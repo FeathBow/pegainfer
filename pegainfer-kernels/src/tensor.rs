@@ -107,6 +107,43 @@ pub fn stream_spin_wait(ctx: &DeviceContext) -> anyhow::Result<()> {
     }
 }
 
+/// Copy token ids from an i32 argmax buffer into a u32 embedding buffer.
+pub fn memcpy_dtod_u32_from_i32(
+    ctx: &DeviceContext,
+    src: &CudaSlice<i32>,
+    dst: &mut CudaSlice<u32>,
+    count: usize,
+) -> anyhow::Result<()> {
+    use cudarc::driver::DevicePtr;
+    use cudarc::driver::DevicePtrMut;
+
+    anyhow::ensure!(
+        count <= src.len() && count <= dst.len(),
+        "dtod i32->u32 copy of {count} exceeds src {} or dst {}",
+        src.len(),
+        dst.len()
+    );
+    if count == 0 {
+        return Ok(());
+    }
+    let stream = active_cu_stream(ctx);
+    let (src_ptr, _src_guard) = src.device_ptr(&ctx.stream);
+    let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            dst_ptr,
+            src_ptr,
+            count * std::mem::size_of::<i32>(),
+            stream,
+        )
+    };
+    anyhow::ensure!(
+        result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuMemcpyDtoDAsync i32->u32 failed: {result:?}"
+    );
+    Ok(())
+}
+
 /// Marker trait for tensor metadata tags.
 pub trait NamedTag {
     const NAME: &'static str;
