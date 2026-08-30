@@ -956,6 +956,11 @@ impl EngineState {
         let admit_coalesce = admit_coalesce_ms()?;
         let slots = decode_slots()?;
         let local_kv_storage = kv_fp8_storage()?;
+        anyhow::ensure!(
+            admit_coalesce.is_none() || lane_mode.is_none(),
+            "{ADMIT_COALESCE_ENV} and {ASYNC_PREFILL_ENV} cannot combine: the lane flies one \
+             prefill at a time, so the door could only delay it"
+        );
         if max_context > MAX_CONTEXT {
             anyhow::ensure!(
                 mix_chunk.is_some(),
@@ -2788,9 +2793,8 @@ mod lane_tests {
         super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state")
     }
 
-    /// A raise without the chunk knob, and a raise with the overlap lane,
-    /// both refuse before the multi-GiB load — the startup policy the
-    /// serving doc promises.
+    /// Invalid knob combinations refuse before the multi-GiB load — the
+    /// startup policy the serving doc promises.
     #[test]
     #[ignore = "requires the pinned 12B checkpoint and --test-threads=1"]
     fn the_raise_refuses_without_its_prerequisites() {
@@ -2818,6 +2822,18 @@ mod lane_tests {
             format!("{err:#}").contains("unsupported over"),
             "unexpected refusal: {err:#}"
         );
+        let err = load(&[
+            (super::ADMIT_COALESCE_ENV, "300"),
+            (super::ASYNC_PREFILL_ENV, "green:35"),
+        ])
+        .err()
+        .expect("the coalesce door and async lane must refuse");
+        assert!(
+            format!("{err:#}").contains("the door could only delay it"),
+            "unexpected refusal: {err:#}"
+        );
+    }
+
     }
 
     /// The slots boundary, driven at the roster edge the engine loop owns
