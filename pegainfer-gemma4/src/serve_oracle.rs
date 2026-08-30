@@ -852,7 +852,8 @@ fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &Gemm
 #[test]
 #[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn mixed_step_matches_serial() {
-    let (ctx, serve, _dir) = stack_with(2048, 512);
+    // This is a bf16 bit-exactness contract; distribution and waypoint gates judge fp8.
+    let (ctx, serve, _dir) = stack_with_storage(2048, 512, KvStorage::Bf16);
     assert_mixed_admissions_match_serial(&ctx, &serve);
     assert_mixed_window_crossing_matches_serial(&ctx, &serve);
 }
@@ -971,7 +972,8 @@ fn overlapped_prefill_matches_the_sync_step() {
 #[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn prefix_restore_matches_cold_path() {
     use crate::prefix_cache::PrefixCache;
-    let (ctx, serve, _dir) = stack_with(4096, 512);
+    // The cache's page copies are bf16-only; distribution and waypoint gates judge fp8.
+    let (ctx, serve, _dir) = stack_with_storage(4096, 512, KvStorage::Bf16);
     let window = serve.weights.config.sliding_window;
     let mut arena = serve.alloc_step_arena(&ctx, 1, false).expect("step arena");
     let budget = 16usize;
