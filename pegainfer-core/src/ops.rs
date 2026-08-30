@@ -24,6 +24,7 @@ pub use pegainfer_kernels::ops::SuppressIds;
 pub use pegainfer_kernels::ops::accumulate_bf16_token_scaled_to_f32_into;
 pub use pegainfer_kernels::ops::add_batch;
 pub use pegainfer_kernels::ops::add_batch_into;
+pub use pegainfer_kernels::ops::advance_decode_metadata;
 pub use pegainfer_kernels::ops::argmax;
 pub use pegainfer_kernels::ops::argmax_batch_bf16_into;
 pub use pegainfer_kernels::ops::batch_prefill_paged_hd512_into;

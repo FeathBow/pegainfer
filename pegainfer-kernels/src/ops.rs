@@ -87,6 +87,7 @@ pub use elementwise::add_batch;
 pub use elementwise::add_batch_into;
 pub use elementwise::add_into;
 pub use elementwise::add_scaled_bf16_into;
+pub use elementwise::advance_decode_metadata;
 pub use elementwise::bf16_bytes_to_f32_into;
 pub use elementwise::bf16_hidden_to_f32_into;
 pub use elementwise::copy_hidden_rows_into;

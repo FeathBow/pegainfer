@@ -82,6 +82,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn advance_decode_metadata_cuda(
+        positions: *mut i32,
+        local_last: *mut i32,
+        pseudo_last: *mut i32,
+        kv_chunk: *mut i32,
+        rows: i32,
+        factor: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn add_scaled_bf16_cuda(
         routed: *const Half,
         scale: f32,

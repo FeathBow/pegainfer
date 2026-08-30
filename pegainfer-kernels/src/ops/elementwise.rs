@@ -49,6 +49,42 @@ pub fn add_batch_into(
     Ok(())
 }
 
+/// Advance the per-row decode tables written by a regular graph replay.
+pub fn advance_decode_metadata(
+    ctx: &DeviceContext,
+    positions: &CudaSlice<i32>,
+    local_last: &CudaSlice<i32>,
+    pseudo_last: &CudaSlice<i32>,
+    kv_chunk: &CudaSlice<i32>,
+    rows: usize,
+    factor: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        positions.len() >= rows
+            && local_last.len() >= rows
+            && kv_chunk.len() >= rows
+            && pseudo_last.len() >= rows * factor,
+        "advance_decode_metadata: {rows} rows x {factor} exceeds a table"
+    );
+    let (positions_ptr, _positions_guard) = positions.device_ptr(&ctx.stream);
+    let (local_ptr, _local_guard) = local_last.device_ptr(&ctx.stream);
+    let (pseudo_ptr, _pseudo_guard) = pseudo_last.device_ptr(&ctx.stream);
+    let (chunk_ptr, _chunk_guard) = kv_chunk.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::advance_decode_metadata_cuda(
+            positions_ptr as *mut i32,
+            local_ptr as *mut i32,
+            pseudo_ptr as *mut i32,
+            chunk_ptr as *mut i32,
+            rows as i32,
+            factor as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// Element-wise add of `n` bf16 elements into a pre-allocated output
 /// (`out = a + b`). Slice-level twin of [`add_batch_into`] — same kernel —
 /// for callers whose buffers live in a persistent decode arena rather than

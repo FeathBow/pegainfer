@@ -518,6 +518,27 @@ __global__ void embedding_batched_vocab_shard_vec4_kernel(
   }
 }
 
+// Advances the device tables a regular decode step will consume next.
+static const int ADVANCE_DECODE_METADATA_BLOCK = 32;
+
+__global__ void advance_decode_metadata_kernel(
+    int *__restrict__ positions,
+    int *__restrict__ local_last,
+    int *__restrict__ pseudo_last,
+    int *__restrict__ kv_chunk,
+    int rows,
+    int factor) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < rows) {
+    positions[row] += 1;
+    local_last[row] += 1;
+    kv_chunk[row] += 1;
+    for (int copy = 0; copy < factor; ++copy) {
+      pseudo_last[row * factor + copy] += 1;
+    }
+  }
+}
+
 extern "C" {
 
 CUresult add_cuda(
@@ -901,6 +922,16 @@ CUresult embedding_batched_vocab_shard_cuda(
   int grid = (total + block - 1) / block;
   embedding_batched_vocab_shard_kernel<<<grid, block, 0, stream>>>(
       embed, token_ids, out, hidden_size, seq_len, vocab_start, part_vocab_size);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult advance_decode_metadata_cuda(
+    int *positions, int *local_last, int *pseudo_last, int *kv_chunk,
+    int rows, int factor, cudaStream_t stream) {
+  int block = ADVANCE_DECODE_METADATA_BLOCK;
+  int grid = (rows + block - 1) / block;
+  advance_decode_metadata_kernel<<<grid, block, 0, stream>>>(
+      positions, local_last, pseudo_last, kv_chunk, rows, factor);
   return (CUresult)cudaGetLastError();
 }
 

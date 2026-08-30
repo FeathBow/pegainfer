@@ -990,6 +990,7 @@ impl EngineState {
         if pending.is_empty() {
             return;
         }
+        self.arena.invalidate_decode_fingerprint();
         self.drain_pipeline(active);
         let mut attempts = 0;
         while attempts < self.slots && active.len() < self.slots {
@@ -1363,6 +1364,7 @@ impl EngineState {
             .as_ref()
             .is_some_and(|lane| lane.inflight.is_some())
         {
+            self.arena.invalidate_decode_fingerprint();
             self.drain_pipeline(active);
         }
         let Some(lane) = self.lane.as_mut() else {
