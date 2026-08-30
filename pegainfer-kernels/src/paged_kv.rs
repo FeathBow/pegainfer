@@ -14,10 +14,26 @@ pub struct PagedKvLayout {
     pub layer_stride: usize,
     /// Elements per page (all layers): num_layers x layer_stride.
     pub page_stride: usize,
+    /// Bytes per stored KV element. Strides remain in elements.
+    pub elem_bytes: usize,
 }
 
 impl PagedKvLayout {
     pub fn new(num_layers: usize, num_kv_heads: usize, head_dim: usize, page_size: usize) -> Self {
+        Self::with_elem_bytes(num_layers, num_kv_heads, head_dim, page_size, 2)
+    }
+
+    pub fn with_elem_bytes(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        elem_bytes: usize,
+    ) -> Self {
+        assert!(
+            elem_bytes == 1 || elem_bytes == 2,
+            "paged KV elements are bf16 (2 bytes) or e4m3 (1 byte), not {elem_bytes} bytes"
+        );
         let kv_block_len = page_size * num_kv_heads * head_dim;
         let layer_stride = 2 * kv_block_len;
         let page_stride = num_layers * layer_stride;
@@ -29,6 +45,7 @@ impl PagedKvLayout {
             kv_block_len,
             layer_stride,
             page_stride,
+            elem_bytes,
         }
     }
 }

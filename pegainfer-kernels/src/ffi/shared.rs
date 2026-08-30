@@ -1216,6 +1216,65 @@ unsafe extern "C" {
         stride_page: i64,
         stream: CUstream,
     ) -> i32;
+
+    /// fp8-KV twin: e4m3 stores at scale 1.0 into a one-byte-element pool.
+    pub fn qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indices_len: i32,
+        page_origin: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        num_pages: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    /// fp8-KV twin: e4m3 stores at scale 1.0 into a one-byte-element pool.
+    pub fn qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indices_len: i32,
+        page_indptr: *const i32,
+        page_origins: *const i32,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        batch: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        num_pages: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
 }
 
 // hd512 QK-norm + partial RoPE prep (Gemma 4 global layers):

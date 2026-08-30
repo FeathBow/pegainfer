@@ -25,6 +25,8 @@ pub struct KvLayout {
     pub layer_stride: usize,
     /// Elements per page (all layers): num_layers × layer_stride.
     pub page_stride: usize,
+    /// Bytes per stored element. Strides remain in elements.
+    pub elem_bytes: usize,
 }
 
 impl KvLayout {
@@ -34,6 +36,20 @@ impl KvLayout {
         head_dim: usize,
         page_size: usize,
     ) -> anyhow::Result<Self> {
+        Self::with_elem_bytes(num_layers, num_kv_heads, head_dim, page_size, 2)
+    }
+
+    pub fn with_elem_bytes(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        elem_bytes: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            elem_bytes == 1 || elem_bytes == 2,
+            "paged KV elements are bf16 (2 bytes) or e4m3 (1 byte), not {elem_bytes} bytes"
+        );
         let strides = || -> Option<(usize, usize, usize)> {
             let kv_block_len = page_size.checked_mul(num_kv_heads)?.checked_mul(head_dim)?;
             let layer_stride = kv_block_len.checked_mul(2)?;
@@ -54,6 +70,7 @@ impl KvLayout {
             kv_block_len,
             layer_stride,
             page_stride,
+            elem_bytes,
         })
     }
 
@@ -66,6 +83,7 @@ impl KvLayout {
             kv_block_len: self.kv_block_len,
             layer_stride: self.layer_stride,
             page_stride: self.page_stride,
+            elem_bytes: self.elem_bytes,
         }
     }
 }
@@ -105,7 +123,29 @@ impl KvPool {
         page_size: usize,
         num_pages: usize,
     ) -> Result<Self> {
-        let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size)?;
+        Self::with_elem_bytes(
+            ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_pages,
+            2,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_elem_bytes(
+        ctx: &DeviceContext,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        num_pages: usize,
+        elem_bytes: usize,
+    ) -> Result<Self> {
+        let layout =
+            KvLayout::with_elem_bytes(num_layers, num_kv_heads, head_dim, page_size, elem_bytes)?;
         let total_elements = num_pages.checked_mul(layout.page_stride).ok_or_else(|| {
             anyhow::anyhow!(
                 "KvPool geometry overflows: {num_pages} pages x {} elements per page",
@@ -114,17 +154,18 @@ impl KvPool {
         })?;
         // The allocator multiplies by the element size unchecked; answer
         // for the byte domain here, before it does.
-        total_elements
-            .checked_mul(std::mem::size_of::<bf16>())
+        let total_bytes = total_elements
+            .checked_mul(layout.elem_bytes)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "KvPool geometry overflows the byte domain: {total_elements} bf16 elements"
+                    "KvPool geometry overflows the byte domain: {total_elements} elements"
                 )
             })?;
+        let backing_slots = total_bytes.div_ceil(std::mem::size_of::<bf16>());
 
         let buffer: CudaSlice<bf16> = ctx
             .stream
-            .alloc_zeros(total_elements)
+            .alloc_zeros(backing_slots)
             .map_err(|e| anyhow::anyhow!("KvPool alloc failed: {e}"))?;
 
         let pool = PagePool::new(num_pages);

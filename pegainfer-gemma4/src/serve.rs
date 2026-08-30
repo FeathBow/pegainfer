@@ -313,6 +313,12 @@ fn copy_pool_pages(
     dst: &[i32],
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
+    // Startup refuses the prefix cache alongside the fp8 pool, so a one-byte
+    // layout here means a byte-domain bug, not a configuration.
+    anyhow::ensure!(
+        layout.elem_bytes == 2,
+        "pool page copies index bf16 elements; the fp8 pool must not reach them"
+    );
     anyhow::ensure!(
         src.len() == dst.len(),
         "page copy list mismatch: {} src vs {} dst",
@@ -649,6 +655,22 @@ pub(crate) fn global_split_factor(config: &Gemma4Config) -> Result<usize> {
 }
 
 /// Everything a serving step needs that outlives requests.
+fn local_kv_elem_bytes() -> Result<usize> {
+    match std::env::var("PEGAINFER_KV_FP8") {
+        Err(std::env::VarError::NotPresent) => Ok(2),
+        Ok(value) if value == "local" => {
+            anyhow::ensure!(
+                std::env::var_os("PEGAINFER_PREFIX_CACHE").is_none(),
+                "PEGAINFER_KV_FP8 and PEGAINFER_PREFIX_CACHE cannot combine: the prefix cache \
+                 copies pool pages in bf16 element units"
+            );
+            Ok(1)
+        }
+        Ok(value) => anyhow::bail!("PEGAINFER_KV_FP8 supports only \"local\", got {value:?}"),
+        Err(err) => anyhow::bail!("PEGAINFER_KV_FP8 is not unicode: {err}"),
+    }
+}
+
 pub(crate) struct GemmaServe {
     /// The weights these pools, rope tables and layer numbering were built
     /// for. Holding them is what makes a step's model identity structural:
@@ -744,13 +766,14 @@ impl GemmaServe {
                 }
             })
             .collect();
-        let local_pool = KvPool::new(
+        let local_pool = KvPool::with_elem_bytes(
             ctx,
             locals,
             config.num_key_value_heads,
             config.head_dim,
             PAGE_SIZE,
             local_pages,
+            local_kv_elem_bytes()?,
         )?;
         let global_pool = KvPool::new(
             ctx,
