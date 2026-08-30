@@ -144,7 +144,7 @@ impl MoeScratch {
             dense_normed: hidden(max_rows)?,
             expert_normed: hidden(max_rows)?,
             expert_offsets: ctx.stream.alloc_zeros::<u32>(moe.num_experts + 1)?,
-            expert_cursor: ctx.stream.alloc_zeros::<u32>(moe.num_experts)?,
+            expert_cursor: ctx.stream.alloc_zeros::<u32>(1)?,
         })
     }
 
