@@ -212,6 +212,46 @@ fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
     }
 }
 
+/// Holds arrivals that would invade a live decode batch so one window's
+/// arrivals land as a back-to-back burst of admissions: the stream's tail
+/// gap prices the number of interruptions. One mixed step merges extra
+/// prompts only with chunking or while its leader is under
+/// `MIX_GATHER_ROWS`. The cohort bounds free-slot capacity, not a batch
+/// across completions; idle engines admit on sight and shallow batches skip.
+struct CoalesceDoor {
+    window: std::time::Duration,
+    since: Option<std::time::Instant>,
+}
+
+impl CoalesceDoor {
+    fn new(window: std::time::Duration) -> Self {
+        Self {
+            window,
+            since: None,
+        }
+    }
+
+    fn opens(
+        &mut self,
+        pending: usize,
+        active: usize,
+        slots: usize,
+        now: std::time::Instant,
+    ) -> bool {
+        if pending == 0 || active == 0 || (active + pending) * 2 < slots {
+            self.since = None;
+            return true;
+        }
+        let cohort = MIX_MAX_PROMPTS.min(slots.saturating_sub(active)).max(1);
+        let since = *self.since.get_or_insert(now);
+        let open = pending >= cohort || now.duration_since(since) >= self.window;
+        if open {
+            self.since = None;
+        }
+        open
+    }
+}
+
 pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
     let dir = model_path
         .to_str()
@@ -252,7 +292,7 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
             let mut pending: VecDeque<Submitted> = VecDeque::new();
             let mut active: Vec<Active> = Vec::new();
             let mut disconnected = false;
-            let mut coalesce_since: Option<std::time::Instant> = None;
+            let mut coalesce_door = state.admit_coalesce.map(CoalesceDoor::new);
             'engine: loop {
                 loop {
                     match submit_rx.try_recv() {
@@ -301,35 +341,14 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                 // flight for its whole length. Bound the attempts too, so a
                 // burst costs the streams a bounded number of prefills per
                 // token however deep it is.
-                // The coalesce door: arrivals that would invade a live decode batch wait out the
-                // window together, then share one mixed admission. A full mixed cohort releases
-                // early, and an idle engine never waits. Shallow batches skip the door: with few
-                // live streams the tail-gap count sits under the percentile on its own, and
-                // waiting for a cohort only taxes TTFT. Depth counts the arrivals too — a
-                // closed-loop arrival lands right after a completion, exactly when the active
-                // roster dips.
-                let door_open = match state.admit_coalesce {
-                    Some(window)
-                        if !pending.is_empty()
-                            && !active.is_empty()
-                            && (active.len() + pending.len()) * 2 >= state.slots =>
-                    {
-                        let cohort = MIX_MAX_PROMPTS
-                            .min(state.slots.saturating_sub(active.len()))
-                            .max(1);
-                        let gathered = pending.len() >= cohort;
-                        let since = *coalesce_since.get_or_insert_with(std::time::Instant::now);
-                        let open = gathered || since.elapsed() >= window;
-                        if open {
-                            coalesce_since = None;
-                        }
-                        open
-                    }
-                    _ => {
-                        coalesce_since = None;
-                        true
-                    }
-                };
+                let door_open = coalesce_door.as_mut().is_none_or(|door| {
+                    door.opens(
+                        pending.len(),
+                        active.len(),
+                        state.slots,
+                        std::time::Instant::now(),
+                    )
+                });
                 if door_open {
                     state.admit_from_queue(&mut pending, &mut active);
                 }
@@ -2356,6 +2375,81 @@ mod knob_tests {
         }
     }
 
+    fn test_door() -> CoalesceDoor {
+        CoalesceDoor::new(std::time::Duration::from_millis(100))
+    }
+
+    #[test]
+    fn coalesce_door_idle_opens_and_clears_the_timer() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        door.since = Some(now);
+        assert!(door.opens(1, 0, 8, now));
+        assert_eq!(door.since, None);
+    }
+
+    #[test]
+    fn coalesce_door_empty_queue_opens() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        assert!(door.opens(0, 4, 8, now));
+        assert_eq!(door.since, None);
+    }
+
+    #[test]
+    fn coalesce_door_shallow_batch_opens() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        assert!(door.opens(1, 1, 8, now));
+        assert_eq!(door.since, None);
+    }
+
+    #[test]
+    fn coalesce_door_deep_under_cohort_batch_closes_and_pins_the_timer() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        assert!(!door.opens(1, 3, 8, now));
+        assert_eq!(door.since, Some(now));
+        assert!(!door.opens(1, 3, 8, now + std::time::Duration::from_millis(1)));
+        assert_eq!(door.since, Some(now));
+    }
+
+    #[test]
+    fn coalesce_door_full_cohort_opens_and_clears() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        door.since = Some(now);
+        assert!(door.opens(4, 4, 8, now));
+        assert_eq!(door.since, None);
+    }
+
+    #[test]
+    fn coalesce_door_elapsed_window_opens() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        let window = door.window;
+        assert!(!door.opens(1, 3, 8, now));
+        assert!(door.opens(1, 3, 8, now + window));
+        assert_eq!(door.since, None);
+    }
+
+    #[test]
+    fn coalesce_door_full_roster_opens_for_one_capacity_bounded_arrival() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        assert!(door.opens(1, 8, 8, now));
+        assert_eq!(door.since, None);
+    }
+
+    #[test]
+    fn coalesce_door_freed_slots_rederive_the_cohort() {
+        let now = std::time::Instant::now();
+        let mut door = test_door();
+        assert!(door.opens(2, 6, 8, now));
+        assert!(!door.opens(2, 5, 8, now));
+        assert_eq!(door.since, Some(now));
+    }
+
     #[test]
     fn chunk_mode_parses_or_refuses() {
         for off in ["", "0", "off", " OFF "] {
@@ -2466,6 +2560,7 @@ mod lane_tests {
     struct Drained {
         tokens: usize,
         cached: usize,
+        scheduled: usize,
         finish: FinishReason,
         ids: Vec<u32>,
     }
@@ -2473,6 +2568,7 @@ mod lane_tests {
     fn drain(rx: &mut TokenStreamReceiver, name: &str) -> Drained {
         let mut tokens = 0;
         let mut cached = 0;
+        let mut scheduled = 0;
         let mut ids = Vec::new();
         loop {
             match rx.blocking_recv().map(|(_, event)| event) {
@@ -2480,12 +2576,16 @@ mod lane_tests {
                     tokens += 1;
                     ids.push(id);
                 }
-                Some(TokenEvent::Scheduled { cached_tokens, .. }) => cached = cached_tokens,
+                Some(TokenEvent::Scheduled { cached_tokens, .. }) => {
+                    cached = cached_tokens;
+                    scheduled += 1;
+                }
                 Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
                 Some(TokenEvent::Finished { finish_reason, .. }) => {
                     return Drained {
                         tokens,
                         cached,
+                        scheduled,
                         finish: finish_reason,
                         ids,
                     };
@@ -2834,6 +2934,59 @@ mod lane_tests {
         );
     }
 
+    /// The production intake decision is driven with an injected clock so
+    /// this gate observes scheduling events without sleeping: two arrivals
+    /// wait behind a live roster, the capacity-bounded cohort releases when
+    /// its third arrives, and one intake pass admits the whole burst.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_coalesce_door_releases_one_admission_burst() {
+        let dir = crate::testkit::model_path();
+        let policy = super::generation_policy(&dir).expect("policy");
+        let _env = scoped_engine_env(&[
+            (super::ADMIT_COALESCE_ENV, "2000"),
+            (super::DECODE_SLOTS_ENV, "4"),
+        ]);
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        let mut pending = std::collections::VecDeque::new();
+        let mut active = Vec::new();
+        let (incumbent, mut incumbent_rx) = walk_request(ids(40, 1), 16);
+        pending.push_back((incumbent, pegainfer_frontend::engine::KvPrefix::none()));
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(active.len(), 1, "the live roster is pinned");
+
+        let (second, mut second_rx) = walk_request(ids(40, 2), 4);
+        let (third, mut third_rx) = walk_request(ids(40, 3), 4);
+        pending.push_back((second, pegainfer_frontend::engine::KvPrefix::none()));
+        pending.push_back((third, pegainfer_frontend::engine::KvPrefix::none()));
+        let now = std::time::Instant::now();
+        let mut door = super::CoalesceDoor::new(state.admit_coalesce.expect("door enabled"));
+        assert!(!door.opens(pending.len(), active.len(), state.slots, now));
+        assert!(second_rx.try_recv().is_err());
+        assert!(third_rx.try_recv().is_err());
+
+        let (fourth, mut fourth_rx) = walk_request(ids(40, 4), 4);
+        pending.push_back((fourth, pegainfer_frontend::engine::KvPrefix::none()));
+        assert!(door.opens(pending.len(), active.len(), state.slots, now));
+        state.admit_from_queue(&mut pending, &mut active);
+        assert!(pending.is_empty(), "the release drains the cohort");
+        assert_eq!(active.len(), 4, "every request is admitted");
+        while !active.is_empty() {
+            state.decode_round(&mut active);
+        }
+
+        let incumbent = drain(&mut incumbent_rx, "incumbent");
+        let second = drain(&mut second_rx, "second");
+        let third = drain(&mut third_rx, "third");
+        let fourth = drain(&mut fourth_rx, "fourth");
+        assert_eq!(incumbent.tokens, 16);
+        assert_eq!((second.tokens, third.tokens, fourth.tokens), (4, 4, 4));
+        assert_eq!(
+            second.scheduled + third.scheduled + fourth.scheduled,
+            3,
+            "the released walk emits one admission event per request"
+        );
     }
 
     /// The slots boundary, driven at the roster edge the engine loop owns

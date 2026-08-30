@@ -61,6 +61,7 @@ GATES_DENSE_AND_ROUTED=(
 # reads a weight, so that one needs the config and nothing else.
 GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_tests::the_gathered_lifecycle_completes"
+  "gpu,ckpt engine::lane_tests::the_coalesce_door_releases_one_admission_burst"
   "gpu,ckpt,prompts engine::lane_tests::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
   "gpu,ckpt,prompts engine::lane_tests::the_full_roster_keeps_its_pipeline_under_a_queue"
   "gpu,ckpt,prompts engine::lane_tests::an_idle_refill_drops_the_retired_fingerprint"
