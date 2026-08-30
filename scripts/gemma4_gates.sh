@@ -109,6 +109,14 @@ MANIFEST_LIB=(
   "${GATES_DEVICE[@]}"
   "${GATES_ROUTED[@]}"
 )
+GATES_FP8_PROFILE=(
+  "serve::oracle::context_waypoints_match_hf"
+  "serve::oracle::greedy_matches_hf_generate"
+  "serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
+  "serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
+  "serve::oracle::eviction_is_footprint_only"
+  "serve::oracle::overlapped_prefill_matches_the_sync_step"
+)
 
 # Integration gates live in their own binaries, which `--lib` cannot see. One
 # array per binary, named GATES_<TARGET>; the target list itself is held
@@ -132,8 +140,26 @@ CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
 
 die() { echo "gemma4 gates: $*" >&2; exit 1; }
 
+gate_is_in() {
+  local wanted=$1 candidate
+  shift
+  for candidate in "$@"; do
+    [ "$candidate" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || die "cannot enter the repository root"
+
+[ -z "${PEGAINFER_KV_FP8:-}" ] || die \
+  "PEGAINFER_KV_FP8 is ambient; PEGAINFER_GATE_STORAGE is the only storage switch"
+gate_storage=${PEGAINFER_GATE_STORAGE:-bf16}
+case "$gate_storage" in
+  bf16) ;;
+  fp8) export PEGAINFER_KV_FP8=local ;;
+  *) die "PEGAINFER_GATE_STORAGE must be unset, bf16, or fp8" ;;
+esac
 
 # --- prerequisites, one refusal per tier ----------------------------------
 # Each is demanded only when a selected gate declares it, so a focused run
@@ -186,6 +212,7 @@ require_gpu() {
   exec {gpu_lock_fd}<"$lock_path" || die "cannot open device lock $lock_path"
   flock -n "$gpu_lock_fd" || die "GPU $gpu_uuid is already owned by another Gemma 4 gate runner"
   echo "gemma4 gates: claimed GPU $gpu_uuid (selector $selector)"
+  echo "gemma4 gates: storage profile $gate_storage"
   if [ -n "${PEGAINFER_KV_FP8:-}" ]; then
     echo "gemma4 gates: PEGAINFER_KV_FP8=$PEGAINFER_KV_FP8"
   fi
@@ -296,6 +323,10 @@ lib_listing=$(ignored_in "$CRATE" --lib)
 lib_names=()
 for entry in "${MANIFEST_LIB[@]}"; do lib_names+=("${entry##* }"); done
 check_membership "library" "$lib_listing" "$(printf '%s\n' "${lib_names[@]}" | sort)"
+for gate in "${GATES_FP8_PROFILE[@]}"; do
+  gate_is_in "$gate" "${lib_names[@]}" || die \
+    "the fp8 storage profile names a gate outside the library manifest: $gate"
+done
 
 kernels_listing=$(ignored_in "$KERNELS_CRATE" --lib)
 [ -n "$kernels_listing" ] || die "could not list the kernels library's ignored gates"
@@ -360,6 +391,10 @@ done
 filter=${1:-}
 selected=()
 for entry in "${all_gates[@]}"; do
+  if [ "$gate_storage" = fp8 ]; then
+    gate=${entry##*|}
+    gate_is_in "$gate" "${GATES_FP8_PROFILE[@]}" || continue
+  fi
   [ -z "$filter" ] || [[ ${entry##*|} == *"$filter"* ]] || continue
   selected+=("$entry")
 done
