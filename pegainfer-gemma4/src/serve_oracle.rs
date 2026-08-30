@@ -237,7 +237,7 @@ fn gate_waypoint(
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     point: Waypoint<'_>,
-) -> Option<String> {
+) -> Vec<String> {
     let label = match point.chunk {
         0 => point.case.to_string(),
         _ => format!("{}-chunked", point.case),
@@ -251,10 +251,6 @@ fn gate_waypoint(
         "{label}: shifted multi-token coverage"
     );
     let (max_abs, top1) = score_rows(&run.rows, &ids, &lps, top_k, &label);
-    assert!(
-        top1 >= backend_top1,
-        "{label}: top-1 {top1}/{positions} below backend bar {backend_top1}/{positions}"
-    );
     let page = serve.local_pool.layout().page_size;
     let released = run.kv_len.saturating_sub(serve.sliding_window) / page;
     assert_eq!(run.local_pages, run.kv_len.div_ceil(page) - released);
@@ -264,7 +260,16 @@ fn gate_waypoint(
          {top1}/{positions}, local pages {}, global {}",
         run.local_pages, run.global_pages
     );
-    (max_abs > tolerance).then(|| format!("{label} ({max_abs} > {tolerance})"))
+    let mut failures = Vec::new();
+    if top1 < backend_top1 {
+        failures.push(format!(
+            "{label}: top-1 {top1}/{positions} below backend bar {backend_top1}/{positions}"
+        ));
+    }
+    if max_abs > tolerance {
+        failures.push(format!("{label} ({max_abs} > {tolerance})"));
+    }
+    failures
 }
 
 fn gate_waypoints(
@@ -272,15 +277,11 @@ fn gate_waypoints(
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     points: &[Waypoint<'_>],
-) {
-    let over: Vec<String> = points
+) -> Vec<String> {
+    points
         .iter()
-        .filter_map(|&point| gate_waypoint(ctx, serve, fixture, point))
-        .collect();
-    assert!(
-        over.is_empty(),
-        "cases over their calibrated floor: {over:?}"
-    );
+        .flat_map(|&point| gate_waypoint(ctx, serve, fixture, point))
+        .collect()
 }
 
 fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8]) {
@@ -364,8 +365,12 @@ fn context_waypoints_match_hf() {
             floor: Some(floor),
         },
     ];
-    gate_waypoints(&ctx, &serve, &window, &window_points);
-    gate_waypoints(&ctx, &serve, &long, &long_points);
+    let mut failures = gate_waypoints(&ctx, &serve, &window, &window_points);
+    failures.extend(gate_waypoints(&ctx, &serve, &long, &long_points));
+    assert!(
+        failures.is_empty(),
+        "cases over their calibrated floor: {failures:?}"
+    );
 }
 
 fn incremental_argmaxes(ctx: &DeviceContext, serve: &GemmaServe, prompt: &[u32]) -> Vec<usize> {
