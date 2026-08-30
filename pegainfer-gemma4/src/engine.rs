@@ -966,11 +966,13 @@ impl EngineState {
         let mut sampler_graphs = Vec::new();
         if graph_enabled {
             let (logits, ids) = arena.logits_and_ids();
+            // The warm pass lands lazy module loads outside capture.
+            logits.seq_len = arena_rows;
+            ops::suppress_logits_bf16_in_place(&ctx, logits, &suppress_ids)?;
+            pegainfer_sample::greedy_argmax_ids(&ctx, logits, arena_rows, ids, &mut scratch)?;
             let mut bucket = 1usize;
             while bucket <= arena_rows {
                 logits.seq_len = bucket;
-                ops::suppress_logits_bf16_in_place(&ctx, logits, &suppress_ids)?;
-                pegainfer_sample::greedy_argmax_ids(&ctx, logits, bucket, ids, &mut scratch)?;
                 let mut graph = CudaGraphState::new();
                 graph.capture_only(&ctx, || {
                     ops::suppress_logits_bf16_in_place(&ctx, logits, &suppress_ids)?;
@@ -1791,6 +1793,14 @@ impl EngineState {
         })
     }
 
+    fn fence_or_abort(&self) {
+        let sync = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.ctx.stream.cu_stream()) };
+        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            log::error!("FATAL: cuStreamSynchronize(decode) failed ({sync:?}); aborting");
+            std::process::abort();
+        }
+    }
+
     /// Queue one decode and stage its greedy picks into the next embedding's
     /// id buffer and one pinned readback slot.
     fn launch_staged(
@@ -1811,7 +1821,7 @@ impl EngineState {
                     .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)?;
             }
         }
-        let graph_slot = rows.next_power_of_two().trailing_zeros() as usize;
+        let graph_slot = crate::serve::decode_bucket_slot(rows);
         if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {
             graph
                 .launch_captured(&self.ctx)
@@ -1862,6 +1872,7 @@ impl EngineState {
             return;
         };
         if let Err(err) = self.collect_pending(active, &pending) {
+            self.fence_or_abort();
             return fail_active_batch(active, "pipelined decode drain", &err);
         }
         active.retain(|entry| !entry.stopping);
@@ -1977,7 +1988,10 @@ impl EngineState {
                 .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
             {
                 Ok(logits) => logits,
-                Err(err) => return fail_active_batch(active, "batched decode", &err),
+                Err(err) => {
+                    self.fence_or_abort();
+                    return fail_active_batch(active, "batched decode", &err);
+                }
             }
         };
         let sampled = {
@@ -1995,7 +2009,10 @@ impl EngineState {
         };
         match sampled {
             Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0),
-            Err(err) => fail_active_batch(active, "batched decode", &err),
+            Err(err) => {
+                self.fence_or_abort();
+                fail_active_batch(active, "batched decode", &err);
+            }
         }
     }
 
@@ -2008,6 +2025,7 @@ impl EngineState {
                 match self.launch_staged(active, true, next_slot) {
                     Ok(rows) => {
                         if let Err(err) = self.collect_pending(active, &pending) {
+                            self.fence_or_abort();
                             fail_active_batch(active, "pipelined decode collect", &err);
                             return;
                         }
@@ -2020,6 +2038,7 @@ impl EngineState {
                         if let Err(collect_err) = self.collect_pending(active, &pending) {
                             log::error!("collect during launch failure failed: {collect_err:#}");
                         }
+                        self.fence_or_abort();
                         fail_active_batch(active, "pipelined decode launch", &err);
                     }
                 }
@@ -2039,7 +2058,10 @@ impl EngineState {
         if self.pipeline_eligible(active) {
             match self.launch_staged(active, false, 0) {
                 Ok(rows) => self.pipeline = Some(PendingDecode { rows, slot: 0 }),
-                Err(err) => fail_active_batch(active, "batched decode", &err),
+                Err(err) => {
+                    self.fence_or_abort();
+                    fail_active_batch(active, "batched decode", &err);
+                }
             }
             return;
         }

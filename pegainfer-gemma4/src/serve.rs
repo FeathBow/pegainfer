@@ -468,8 +468,8 @@ impl TowerScratch {
     }
 }
 
-fn bucket_slot(bucket: usize) -> usize {
-    bucket.trailing_zeros() as usize
+pub(crate) fn decode_bucket_slot(rows: usize) -> usize {
+    rows.next_power_of_two().trailing_zeros() as usize
 }
 
 fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &mut HiddenStates) {
@@ -935,7 +935,7 @@ impl GemmaServe {
             mix_indptr,
             head_normed: HiddenStates::zeros(ctx, self.local_geom.hidden_size, max_rows)?,
             logits: HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, max_rows)?,
-            graphs: (0..=bucket_slot(max_rows))
+            graphs: (0..=decode_bucket_slot(max_rows))
                 .map(|_| CudaGraphState::new())
                 .collect(),
             graph_enabled,
@@ -1934,7 +1934,7 @@ impl GemmaServe {
             ..
         } = arena;
         if *graph_enabled {
-            let graph = &mut graphs[bucket_slot(padded)];
+            let graph = &mut graphs[decode_bucket_slot(padded)];
             anyhow::ensure!(
                 graph.is_captured(),
                 "no captured graph for bucket {padded}; the pre-capture sweep must cover \
@@ -2366,7 +2366,7 @@ impl GemmaServe {
                     head_normed,
                     logits,
                 )?;
-                graphs[bucket_slot(padded)].capture_only(ctx, || {
+                graphs[decode_bucket_slot(padded)].capture_only(ctx, || {
                     self.decode_gpu_body(
                         ctx,
                         tower,
