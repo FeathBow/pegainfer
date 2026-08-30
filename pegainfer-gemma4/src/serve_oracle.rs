@@ -3,6 +3,7 @@
 //! different admission shape.
 
 use anyhow::Result;
+use pegainfer_core::kv_pool::KvStorage;
 
 use super::*;
 use crate::kv::admit_tokens;
@@ -15,20 +16,20 @@ use crate::testkit::model_path;
 use crate::testkit::u32_tensor;
 
 fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
+    stack_with_storage(max_context, pages, KvStorage::Bf16)
+}
+
+fn stack_with_storage(
+    max_context: usize,
+    pages: usize,
+    storage: KvStorage,
+) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
     let config = Gemma4Config::from_file(&dir).expect("config");
     let (weights, _) =
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
-    let serve = GemmaServe::new(
-        &ctx,
-        weights,
-        max_context,
-        pegainfer_core::kv_pool::KvStorage::Bf16,
-        pages,
-        pages,
-    )
-    .expect("serve");
+    let serve = GemmaServe::new(&ctx, weights, max_context, storage, pages, pages).expect("serve");
     (ctx, serve, dir)
 }
 
@@ -360,6 +361,86 @@ fn context_waypoints_match_hf() {
     ];
     gate_waypoints(&ctx, &serve, &window, &window_points);
     gate_waypoints(&ctx, &serve, &long, &long_points);
+}
+
+fn incremental_argmaxes(ctx: &DeviceContext, serve: &GemmaServe, prompt: &[u32]) -> Vec<usize> {
+    let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(ctx, 1, false)
+        .expect("oracle step arena");
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1).expect("admit first token");
+    let first = serve.step(ctx, &mut kv, &prompt[..1]).expect("first step");
+    let mut choices = vec![argmax(&first.to_host(ctx).expect("first logits D2H"))];
+    for &token in &prompt[1..] {
+        let row = decode_serving(serve, ctx, &mut arena, &mut kv, token).expect("decode");
+        choices.push(argmax(&row));
+    }
+    choices
+}
+
+fn recomputed_argmaxes(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    prompt: &[u32],
+    positions: &[usize],
+) -> Vec<usize> {
+    positions
+        .iter()
+        .map(|&position| {
+            let mut kv = serve.alloc_kv();
+            let prefix = &prompt[..=position];
+            admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prefix.len())
+                .expect("admit recompute prefix");
+            let logits = serve.step(ctx, &mut kv, prefix).expect("recompute step");
+            let host = logits.to_host(ctx).expect("recompute logits D2H");
+            let vocab = logits.hidden_dim;
+            argmax(&host[(logits.seq_len - 1) * vocab..])
+        })
+        .collect()
+}
+
+fn agreement(left: &[usize], right: &[usize]) -> usize {
+    left.iter().zip(right).filter(|(a, b)| a == b).count()
+}
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
+fn fp8_argmax_agreement_meets_the_bf16_floor() {
+    const SAMPLE_STRIDE: usize = 8;
+    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("window fixture");
+    let (_, prompt) = u32_tensor(&fixture, "w1023_prompt");
+    let sampled: Vec<usize> = (0..prompt.len()).step_by(SAMPLE_STRIDE).collect();
+
+    let (ctx, bf16, _) = stack_with_storage(1024, 66, KvStorage::Bf16);
+    let bf16_incremental = incremental_argmaxes(&ctx, &bf16, &prompt);
+    // Recompute is quadratic, so every eighth position defines the sampled floor.
+    let bf16_recomputed = recomputed_argmaxes(&ctx, &bf16, &prompt, &sampled);
+    let bf16_sampled: Vec<usize> = sampled.iter().map(|&pos| bf16_incremental[pos]).collect();
+    let floor_matches = agreement(&bf16_sampled, &bf16_recomputed);
+    drop(bf16);
+    drop(ctx);
+
+    let (ctx, fp8, _) = stack_with_storage(1024, 66, KvStorage::E4m3);
+    let fp8_incremental = incremental_argmaxes(&ctx, &fp8, &prompt);
+    let fp8_sampled: Vec<usize> = sampled.iter().map(|&pos| fp8_incremental[pos]).collect();
+    let fp8_matches = agreement(&fp8_sampled, &bf16_sampled);
+    let samples = sampled.len();
+    let samples_f64 = f64::from(u32::try_from(samples).expect("sample count fits u32"));
+    let floor_rate =
+        f64::from(u32::try_from(floor_matches).expect("match count fits u32")) / samples_f64;
+    let fp8_rate =
+        f64::from(u32::try_from(fp8_matches).expect("match count fits u32")) / samples_f64;
+    eprintln!(
+        "argmax agreement: bf16 incremental/recompute {floor_rate:.6} \
+         ({floor_matches}/{samples}), fp8/bf16 incremental {fp8_rate:.6} \
+         ({fp8_matches}/{samples})"
+    );
+    assert!(
+        fp8_matches >= floor_matches,
+        "fp8/bf16 argmax agreement {fp8_matches}/{samples} is below the bf16 \
+         incremental/recompute floor {floor_matches}/{samples}"
+    );
 }
 
 /// `window_left` masks out-of-window keys whether or not their pages are

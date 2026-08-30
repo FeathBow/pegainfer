@@ -39,6 +39,7 @@ GPU_LOCK_ROOT=/tmp
 # run a gate without producing the whole suite's prerequisites.
 GATES_NUMERIC_PARITY=(
   "gpu,ckpt,fixtures serve::oracle::context_waypoints_match_hf"
+  "gpu,ckpt,fixtures serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
   "gpu,ckpt,fixtures serve::oracle::greedy_matches_hf_generate"
 )
 GATES_ADMISSION=(
