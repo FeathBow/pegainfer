@@ -46,6 +46,7 @@ const MIX_CHUNK_TOKENS_ENV: &str = "PEGAINFER_MIX_CHUNK_TOKENS";
 const MAX_CONTEXT_ENV: &str = "PEGAINFER_MAX_CONTEXT";
 const DECODE_SLOTS_ENV: &str = "PEGAINFER_DECODE_SLOTS";
 const KV_FP8_ENV: &str = "PEGAINFER_KV_FP8";
+const ADMIT_COALESCE_ENV: &str = "PEGAINFER_ADMIT_COALESCE_MS";
 const MIN_CONTEXT: usize = 1024;
 const MIN_CHUNK_TOKENS: usize = 64;
 const CEILING_DOMAIN: usize = i32::MAX as usize;
@@ -194,22 +195,8 @@ fn parse_kv_fp8(raw: Option<&str>) -> Result<KvStorage> {
         Some(value) => anyhow::bail!("PEGAINFER_KV_FP8 supports only \"local\", got {value:?}"),
     }
 }
-
-/// The admission coalesce door: `PEGAINFER_ADMIT_COALESCE_MS=N` holds
-/// arrivals that would ride a live decode batch for up to `N` ms, so one
-/// window's arrivals share a single mixed admission instead of invading
-/// the batch once each — a live stream's tail gap prices the number of
-/// admission events, not their size. An idle engine admits on sight; the
-/// door only prices arrivals that have someone to disturb. Unset (or
-/// `0`/`off`) admits on sight everywhere.
 fn admit_coalesce_ms() -> Result<Option<std::time::Duration>> {
-    match std::env::var("PEGAINFER_ADMIT_COALESCE_MS") {
-        Ok(raw) => parse_admit_coalesce_ms(&raw),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("PEGAINFER_ADMIT_COALESCE_MS is not valid UTF-8")
-        }
-    }
+    read_env(ADMIT_COALESCE_ENV)?.map_or(Ok(None), |raw| parse_admit_coalesce_ms(&raw))
 }
 
 fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
@@ -219,7 +206,7 @@ fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
         other => match other.parse::<u64>() {
             Ok(ms) if (1..=2000).contains(&ms) => Ok(Some(std::time::Duration::from_millis(ms))),
             _ => anyhow::bail!(
-                "PEGAINFER_ADMIT_COALESCE_MS={raw:?} not recognized (off | N ms, 1 <= N <= 2000)"
+                "{ADMIT_COALESCE_ENV}={raw:?} not recognized (off | N ms, 1 <= N <= 2000)"
             ),
         },
     }
@@ -2573,13 +2560,14 @@ mod lane_tests {
         }
     }
 
-    const SERVING_KNOBS: [&str; 6] = [
-        "PEGAINFER_ASYNC_PREFILL",
-        "PEGAINFER_PREFIX_CACHE",
-        "PEGAINFER_MIX_CHUNK_TOKENS",
-        "PEGAINFER_MAX_CONTEXT",
-        "PEGAINFER_DECODE_SLOTS",
-        "PEGAINFER_KV_FP8",
+    const SERVING_KNOBS: [&str; 7] = [
+        super::ASYNC_PREFILL_ENV,
+        super::PREFIX_CACHE_ENV,
+        super::MIX_CHUNK_TOKENS_ENV,
+        super::MAX_CONTEXT_ENV,
+        super::DECODE_SLOTS_ENV,
+        super::ADMIT_COALESCE_ENV,
+        super::KV_FP8_ENV,
     ];
 
     /// Clear every serving knob, set `overrides`, and hand back the guard
