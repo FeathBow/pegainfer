@@ -165,6 +165,11 @@ fn e4m3_to_f32(byte: u8) -> f32 {
     }
 }
 
+fn valid_e4m3_code(ordinal: usize) -> u8 {
+    let code = ordinal % 254;
+    u8::try_from(code + usize::from(code >= 0x7f)).expect("e4m3 code")
+}
+
 fn varied_values(pages: usize) -> Vec<f32> {
     let layout = PagedKvLayout::with_storage(1, 1, HD, PAGE_SIZE, KvStorage::Bf16);
     let mut values = vec![0.0; layout.page_stride * pages];
@@ -176,10 +181,11 @@ fn varied_values(pages: usize) -> Vec<f32> {
                         + block * layout.kv_block_len
                         + slot * HD
                         + element;
-                    let seed = page * PAGE_SIZE * HD * 2 + slot * HD * 2 + element * 2 + block;
-                    let byte = ((5 + seed % 5) << 3) as u8
-                        | (seed % 8) as u8
+                    let seed = slot * HD * 2 + element * 2 + block;
+                    let variation = ((5 + seed % 5) << 3)
+                        | (seed % 8)
                         | if seed.is_multiple_of(3) { 0x80 } else { 0 };
+                    let byte = valid_e4m3_code(page + variation);
                     values[index] = e4m3_to_f32(byte);
                 }
             }
@@ -360,7 +366,7 @@ fn varied_geometry_probe(ctx: &DeviceContext, prefix_rows: usize, pages: usize) 
     let (page_lists, starts, lengths, lasts) = if prefix_rows == 0 {
         (vec![vec![pages as i32 - 1]], vec![1], vec![1], vec![2])
     } else {
-        let prefix_pages: Vec<i32> = (0..pages as i32 - 1).collect();
+        let prefix_pages: Vec<i32> = (0..pages as i32 - 1).rev().collect();
         (
             vec![prefix_pages, vec![pages as i32 - 1]],
             vec![0, 1],
@@ -409,6 +415,13 @@ fn varied_fp8_window_read_is_geometry_invariant_for_the_probed_row() {
     };
     let packed_rows = 300;
     let pages = (packed_rows + 1usize).div_ceil(PAGE_SIZE);
+    let layout = PagedKvLayout::with_storage(1, 1, HD, PAGE_SIZE, KvStorage::E4m3);
+    let bytes: Vec<u8> = varied_values(pages).into_iter().map(exact_e4m3).collect();
+    let probed = &bytes[(pages - 1) * layout.page_stride..pages * layout.page_stride];
+    for page in 0..pages - 1 {
+        let other = &bytes[page * layout.page_stride..(page + 1) * layout.page_stride];
+        assert_ne!(probed, other, "probed page aliases physical page {page}");
+    }
     let lone = varied_geometry_probe(&ctx, 0, pages);
     let packed = varied_geometry_probe(&ctx, packed_rows, pages);
     if let Some(index) = lone.iter().zip(&packed).position(|(a, b)| a != b) {
