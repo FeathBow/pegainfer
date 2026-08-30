@@ -41,6 +41,10 @@ fn relative_gap(mine: &[f32], reference: &[f32]) -> f32 {
         / scale
 }
 
+/// One dispatch's device results. Logits, picks and weights are small and
+/// come back whole; the per-route projections and the block come back for
+/// `rows` only, so a thousand-row dispatch does not move tens of MiB to read
+/// six rows.
 struct RoutedCapture {
     /// The alignment pass's padded row total, which names the block it used.
     padded: usize,
@@ -48,11 +52,13 @@ struct RoutedCapture {
     logits: Vec<half::bf16>,
     index: Vec<i32>,
     weight: Vec<f32>,
-    gate: Vec<half::bf16>,
-    /// Each route's down projection with the router weight applied, before
-    /// the top-k sum and the post norm fold it into the block.
-    down: Vec<half::bf16>,
-    block: Vec<half::bf16>,
+    rows: Vec<usize>,
+    /// Per captured row: the first expert projection of its `top_k` routes.
+    gate: std::collections::HashMap<usize, Vec<half::bf16>>,
+    /// Per captured row: each route's down projection with the router weight
+    /// applied, before the top-k sum and the post norm fold it into the block.
+    down: std::collections::HashMap<usize, Vec<half::bf16>>,
+    block: std::collections::HashMap<usize, Vec<half::bf16>>,
 }
 
 /// The padded total the alignment pass must have produced for these picks at
@@ -70,6 +76,7 @@ fn assert_padding(label: &str, capture: &RoutedCapture, experts: usize, block: u
     );
 }
 
+/// `actual` reproduces `expected` byte for byte on `expected`'s rows.
 fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapture) {
     assert!(
         actual.logits.starts_with(&expected.logits),
@@ -83,18 +90,55 @@ fn assert_same_target(label: &str, expected: &RoutedCapture, actual: &RoutedCapt
         actual.weight.starts_with(&expected.weight),
         "{label}: router weights moved"
     );
+    for row in &expected.rows {
+        assert_eq!(
+            expected.gate[row], actual.gate[row],
+            "{label}: row {row} gate bytes moved"
+        );
+        assert_eq!(
+            expected.down[row], actual.down[row],
+            "{label}: row {row} down bytes moved"
+        );
+        assert_eq!(
+            expected.block[row], actual.block[row],
+            "{label}: row {row} block bytes moved"
+        );
+    }
+}
+
+/// The block policy's own claim, on its own rows: a route's expert GEMM is
+/// the same bytes on the 16-row and the 64-row block. The router projection
+/// is a cuBLAS GEMM whose algorithm follows the batch, so a four-row and a
+/// thousand-row dispatch may store different logits for the same input row;
+/// where a row's pick agrees across the two, the gate bytes must agree.
+fn assert_prefix_gate_bytes(
+    label: &str,
+    narrow: &RoutedCapture,
+    coarse: &RoutedCapture,
+    top_k: usize,
+    width: usize,
+) {
+    let mut compared = 0usize;
+    for row in &narrow.rows {
+        for pick in 0..top_k {
+            let at = row * top_k + pick;
+            if narrow.index[at] != coarse.index[at] {
+                continue;
+            }
+            let span = pick * width..(pick + 1) * width;
+            assert_eq!(
+                narrow.gate[row][span.clone()],
+                coarse.gate[row][span],
+                "{label}: row {row} pick {pick} gate bytes differ across the block policy"
+            );
+            compared += 1;
+        }
+    }
     assert!(
-        actual.gate.starts_with(&expected.gate),
-        "{label}: gate bytes moved"
+        compared > 0,
+        "{label}: no pick agreed across the two dispatches, nothing was compared"
     );
-    assert!(
-        actual.down.starts_with(&expected.down),
-        "{label}: down bytes moved"
-    );
-    assert!(
-        actual.block.starts_with(&expected.block),
-        "{label}: block bytes moved"
-    );
+    eprintln!("{label}: {compared} routes compared byte for byte across the block policy");
 }
 
 /// The host side of the block: checkpoint weights widened on the host, the
@@ -243,7 +287,7 @@ fn assert_matches_reference(
                 reference_gate[column] = g;
                 activated[column] = gelu_tanh(g) * u;
             }
-            let device_gate: Vec<f32> = capture.gate[at * width..(at + 1) * width]
+            let device_gate: Vec<f32> = capture.gate[&row][pick * width..(pick + 1) * width]
                 .iter()
                 .map(|x| x.to_f32())
                 .collect();
@@ -263,7 +307,7 @@ fn assert_matches_reference(
                     weight * projected
                 })
                 .collect();
-            let device_down: Vec<f32> = capture.down[at * hidden..(at + 1) * hidden]
+            let device_down: Vec<f32> = capture.down[&row][pick * hidden..(pick + 1) * hidden]
                 .iter()
                 .map(|x| x.to_f32())
                 .collect();
@@ -286,10 +330,7 @@ fn assert_matches_reference(
         let reference_block: Vec<f32> = (0..hidden)
             .map(|i| dense_normed[i] + routed_normed[i])
             .collect();
-        let device_block: Vec<f32> = capture.block[row * hidden..(row + 1) * hidden]
-            .iter()
-            .map(|x| x.to_f32())
-            .collect();
+        let device_block: Vec<f32> = capture.block[&row].iter().map(|x| x.to_f32()).collect();
         let block_gap = relative_gap(&device_block, &reference_block);
         assert!(
             block_gap <= RELATIVE_TOLERANCE,
@@ -313,6 +354,12 @@ fn the_routed_block_matches_the_reference_formulas() {
     const NARROW_TARGET_ROWS: usize = 4;
     const COMPANION_ROWS: usize = NARROW_TARGET_ROWS + 1;
     const ROOMY_SCRATCH_ROWS: usize = 8;
+    // The production block policy, pinned here rather than derived from it,
+    // so a moved constant fails this gate instead of moving its inputs along:
+    // the widest dispatch the 16-row block still takes, and the narrowest the
+    // 64-row block takes.
+    const NARROW_EDGE_ROWS: usize = 1023;
+    const COARSE_ROWS: usize = 1024;
 
     let model = std::env::var("PEGAINFER_NVFP4_MODEL")
         .expect("PEGAINFER_NVFP4_MODEL must name the checkpoint directory");
@@ -325,10 +372,8 @@ fn the_routed_block_matches_the_reference_formulas() {
     let hidden = geom.hidden_size;
     let width = routed.intermediate_size;
     let top_k = routed.top_k;
-    // The smallest dispatch the production policy sends to the 64-row block.
-    let coarse_rows = super::PREFILL_MIN_SLOTS.div_ceil(top_k);
-    assert_eq!(super::marlin_block(coarse_rows * top_k), 64);
-    assert_eq!(super::marlin_block(coarse_rows * top_k - 1), 16);
+    assert_eq!(super::marlin_block(NARROW_EDGE_ROWS * top_k), 16);
+    assert_eq!(super::marlin_block(COARSE_ROWS * top_k), 64);
 
     let (weights, _) =
         crate::weights::Gemma4Weights::from_safetensors(&model, 0, config).expect("weights");
@@ -343,55 +388,70 @@ fn the_routed_block_matches_the_reference_formulas() {
             .map(|i| bf16::from_f32((((i * 37 + seed * 11) % 199) as f32 - 99.0) / 200.0))
             .collect()
     };
-    let capture = |residual_host: &[bf16], dense_host: &[bf16], scratch: &mut MoeScratch| {
-        let active_rows = residual_host.len() / hidden;
-        let active_slots = active_rows * top_k;
-        let residual =
-            HiddenStates::from_host(&ctx, residual_host, hidden, active_rows).expect("residual");
-        let dense = HiddenStates::from_host(&ctx, dense_host, hidden, active_rows).expect("dense");
-        let mut out = HiddenStates::zeros(&ctx, hidden, active_rows).expect("out");
-        moe_into(&ctx, moe, &geom, &residual, &dense, scratch, &mut out).expect("routed block");
-        RoutedCapture {
-            padded: usize::try_from(
+    let capture =
+        |residual_host: &[bf16], dense_host: &[bf16], scratch: &mut MoeScratch, rows: &[usize]| {
+            let active_rows = residual_host.len() / hidden;
+            let active_slots = active_rows * top_k;
+            let residual = HiddenStates::from_host(&ctx, residual_host, hidden, active_rows)
+                .expect("residual");
+            let dense =
+                HiddenStates::from_host(&ctx, dense_host, hidden, active_rows).expect("dense");
+            let mut out = HiddenStates::zeros(&ctx, hidden, active_rows).expect("out");
+            moe_into(&ctx, moe, &geom, &residual, &dense, scratch, &mut out).expect("routed block");
+            let row_span = |data: &cudarc::driver::CudaSlice<bf16>, row: usize, len: usize| {
                 ctx.stream
-                    .clone_dtoh(&scratch.padded_total)
-                    .expect("padded total")[0],
-            )
-            .expect("padded total"),
-            logits: ctx
-                .stream
-                .clone_dtoh(
-                    &scratch
-                        .logits
-                        .data
-                        .slice(..active_rows * routed.num_experts),
+                    .clone_dtoh(&data.slice(row * len..(row + 1) * len))
+                    .expect("row span")
+            };
+            RoutedCapture {
+                padded: usize::try_from(
+                    ctx.stream
+                        .clone_dtoh(&scratch.padded_total)
+                        .expect("padded total")[0],
                 )
-                .expect("logits"),
-            index: ctx
-                .stream
-                .clone_dtoh(&scratch.index.slice(..active_slots))
-                .expect("index"),
-            weight: ctx
-                .stream
-                .clone_dtoh(&scratch.weight.slice(..active_slots))
-                .expect("weight"),
-            gate: ctx
-                .stream
-                .clone_dtoh(&scratch.routed_gate.data.slice(..active_slots * width))
-                .expect("routed gate"),
-            down: ctx
-                .stream
-                .clone_dtoh(&scratch.routed_down.data.slice(..active_slots * hidden))
-                .expect("routed down"),
-            block: ctx
-                .stream
-                .clone_dtoh(&out.data.slice(..active_rows * hidden))
-                .expect("out"),
-        }
-    };
+                .expect("padded total"),
+                logits: ctx
+                    .stream
+                    .clone_dtoh(
+                        &scratch
+                            .logits
+                            .data
+                            .slice(..active_rows * routed.num_experts),
+                    )
+                    .expect("logits"),
+                index: ctx
+                    .stream
+                    .clone_dtoh(&scratch.index.slice(..active_slots))
+                    .expect("index"),
+                weight: ctx
+                    .stream
+                    .clone_dtoh(&scratch.weight.slice(..active_slots))
+                    .expect("weight"),
+                rows: rows.to_vec(),
+                gate: rows
+                    .iter()
+                    .map(|&row| (row, row_span(&scratch.routed_gate.data, row, top_k * width)))
+                    .collect(),
+                down: rows
+                    .iter()
+                    .map(|&row| {
+                        (
+                            row,
+                            row_span(&scratch.routed_down.data, row, top_k * hidden),
+                        )
+                    })
+                    .collect(),
+                block: rows
+                    .iter()
+                    .map(|&row| (row, row_span(&out.data, row, hidden)))
+                    .collect(),
+            }
+        };
+    let all_rows = |rows: usize| (0..rows).collect::<Vec<_>>();
     let run = |residual_host: &[bf16], dense_host: &[bf16], scratch_rows: usize| {
         let mut scratch = MoeScratch::new(&ctx, &geom, scratch_rows).expect("scratch");
-        capture(residual_host, dense_host, &mut scratch)
+        let rows = all_rows(residual_host.len() / hidden);
+        capture(residual_host, dense_host, &mut scratch, &rows)
     };
 
     let residual_host = sample(0, NARROW_TARGET_ROWS);
@@ -410,16 +470,38 @@ fn the_routed_block_matches_the_reference_formulas() {
     assert_padding("narrow target", &baseline, routed.num_experts, 16);
     assert_padding("companion route", &companion, routed.num_experts, 16);
 
-    let coarse_residual_host = sample(0, coarse_rows);
-    let coarse_dense_host = sample(1, coarse_rows);
-    let mut coarse_scratch = MoeScratch::new(&ctx, &geom, coarse_rows).expect("coarse scratch");
+    // The widest 16-row dispatch and the narrowest 64-row one, each read on
+    // the narrow target's four rows, a middle row and its last row.
+    let edge_residual_host = sample(0, NARROW_EDGE_ROWS);
+    let edge_dense_host = sample(1, NARROW_EDGE_ROWS);
+    let edge_rows = [0, 1, 2, 3, NARROW_EDGE_ROWS / 2, NARROW_EDGE_ROWS - 1];
+    let mut edge_scratch = MoeScratch::new(&ctx, &geom, NARROW_EDGE_ROWS).expect("edge scratch");
+    let edge = capture(
+        &edge_residual_host,
+        &edge_dense_host,
+        &mut edge_scratch,
+        &edge_rows,
+    );
+    assert_padding("narrow edge", &edge, routed.num_experts, 16);
+
+    let coarse_residual_host = sample(0, COARSE_ROWS);
+    let coarse_dense_host = sample(1, COARSE_ROWS);
+    let coarse_rows = [0, 1, 2, 3, COARSE_ROWS / 2, COARSE_ROWS - 1];
+    let mut coarse_scratch = MoeScratch::new(&ctx, &geom, COARSE_ROWS).expect("coarse scratch");
     let coarse = capture(
         &coarse_residual_host,
         &coarse_dense_host,
         &mut coarse_scratch,
+        &coarse_rows,
     );
     assert_padding("coarse dispatch", &coarse, routed.num_experts, 64);
-    let reused = capture(&residual_host, &dense_host, &mut coarse_scratch);
+    assert_prefix_gate_bytes("coarse prefix", &baseline, &coarse, top_k, width);
+    let reused = capture(
+        &residual_host,
+        &dense_host,
+        &mut coarse_scratch,
+        &all_rows(NARROW_TARGET_ROWS),
+    );
     assert_same_target("block 16 after block 64", &baseline, &reused);
     assert_padding("block 16 after block 64", &reused, routed.num_experts, 16);
 
@@ -464,11 +546,10 @@ fn the_routed_block_matches_the_reference_formulas() {
         shards: &shards,
         widened: std::cell::RefCell::new(std::collections::HashMap::new()),
     };
-    // The narrow target's four rows and the companion's fifth (the narrow
-    // path's tail row) meet the oracle in full. The coarse dispatch is a
-    // thousand rows, so it meets the oracle on representatives: its first
-    // four rows (the narrow target's inputs, now on the 64-row block), a
-    // middle row and its last row.
+    // Every row the host oracle sees, it sees once: the narrow target's
+    // four, the companion's fifth (the narrow path's tail row), the middle
+    // and last rows of the widest 16-row dispatch and of the narrowest
+    // 64-row one. The coarse prefix is judged by bytes above, not here.
     assert_matches_reference(
         "4-row target",
         &baseline,
@@ -485,15 +566,21 @@ fn the_routed_block_matches_the_reference_formulas() {
         &companion_dense_host,
         &host,
     );
-    for rows in [
-        0..NARROW_TARGET_ROWS,
-        coarse_rows / 2..coarse_rows / 2 + 1,
-        coarse_rows - 1..coarse_rows,
-    ] {
+    for row in [NARROW_EDGE_ROWS / 2, NARROW_EDGE_ROWS - 1] {
+        assert_matches_reference(
+            "narrow edge",
+            &edge,
+            row..row + 1,
+            &edge_residual_host,
+            &edge_dense_host,
+            &host,
+        );
+    }
+    for row in [COARSE_ROWS / 2, COARSE_ROWS - 1] {
         assert_matches_reference(
             "coarse dispatch",
             &coarse,
-            rows,
+            row..row + 1,
             &coarse_residual_host,
             &coarse_dense_host,
             &host,
