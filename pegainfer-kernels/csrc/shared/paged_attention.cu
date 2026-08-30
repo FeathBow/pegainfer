@@ -2,7 +2,8 @@
 //
 // We include FlashInfer headers (header-only C++) and instantiate only the
 // template variants needed: bf16 Q/KV/O, NHD layout, no RoPE, at HEAD_DIM 128
-// and 256, the latter both with and without a sliding-window mask.
+// and 256 — the latter both with and without a sliding-window mask — plus the
+// hd512 split-KV decode entry the global family reads through.
 //
 // FlashInfer's dispatchers internally instantiate multiple GQA group sizes
 // (1,2,3,4,8) — this covers both Qwen3-4B (GQA=4) and Qwen3.5-4B (GQA=8).
@@ -202,10 +203,6 @@ int32_t batch_prefill_cta_tile_q_with_override(
     return static_cast<int32_t>(resolve_prefill_cta_tile_q(
         packed_qo_len, head_dim, cta_tile_q_override));
 }
-
-} // extern "C"
-
-extern "C" {
 
 int batch_prefill_paged_cuda_with_cta_tile_q(
     void* q, void* output, void* kv_data,

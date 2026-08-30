@@ -76,16 +76,16 @@ static int decode_launch(
     int32_t* page_indices,         // [num_pages_this_request]
     int32_t* page_indptr,          // [batch_size + 1]
     int32_t* last_page_len_d,      // [batch_size]
-    // Plan metadata (GPU arrays — trivial for non-partition bs=1)
-    int32_t* request_indices,      // [padded_batch_size], e.g. [0]
-    int32_t* kv_tile_indices,      // [padded_batch_size], e.g. [0]
-    int32_t* kv_chunk_size_ptr,    // GPU ptr → 1 int32 (kv_len)
+    // Plan metadata (GPU arrays, one slot per padded request)
+    int32_t* request_indices,      // [padded_batch_size]
+    int32_t* kv_tile_indices,      // [padded_batch_size]
+    int32_t* kv_chunk_size_ptr,    // GPU ptr → per-request kv lengths
     // Dimensions
     int32_t  num_qo_heads,
     int32_t  num_kv_heads,
     int32_t  head_dim,
     int32_t  page_size,
-    int32_t  batch_size,           // 1 for Phase 1
+    int32_t  batch_size,
     int64_t  stride_page,          // KvLayout.page_stride
     float    sm_scale,             // typically 1/sqrt(head_dim)
     int32_t  window_left,
@@ -302,7 +302,7 @@ static int prefill_paged_launch(
     params.qo_tile_indices   = qo_tile_indices;
     params.kv_tile_indices   = kv_tile_indices;
     params.merge_indptr      = nullptr;
-    params.o_indptr          = q_indptr;  // same as q_indptr for non-partition: [0, seq_len]
+    params.o_indptr          = q_indptr;  // non-partition: rows land at their request boundaries
     params.block_valid_mask  = nullptr;
     params.kv_chunk_size_ptr = kv_chunk_size_ptr;
     params.max_total_num_rows = seq_len;
