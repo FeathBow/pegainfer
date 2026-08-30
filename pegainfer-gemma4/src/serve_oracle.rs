@@ -428,6 +428,20 @@ fn agreement_case(
 
     let (ctx, bf16, _) = stack_with_storage(max_context, pages, KvStorage::Bf16);
     let bf16_incremental = incremental_argmaxes(&ctx, &bf16, &prompt);
+    // The same-schedule run-to-run baseline, measured on this exact prompt
+    // and schedule: a replay must agree everywhere, which is why a lossy
+    // storage is judged against the cross-shape floor below instead.
+    let bf16_replay = incremental_argmaxes(&ctx, &bf16, &prompt);
+    let replay_matches = agreement(&bf16_incremental, &bf16_replay);
+    eprintln!(
+        "{tensor_name}: same-schedule bf16 run-to-run agreement {replay_matches}/{}",
+        bf16_incremental.len()
+    );
+    assert_eq!(
+        replay_matches,
+        bf16_incremental.len(),
+        "{tensor_name}: the same-schedule bf16 replay must be deterministic"
+    );
     let bf16_recomputed = recomputed_argmaxes(&ctx, &bf16, &prompt, &sampled);
     let bf16_sampled: Vec<usize> = sampled.iter().map(|&pos| bf16_incremental[pos]).collect();
     let floor_matches = agreement(&bf16_sampled, &bf16_recomputed);
