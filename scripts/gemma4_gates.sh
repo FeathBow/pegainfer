@@ -44,6 +44,7 @@ GATES_NUMERIC_PARITY=(
 )
 GATES_ADMISSION=(
   "gpu,ckpt,prompts serve::oracle::mixed_step_matches_serial"
+  "gpu,ckpt,prompts serve::oracle::fp8_mixed_walk_holds_its_structure"
   "gpu,ckpt,prompts engine::lane_tests::the_gathered_walk_matches_the_serial_path"
   "gpu,ckpt,prompts engine::lane_tests::the_gathered_transient_leaves_headroom"
 )
@@ -113,6 +114,7 @@ GATES_FP8_PROFILE=(
   "serve::oracle::context_waypoints_match_hf"
   "serve::oracle::greedy_matches_hf_generate"
   "serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
+  "serve::oracle::fp8_mixed_walk_holds_its_structure"
   "serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
   "serve::oracle::eviction_is_footprint_only"
   "serve::oracle::overlapped_prefill_matches_the_sync_step"

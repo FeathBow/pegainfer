@@ -587,8 +587,10 @@ fn greedy_matches_hf_generate() {
     );
 }
 
-fn mixed_gate_argmax(host: &[f32], row: usize, vocab: usize) -> u32 {
-    u32::try_from(argmax(&host[row * vocab..(row + 1) * vocab])).expect("token id")
+/// The production sampler draws from the true vocabulary; a padded lm_head
+/// column is never a candidate, so neither is it here.
+fn mixed_gate_argmax(host: &[f32], row: usize, stride: usize, bound: usize) -> u32 {
+    u32::try_from(argmax(&host[row * stride..row * stride + bound])).expect("token id")
 }
 
 /// Reserve a lane's whole prompt. These gates drive the serving primitives
@@ -629,7 +631,8 @@ fn gate_host_logits(ctx: &DeviceContext, logits: &HiddenStates) -> (usize, Vec<f
 /// live lanes, so a mixed round and a pure one advance the batch alike.
 fn settle_gate_lanes(
     host: &[f32],
-    vocab: usize,
+    stride: usize,
+    bound: usize,
     row_base: usize,
     lanes: &mut Vec<(usize, GemmaKv, u32)>,
     produced: &mut [Vec<u32>],
@@ -637,7 +640,7 @@ fn settle_gate_lanes(
 ) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
-        let token = mixed_gate_argmax(host, row + row_base, vocab);
+        let token = mixed_gate_argmax(host, row + row_base, stride, bound);
         produced[*req].push(token);
         if produced[*req].len() >= budgets[*req] {
             retire.push(row);
@@ -671,7 +674,15 @@ fn mixed_gate_decode_rounds(
                 .expect("batched decode");
             gate_host_logits(ctx, logits)
         };
-        settle_gate_lanes(&host, vocab, 0, lanes, produced, budgets);
+        settle_gate_lanes(
+            &host,
+            vocab,
+            serve.weights.config.vocab_size,
+            0,
+            lanes,
+            produced,
+            budgets,
+        );
     }
 }
 
@@ -731,11 +742,19 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
                 .expect("k=2 mixed step");
             gate_host_logits(ctx, logits)
         };
-        settle_gate_lanes(&host, vocab, 2, &mut lanes, &mut produced, &budgets);
-        let first_b = mixed_gate_argmax(&host, 0, vocab);
+        settle_gate_lanes(
+            &host,
+            vocab,
+            serve.weights.config.vocab_size,
+            2,
+            &mut lanes,
+            &mut produced,
+            &budgets,
+        );
+        let first_b = mixed_gate_argmax(&host, 0, vocab, serve.weights.config.vocab_size);
         produced[1].push(first_b);
         lanes.push((1, kv_b, first_b));
-        let first_c = mixed_gate_argmax(&host, 1, vocab);
+        let first_c = mixed_gate_argmax(&host, 1, vocab, serve.weights.config.vocab_size);
         produced[2].push(first_c);
         lanes.push((2, kv_c, first_c));
         mixed_gate_decode_rounds(
@@ -816,8 +835,16 @@ fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &Gemm
                 "the mixed prefill must have released its window front (origin {})",
                 kv.local.origin_pages()
             );
-            settle_gate_lanes(&host, vocab, 1, &mut lanes, &mut produced, &budgets);
-            mixed_gate_argmax(&host, 0, vocab)
+            settle_gate_lanes(
+                &host,
+                vocab,
+                serve.weights.config.vocab_size,
+                1,
+                &mut lanes,
+                &mut produced,
+                &budgets,
+            );
+            mixed_gate_argmax(&host, 0, vocab, serve.weights.config.vocab_size)
         } else {
             let logits = serve
                 .step(ctx, &mut kv, &long_prompt)
@@ -870,6 +897,168 @@ fn mixed_step_matches_serial() {
     let (ctx, serve, _dir) = stack_with_storage(2048, 512, KvStorage::Bf16);
     assert_mixed_admissions_match_serial(&ctx, &serve);
     assert_mixed_window_crossing_matches_serial(&ctx, &serve);
+}
+
+fn assert_finite_gate_logits(host: &[f32], what: &str) {
+    assert!(
+        host.iter().all(|value| value.is_finite()),
+        "{what}: mixed step produced non-finite logits"
+    );
+}
+
+fn assert_gate_page_accounting(serve: &GemmaServe, kv: &GemmaKv, what: &str) {
+    let page = serve.local_pool.layout().page_size;
+    let kv_len = kv.local.seq_len();
+    assert_eq!(kv.global.seq_len(), kv_len, "{what}: KV lengths");
+    let released = kv_len.saturating_sub(serve.sliding_window) / page;
+    assert_eq!(
+        kv.local.held_pages(),
+        kv_len.div_ceil(page) - released,
+        "{what}: local pages"
+    );
+    assert_eq!(
+        kv.global.held_pages(),
+        kv_len.div_ceil(page),
+        "{what}: global pages"
+    );
+}
+
+fn fp8_plain_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
+    let prompts = crate::testkit::generate_fixture_prompts();
+    let budgets = [50usize, 37, 44];
+    let mut arena = serve.alloc_step_arena(ctx, 4, false).expect("step arena");
+    let mut lanes = Vec::new();
+    let mut produced = vec![Vec::new(); prompts.len()];
+
+    let (kv_a, first_a) = gate_open_lane(ctx, serve, &prompts[0], "prompt a");
+    produced[0].push(first_a);
+    lanes.push((0, kv_a, first_a));
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        3,
+    );
+
+    let mut kv_b = gate_admit_kv(serve, &prompts[1], "prompt b");
+    let mut kv_c = gate_admit_kv(serve, &prompts[2], "prompt c");
+    let tokens = gate_step_tokens(serve, &mut lanes);
+    let (vocab, host) = {
+        let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+        let mut prefills = [
+            (&mut kv_b, prompts[1].as_slice()),
+            (&mut kv_c, prompts[2].as_slice()),
+        ];
+        let logits = serve
+            .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
+            .expect("k=2 mixed step");
+        gate_host_logits(ctx, logits)
+    };
+    assert_finite_gate_logits(&host, "plain fp8 walk");
+    settle_gate_lanes(
+        &host,
+        vocab,
+        serve.weights.config.vocab_size,
+        2,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+    );
+    for (req, kv, row) in [(1, kv_b, 0), (2, kv_c, 1)] {
+        let first = mixed_gate_argmax(&host, row, vocab, serve.weights.config.vocab_size);
+        produced[req].push(first);
+        lanes.push((req, kv, first));
+    }
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        3,
+    );
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        usize::MAX,
+    );
+    for (tokens, budget) in produced.iter().zip(budgets) {
+        assert_eq!(tokens.len(), budget, "fp8 mixed lane token budget");
+    }
+}
+
+fn fp8_window_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
+    let partner: Vec<u32> = (0..40u32).map(|i| 1000 + i * 31).collect();
+    let long_prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 37) % 50000).collect();
+    let budgets = [24usize, 20];
+    let mut arena = serve.alloc_step_arena(ctx, 2, false).expect("step arena");
+    let mut produced = vec![Vec::new(); 2];
+    let (kv_partner, first_partner) = gate_open_lane(ctx, serve, &partner, "partner");
+    let mut lanes = vec![(0, kv_partner, first_partner)];
+    produced[0].push(first_partner);
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        3,
+    );
+
+    let mut kv_long = gate_admit_kv(serve, &long_prompt, "long prompt");
+    let tokens = gate_step_tokens(serve, &mut lanes);
+    let (vocab, host) = {
+        let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+        let mut prefills = [(&mut kv_long, long_prompt.as_slice())];
+        let logits = serve
+            .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
+            .expect("window-crossing mixed step");
+        gate_host_logits(ctx, logits)
+    };
+    assert_finite_gate_logits(&host, "window-crossing fp8 walk");
+    assert_gate_page_accounting(serve, &kv_long, "long prompt mixed step");
+    settle_gate_lanes(
+        &host,
+        vocab,
+        serve.weights.config.vocab_size,
+        1,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+    );
+    let first_long = mixed_gate_argmax(&host, 0, vocab, serve.weights.config.vocab_size);
+    produced[1].push(first_long);
+    lanes.push((1, kv_long, first_long));
+
+    for (req, mut kv, mut next) in lanes {
+        while produced[req].len() < budgets[req] {
+            let host = decode_serving(serve, ctx, &mut arena, &mut kv, next).expect("decode");
+            let bound = serve.weights.config.vocab_size.min(host.len());
+            next = u32::try_from(argmax(&host[..bound])).expect("token id");
+            produced[req].push(next);
+        }
+        assert_gate_page_accounting(serve, &kv, ["partner", "long prompt"][req]);
+    }
+    for (tokens, budget) in produced.iter().zip(budgets) {
+        assert_eq!(tokens.len(), budget, "fp8 window lane token budget");
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, generate prompts, and a GPU"]
+fn fp8_mixed_walk_holds_its_structure() {
+    let (ctx, serve, _dir) = stack_with_storage(2048, 512, KvStorage::E4m3);
+    fp8_plain_mixed_walk(&ctx, &serve);
+    fp8_window_mixed_walk(&ctx, &serve);
 }
 
 /// The overlap-safe prefill under a lane-stream override must be bit-equal
