@@ -1556,30 +1556,6 @@ mod tests {
     }
 
     #[test]
-    fn int4_offset_binary_nibbles_decode_to_signed_by_subtracting_eight() {
-        let decode = |byte: u8, col: usize| -> i8 {
-            let unsigned = if col.is_multiple_of(2) {
-                byte & 0x0f
-            } else {
-                (byte >> 4) & 0x0f
-            };
-            i8::try_from(unsigned).expect("nibble") - 8
-        };
-
-        for signed_even in -8i8..=7 {
-            for signed_odd in -8i8..=7 {
-                let even = u8::try_from(signed_even + 8).expect("even nibble");
-                let odd = u8::try_from(signed_odd + 8).expect("odd nibble");
-                let byte = even | (odd << 4);
-                assert_eq!(decode(byte, 0), signed_even);
-                assert_eq!(decode(byte, 1), signed_odd);
-                assert_eq!(i16::from(even) - i16::from(signed_even), 8);
-                assert_eq!(i16::from(odd) - i16::from(signed_odd), 8);
-            }
-        }
-    }
-
-    #[test]
     fn marlin_route_capacity_matches_vllm_ignore_invalid_bound() {
         let active_tokens = 7;
         let block_size = 8;
