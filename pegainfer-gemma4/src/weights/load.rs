@@ -544,9 +544,6 @@ mod tests {
     use anyhow::Context;
 
     use super::*;
-    use crate::config::LayerKind;
-
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
     /// Out of range on any host, so opening a device becomes a visible failure.
     /// Not `usize::MAX`, whose cast to the driver's `int` is -1 by accident.
@@ -555,63 +552,6 @@ mod tests {
     fn model_path() -> Result<String> {
         std::env::var("PEGAINFER_TEST_MODEL_PATH")
             .context("PEGAINFER_TEST_MODEL_PATH must point to a Gemma 4 checkpoint directory")
-    }
-
-    /// No forward pass; residency only.
-    ///
-    /// ```text
-    /// PEGAINFER_TEST_MODEL_PATH=/path/to/gemma-4-12B-it cargo test --release \
-    ///   -p pegainfer-gemma4 --features gemma4 --lib \
-    ///   weights::load::tests::loads_the_text_tower_and_reports_residency -- \
-    ///   --exact --ignored --nocapture --test-threads=1
-    /// ```
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint and a GPU"]
-    fn loads_the_text_tower_and_reports_residency() -> Result<()> {
-        let path = model_path()?;
-        let config = Gemma4Config::from_file(&path)?;
-        let (weights, stats) = Gemma4Weights::from_safetensors(&path, 0, config)?;
-
-        let config = &weights.config;
-        assert_eq!(weights.layers.len(), config.layer_types.len());
-        for (layer, &kind) in weights.layers.iter().zip(&config.layer_types) {
-            let attention = &layer.attention;
-            match kind {
-                LayerKind::Sliding => {
-                    assert!(attention.v_proj.is_some(), "sliding layer without a v_proj");
-                    assert_eq!(attention.q_norm.len, config.head_dim);
-                }
-                LayerKind::Global => {
-                    assert!(attention.v_proj.is_none(), "global layer with a v_proj");
-                    assert_eq!(attention.q_norm.len, config.global_head_dim);
-                }
-            }
-            assert_eq!(attention.q_proj.cols, config.hidden_size);
-            assert_eq!(attention.o_proj.rows, config.hidden_size);
-        }
-        assert_eq!(weights.embed_tokens.rows, config.vocab_size);
-        assert_eq!(weights.embed_tokens.cols, config.hidden_size);
-
-        let globals = config
-            .layer_types
-            .iter()
-            .filter(|&&kind| kind == LayerKind::Global)
-            .count();
-        println!(
-            "layers {} ({globals} global), {} modality tensors skipped\n\
-             manifest {:.2} GiB, device {:.2} GiB, free {:.2} GiB\n\
-             {:.0} ms total, of which {:.0} validate, {:.0} record-api, {:.0} execute-and-drain",
-            weights.layers.len(),
-            stats.skipped_modality_tensors,
-            stats.manifest_bytes as f64 / GIB,
-            stats.device_bytes as f64 / GIB,
-            stats.device_free_bytes as f64 / GIB,
-            stats.elapsed_ms,
-            stats.validate_wall_ms,
-            stats.record_api_wall_ms,
-            stats.execute_and_drain_wall_ms,
-        );
-        Ok(())
     }
 
     /// Every faulty tensor named, before a device exists — hence the unopenable

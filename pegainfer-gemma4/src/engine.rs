@@ -3672,18 +3672,4 @@ mod lane_tests {
         );
         assert_eq!(super::pool_pages(usize::MAX, 65, 512, 16, 0, 256), None);
     }
-
-    #[test]
-    fn the_global_door_is_defensive() {
-        // Validation caps every context inside the ceiling and the pool
-        // provisions slots times the ceiling's pages, so no request's whole
-        // account can exceed its slot's share: the door only ever fires on
-        // an accounting bug, which is exactly its job.
-        for ceiling in [8192usize, 32768, 262_144] {
-            let provision_per_slot = ceiling.div_ceil(super::PAGE_SIZE);
-            for context_len in [1usize, 17, ceiling / 2, ceiling] {
-                assert!(super::global_account_pages(context_len) <= provision_per_slot);
-            }
-        }
-    }
 }

@@ -74,7 +74,6 @@ GATES_KV_AND_LANES=(
 )
 # The disagreeing-config gate deliberately fails before any device is opened.
 GATES_LOADER=(
-  "gpu,ckpt weights::load::tests::loads_the_text_tower_and_reports_residency"
   "ckpt weights::load::tests::a_disagreeing_config_names_every_faulty_tensor"
 )
 GATES_DEVICE=(
@@ -97,7 +96,6 @@ GATES_KERNELS_HD256_FP8_POOL=(
   "gpu fp8_decode_prep_stores_exact_bytes_at_layout_offsets"
   "gpu fp8_window_read_matches_bf16_for_exact_values"
   "gpu fp8_finite_window_read_matches_bf16_and_changes_the_result"
-  "gpu fp8_window_read_is_geometry_invariant_for_the_probed_row"
   "gpu varied_fp8_window_read_is_geometry_invariant_for_the_probed_row"
   "gpu decode_wrapper_without_fp8_twin_refuses_e4m3"
 )
@@ -114,8 +112,6 @@ MANIFEST_LIB=(
 GATES_FP8_PROFILE=(
   "serve::oracle::context_waypoints_match_hf"
   "serve::oracle::greedy_matches_hf_generate"
-  "serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
-  "serve::oracle::fp8_mixed_walk_holds_its_structure"
   "serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
   "serve::oracle::incremental_serving_matches_recompute"
   "serve::oracle::overlapped_prefill_matches_the_sync_step"

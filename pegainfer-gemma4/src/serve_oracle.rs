@@ -398,57 +398,81 @@ fn agreement(left: &[usize], right: &[usize]) -> usize {
     left.iter().zip(right).filter(|(a, b)| a == b).count()
 }
 
+struct AgreementCase {
+    tensor_name: &'static str,
+    prompt: Vec<u32>,
+    sampled: Vec<usize>,
+}
+
 fn agreement_case(
     fixture: &safetensors::SafeTensors<'_>,
-    tensor_name: &str,
+    tensor_name: &'static str,
     truncate_to: usize,
     stride: usize,
-) -> (usize, usize, usize) {
+) -> AgreementCase {
     let (_, mut prompt) = u32_tensor(fixture, tensor_name);
     prompt.truncate(truncate_to);
     let sampled: Vec<usize> = (0..prompt.len()).step_by(stride).collect();
-    let max_context = prompt.len().div_ceil(crate::kv::PAGE_SIZE) * crate::kv::PAGE_SIZE;
-    // One request at the case depth, plus each pool's padding page.
-    let pages = max_context.div_ceil(crate::kv::PAGE_SIZE) + 2;
+    AgreementCase {
+        tensor_name,
+        prompt,
+        sampled,
+    }
+}
 
-    let (ctx, bf16, _) = stack_with_storage(max_context, pages, KvStorage::Bf16);
-    let bf16_incremental = incremental_argmaxes(&ctx, &bf16, &prompt);
+fn bf16_agreement(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    case: &AgreementCase,
+) -> (Vec<usize>, usize) {
+    let incremental = incremental_argmaxes(ctx, serve, &case.prompt);
     // The same-schedule run-to-run baseline, measured on this exact prompt
     // and schedule: a replay must agree everywhere, which is why a lossy
     // storage is judged against the cross-shape floor below instead.
-    let bf16_replay = incremental_argmaxes(&ctx, &bf16, &prompt);
-    let replay_matches = agreement(&bf16_incremental, &bf16_replay);
+    let replay = incremental_argmaxes(ctx, serve, &case.prompt);
+    let replay_matches = agreement(&incremental, &replay);
     eprintln!(
-        "{tensor_name}: same-schedule bf16 run-to-run agreement {replay_matches}/{}",
-        bf16_incremental.len()
+        "{}: same-schedule bf16 run-to-run agreement {replay_matches}/{}",
+        case.tensor_name,
+        incremental.len()
     );
     assert_eq!(
         replay_matches,
-        bf16_incremental.len(),
-        "{tensor_name}: the same-schedule bf16 replay must be deterministic"
+        incremental.len(),
+        "{}: the same-schedule bf16 replay must be deterministic",
+        case.tensor_name
     );
-    let bf16_recomputed = recomputed_argmaxes(&ctx, &bf16, &prompt, &sampled);
-    let bf16_sampled: Vec<usize> = sampled.iter().map(|&pos| bf16_incremental[pos]).collect();
-    let floor_matches = agreement(&bf16_sampled, &bf16_recomputed);
-    drop(bf16);
-    drop(ctx);
+    let recomputed = recomputed_argmaxes(ctx, serve, &case.prompt, &case.sampled);
+    let sampled = case
+        .sampled
+        .iter()
+        .map(|&pos| incremental[pos])
+        .collect::<Vec<_>>();
+    let floor_matches = agreement(&sampled, &recomputed);
+    (sampled, floor_matches)
+}
 
-    let (ctx, fp8, _) = stack_with_storage(max_context, pages, KvStorage::E4m3);
-    let fp8_incremental = incremental_argmaxes(&ctx, &fp8, &prompt);
-    let fp8_sampled: Vec<usize> = sampled.iter().map(|&pos| fp8_incremental[pos]).collect();
-    let fp8_matches = agreement(&fp8_sampled, &bf16_sampled);
-    let samples = sampled.len();
+fn judge_agreement(case: &AgreementCase, floor: usize, fp8: usize) {
+    let samples = case.sampled.len();
     let samples_f64 = f64::from(u32::try_from(samples).expect("sample count fits u32"));
-    let floor_rate =
-        f64::from(u32::try_from(floor_matches).expect("match count fits u32")) / samples_f64;
-    let fp8_rate =
-        f64::from(u32::try_from(fp8_matches).expect("match count fits u32")) / samples_f64;
+    let floor_rate = f64::from(u32::try_from(floor).expect("match count fits u32")) / samples_f64;
+    let fp8_rate = f64::from(u32::try_from(fp8).expect("match count fits u32")) / samples_f64;
     eprintln!(
-        "{tensor_name}: argmax agreement: bf16 incremental/recompute {floor_rate:.6} \
-         ({floor_matches}/{samples}), fp8/bf16 incremental {fp8_rate:.6} \
-         ({fp8_matches}/{samples})"
+        "{}: argmax agreement: bf16 incremental/recompute {floor_rate:.6} \
+         ({floor}/{samples}), fp8/bf16 incremental {fp8_rate:.6} ({fp8}/{samples})",
+        case.tensor_name
     );
-    (floor_matches, fp8_matches, samples)
+    assert!(
+        floor * 2 > samples,
+        "{}: degenerate bf16 incremental/recompute floor {floor}/{samples}",
+        case.tensor_name
+    );
+    assert!(
+        fp8 >= floor,
+        "{}: fp8/bf16 argmax agreement {fp8}/{samples} is below the bf16 \
+         incremental/recompute floor {floor}/{samples}",
+        case.tensor_name
+    );
 }
 
 #[test]
@@ -456,21 +480,41 @@ fn agreement_case(
 fn fp8_argmax_agreement_meets_the_bf16_floor() {
     let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("window fixture");
-    // Recompute is quadratic; these strides keep both window depths sampled.
-    // Every case measures before any verdict, so a failing first case cannot
-    // hide the second case's numbers.
-    let results = [("w1023_prompt", usize::MAX, 2), ("w4096_prompt", 2048, 8)]
-        .map(|(name, cut, stride)| (name, agreement_case(&fixture, name, cut, stride)));
-    for (name, (floor, fp8, samples)) in results {
-        assert!(
-            floor * 2 > samples,
-            "{name}: degenerate bf16 incremental/recompute floor {floor}/{samples}"
-        );
-        assert!(
-            fp8 >= floor,
-            "{name}: fp8/bf16 argmax agreement {fp8}/{samples} is below the bf16 \
-             incremental/recompute floor {floor}/{samples}"
-        );
+    let cases = [("w1023_prompt", usize::MAX, 2), ("w4096_prompt", 2048, 8)]
+        .map(|(name, cut, stride)| agreement_case(&fixture, name, cut, stride));
+    let max_context = cases
+        .iter()
+        .map(|case| case.prompt.len().div_ceil(crate::kv::PAGE_SIZE) * crate::kv::PAGE_SIZE)
+        .max()
+        .expect("agreement cases");
+    let pages = max_context.div_ceil(crate::kv::PAGE_SIZE) + 2;
+
+    let (ctx, bf16, _) = stack_with_storage(max_context, pages, KvStorage::Bf16);
+    let bf16_results = cases
+        .each_ref()
+        .map(|case| bf16_agreement(&ctx, &bf16, case));
+    drop(bf16);
+    drop(ctx);
+
+    let (ctx, fp8, _) = stack_with_storage(max_context, pages, KvStorage::E4m3);
+    let fp8_results: Vec<usize> = cases
+        .iter()
+        .zip(bf16_results.iter())
+        .map(|(case, (bf16, _))| {
+            let incremental = incremental_argmaxes(&ctx, &fp8, &case.prompt);
+            let sampled = case
+                .sampled
+                .iter()
+                .map(|&pos| incremental[pos])
+                .collect::<Vec<_>>();
+            agreement(&sampled, bf16)
+        })
+        .collect();
+    drop(fp8);
+    drop(ctx);
+
+    for ((case, (_, floor)), fp8) in cases.iter().zip(bf16_results).zip(fp8_results) {
+        judge_agreement(case, floor, fp8);
     }
 }
 
