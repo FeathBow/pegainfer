@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use log::info;
 use pegainfer_core::tensor::DeviceContext;
+use pegainfer_core::weight_loader::ByteWeightStager;
 use pegainfer_core::weight_loader::SlotId;
 use pegainfer_core::weight_loader::StagedWeightLoader;
 use pegainfer_core::weight_loader::VecSlotId;
@@ -70,8 +71,7 @@ struct LayerSlots {
     gate: SlotId,
     up: SlotId,
     down: SlotId,
-    /// The bf16 half of a routed layer. The experts do not travel through the
-    /// staged loader at all.
+    /// The bf16 half of a routed layer.
     moe: Option<MoeSlots>,
 }
 
@@ -164,6 +164,12 @@ fn upload_experts(
     shards: &[SafeTensors],
     manifest: &Manifest,
 ) -> Result<Vec<Option<StackedExperts>>> {
+    // A dense checkpoint (12B, 31B) has no routed layer; skip the stager's
+    // pinned buffers and thread pool instead of allocating them for nothing.
+    if manifest.layers.iter().all(|layer| layer.moe.is_none()) {
+        return Ok(manifest.layers.iter().map(|_| None).collect());
+    }
+    let mut stager = ByteWeightStager::new(ctx)?;
     manifest
         .layers
         .iter()
@@ -173,9 +179,9 @@ fn upload_experts(
                 .as_ref()
                 .map(|moe| {
                     Ok(StackedExperts {
-                        gate: upload_stacked(ctx, shards, &moe.experts, |e| &e.gate)?,
-                        up: upload_stacked(ctx, shards, &moe.experts, |e| &e.up)?,
-                        down: upload_stacked(ctx, shards, &moe.experts, |e| &e.down)?,
+                        gate: upload_stacked(ctx, &mut stager, shards, &moe.experts, |e| &e.gate)?,
+                        up: upload_stacked(ctx, &mut stager, shards, &moe.experts, |e| &e.up)?,
+                        down: upload_stacked(ctx, &mut stager, shards, &moe.experts, |e| &e.down)?,
                     })
                 })
                 .transpose()
@@ -186,12 +192,11 @@ fn upload_experts(
 /// Stack one projection of every expert into a pair of device buffers and
 /// upload it as the checkpoint stores it.
 ///
-/// This bypasses the staged loader on purpose: that path is bf16-typed, and
-/// widening here is exactly what this representation exists to avoid. Each
-/// expert lands in its own row range, so the buffer is already the shape a
-/// batched call wants.
+/// Each expert lands in its own row range, so the buffer is already the shape
+/// a batched call wants.
 fn upload_stacked(
     ctx: &DeviceContext,
+    stager: &mut ByteWeightStager,
     shards: &[SafeTensors],
     experts: &[ExpertTensors],
     pick: fn(&ExpertTensors) -> &QuantMatrix,
@@ -211,8 +216,9 @@ fn upload_stacked(
         .stream
         .alloc_zeros::<u8>(scales_per_expert * experts.len())
         .map_err(|e| anyhow::anyhow!("Gemma 4: cannot hold the stacked block scales: {e}"))?;
+    let mut sources = Vec::with_capacity(experts.len());
     let mut tensor_scales = Vec::with_capacity(experts.len());
-    let mut scale_bytes = Vec::with_capacity(scales_per_expert * experts.len());
+    let mut scale_peak = 0.0f32;
 
     for (index, expert) in experts.iter().enumerate() {
         let plan = pick(expert);
@@ -232,29 +238,27 @@ fn upload_stacked(
             source.packed().len(),
             source.scales().len()
         );
-        let at = index * packed_per_expert;
-        ctx.stream
-            .memcpy_htod(
-                source.packed(),
-                &mut packed.slice_mut(at..at + packed_per_expert),
-            )
-            .map_err(|e| anyhow::anyhow!("Gemma 4: expert {index} weights did not upload: {e}"))?;
-        let at = index * scales_per_expert;
-        ctx.stream
-            .memcpy_htod(
-                source.scales(),
-                &mut scales.slice_mut(at..at + scales_per_expert),
-            )
-            .map_err(|e| anyhow::anyhow!("Gemma 4: expert {index} scales did not upload: {e}"))?;
-        scale_bytes.extend_from_slice(source.scales());
+        scale_peak = source.scales().iter().fold(scale_peak, |peak, byte| {
+            peak.max(crate::nvfp4::decode_e4m3(*byte) * 128.0)
+        });
         tensor_scales.push(source.tensor_scale());
+        sources.push(source);
     }
+
+    let packed_sources: Vec<&[u8]> = sources.iter().map(QuantSource::packed).collect();
+    stager
+        .upload(&packed_sources, &mut packed)
+        .map_err(|e| anyhow::anyhow!("Gemma 4: expert weights did not upload: {e}"))?;
+    let scale_sources: Vec<&[u8]> = sources.iter().map(QuantSource::scales).collect();
+    stager
+        .upload(&scale_sources, &mut scales)
+        .map_err(|e| anyhow::anyhow!("Gemma 4: expert scales did not upload: {e}"))?;
 
     // Marlin reads the block scale as S0E5M3, so every scale is normalized by
     // one shared power of two and the per-tensor scale takes it back. The
     // factor has to be the same across a projection's experts, which is why it
     // is found here rather than per expert.
-    let rescale = marlin_rescale(&scale_bytes);
+    let rescale = marlin_rescale(scale_peak);
     let mut qweight = ctx
         .stream
         .alloc_zeros::<u8>(packed_per_expert * experts.len())
@@ -304,12 +308,8 @@ fn upload_stacked(
 /// The shared power of two that lifts every block scale so its leading bit
 /// survives the S0E5M3 re-encoding. Mirrors vLLM's
 /// `_nvfp4_compute_scale_factor`, whose bound is the e4m3 maximum.
-fn marlin_rescale(scale_bytes: &[u8]) -> f32 {
+fn marlin_rescale(peak: f32) -> f32 {
     const CEILING: f32 = 448.0 * 128.0;
-    let peak = scale_bytes
-        .iter()
-        .map(|byte| crate::nvfp4::decode_e4m3(*byte) * 128.0)
-        .fold(0.0f32, f32::max);
     if peak <= 0.0 || peak >= CEILING {
         return 1.0;
     }
