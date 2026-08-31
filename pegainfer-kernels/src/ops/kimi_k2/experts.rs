@@ -1399,7 +1399,7 @@ fn launch_marlin_wna16_gemm(
                 ptrs.output,
                 ptrs.c_tmp,
                 ptrs.qweight,
-                ptrs.scales as *const ffi::Half,
+                ptrs.scales.cast::<ffi::Half>(),
                 ptrs.workspace,
                 ptrs.sorted_token_ids,
                 ptrs.expert_ids,
