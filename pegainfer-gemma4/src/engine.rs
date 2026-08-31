@@ -1,5 +1,6 @@
 //! The Gemma 4 engine: one owned thread with iteration-level scheduling.
-//! Prefill runs whole at the step boundary; every active request then
+//! Prefill runs at the step boundary, whole unless the chunk knob splits it;
+//! every active request then
 //! advances one token per batched decode step, sharing each layer's weight
 //! pass.
 
@@ -599,13 +600,14 @@ fn global_account_pages(context_len: usize) -> usize {
 const MIX_MAX_PROMPTS: usize = 4;
 
 /// The gathered step's prompt-row ceiling. Gathering amortizes only the
-/// step floor (~27 ms at 12B) while every live stream's inter-token gap
-/// pays the whole gathered step (~0.2 ms per row), so absorbing long
+/// step floor while every live stream's inter-token gap pays the whole
+/// gathered step, so absorbing long
 /// prompts into one step trades a large certain loss for a small fixed
-/// win — measured at 16 coincident ~1900-token prompts, an unbounded
-/// gather tripled the stream's p99 gap for a sub-2% wall saving. Short
-/// bursts are where the floor dominates; the ceiling keeps the gather
-/// there, and a long prompt keeps its own step.
+/// win. On 12B, the floor measured ~27 ms and each row ~0.2 ms; at 16
+/// coincident ~1900-token prompts, an unbounded gather tripled the stream's
+/// p99 gap for a sub-2% wall saving. The 26B calibration is pending. Short
+/// bursts are where the floor dominates; the ceiling keeps the gather there,
+/// and a long prompt keeps its own step.
 const MIX_GATHER_ROWS: usize = 512;
 
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
@@ -1233,10 +1235,12 @@ impl EngineState {
         }
     }
 
-    /// Validate, admit and prefill one request whole, emit its first token,
-    /// and hand it to the decode batch. An admission refusal is a refusal to
-    /// the client only when no active request could free the pages it needs;
-    /// otherwise the request waits at the queue head.
+    /// Validate and admit one request. The synchronous arms prefill it, emit
+    /// its first token, and hand it to the decode batch; the lane arm only
+    /// launches the in-flight prefill, which the join later settles. An
+    /// admission refusal is a refusal to the client only when no active
+    /// request could free the pages it needs; otherwise the request waits at
+    /// the queue head.
     fn admit_and_prefill(
         &mut self,
         item: Submitted,
@@ -2201,8 +2205,9 @@ fn deliver_decode_row(entry: &mut Active, token: DecodeToken) -> bool {
 /// Deliver one decode step's outcome to every active row and retire the
 /// finished ones — the event flow both the pure decode round and the mixed
 /// admission share; `row_base` is the row's offset into the step's logits
-/// (the mixed step's row 0 is the newcomer). A stop token retires the
-/// request without being emitted; a send failure retires a cancelled one.
+/// (a mixed step's first `row_base` rows are its newcomers). A stop token
+/// retires the request without being emitted; a send failure retires a
+/// cancelled one.
 fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_base: usize) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {

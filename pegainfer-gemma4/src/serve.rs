@@ -2063,13 +2063,12 @@ impl GemmaServe {
         )
     }
 
-    /// One mixed step: a whole admitted prompt (rows `[0..prompt_len)`)
-    /// rides the same weight scan as the live decode batch (the row
-    /// suffix). Always eager — the prompt length varies per admission, so
-    /// this shape never rides a graph; the pure-decode steps around it keep
-    /// their bucketed replays. The returned logits hold `batch + 1` rows:
-    /// row 0 the prompt's next-token distribution, rows 1.. the decode
-    /// batch in order.
+    /// One mixed step: one or more admitted prompts (their rows concatenated
+    /// first) ride the same weight scan as the live decode batch (the row
+    /// suffix). Always eager — prompt lengths vary per admission, so this
+    /// shape never rides a graph; the pure-decode steps around it keep their
+    /// bucketed replays. The returned logits hold `batch + prompts` rows:
+    /// one next-token distribution per prompt, then the decode batch in order.
     pub(crate) fn mixed_prefill_decode_step<'a>(
         &self,
         ctx: &DeviceContext,
