@@ -19,6 +19,8 @@ mod k3_tilelang;
 mod kimi_k2;
 mod linear;
 mod lora;
+#[cfg(any(feature = "gemma4", feature = "kimi-k2"))]
+mod marlin_face;
 mod norm;
 mod sampling;
 
