@@ -1292,8 +1292,7 @@ impl EngineState {
                 // queue of dead submissions cannot stall the decode round.
                 // The row pricing runs after the prefix-cache resolve: a
                 // warm candidate costs the step only its unseen suffix.
-                let mut newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)> =
-                    vec![(request, kv, resumed)];
+                let mut newcomers: Vec<Newcomer> = vec![(request, kv, resumed)];
                 let mut rows_budget = {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
@@ -1311,10 +1310,12 @@ impl EngineState {
                         reserve_whole: self.mix_chunk.is_none(),
                         evict_cache: false,
                         can_wait: true,
+                        // Lazy: a chunked gather's budget can exceed the
+                        // gather rows, and the bound is unused there.
                         max_new_tokens: self
                             .mix_chunk
                             .is_none()
-                            .then_some(MIX_GATHER_ROWS - rows_budget),
+                            .then(|| MIX_GATHER_ROWS - rows_budget),
                     };
                     match self.prepare_newcomer(candidate, options) {
                         PreparedNewcomer::Ready(newcomer, new_tokens) => {
@@ -1611,7 +1612,7 @@ impl EngineState {
     fn mixed_walk(
         &mut self,
         chunk: usize,
-        newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
+        newcomers: Vec<Newcomer>,
         active: &mut Vec<Active>,
     ) -> Admitted {
         let mut walkers: Vec<Walker> = newcomers
@@ -1975,14 +1976,13 @@ impl EngineState {
     /// `Done`.
     fn mixed_admission(
         &mut self,
-        mut newcomers: Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
+        mut newcomers: Vec<Newcomer>,
         active: &mut Vec<Active>,
     ) -> Admitted {
         if let Some(chunk) = self.mix_chunk {
             return self.mixed_walk(chunk, newcomers, active);
         }
-        let fail_newcomers = |newcomers: &mut Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
-                              message: &str| {
+        let fail_newcomers = |newcomers: &mut Vec<Newcomer>, message: &str| {
             for (request, _, _) in newcomers.drain(..) {
                 let _ = request.token_tx.send(TokenEvent::Error {
                     message: message.to_string(),
@@ -2158,11 +2158,7 @@ impl EngineState {
     }
 }
 
-/// Deliver one decode step's outcome to every active row and retire the
-/// finished ones — the event flow both the pure decode round and the mixed
-/// admission share; `row_base` is the row's offset into the step's logits
-/// (the mixed step's row 0 is the newcomer). A stop token retires the
-/// request without being emitted; a send failure retires a cancelled one.
+/// One decode row's sampled outcome.
 struct DecodeToken {
     id: u32,
     logprob: Option<TokenLogprob>,
@@ -2202,6 +2198,11 @@ fn deliver_decode_row(entry: &mut Active, token: DecodeToken) -> bool {
     false
 }
 
+/// Deliver one decode step's outcome to every active row and retire the
+/// finished ones — the event flow both the pure decode round and the mixed
+/// admission share; `row_base` is the row's offset into the step's logits
+/// (the mixed step's row 0 is the newcomer). A stop token retires the
+/// request without being emitted; a send failure retires a cancelled one.
 fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_base: usize) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
