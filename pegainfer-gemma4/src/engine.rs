@@ -631,6 +631,22 @@ enum ReservationDecision {
     Refused(String),
 }
 
+type Newcomer = (GenerateRequest, GemmaKv, Option<u64>);
+
+#[derive(Clone, Copy)]
+struct NewcomerOptions {
+    reserve_whole: bool,
+    evict_cache: bool,
+    can_wait: bool,
+    max_new_tokens: Option<usize>,
+}
+
+enum PreparedNewcomer {
+    Ready(Newcomer, usize),
+    Done,
+    Requeue(Submitted),
+}
+
 /// One row of a step's sampler call. A mid-walk segment's row is sampled and
 /// discarded, so it carries `ignore_eos` whatever its request asked and a
 /// `logprobs` of 0: it never stops and is never scored.
@@ -806,38 +822,15 @@ impl Active {
         if self.stopping {
             return;
         }
-        if policy.stops(token, self.request.params.ignore_eos) {
-            let _ = self.request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens: self.emitted,
-            });
-            self.stopping = true;
-            return;
-        }
-        self.emitted += 1;
-        if self
-            .request
-            .token_tx
-            .send(TokenEvent::Token {
+        let stop = policy.stops(token, self.request.params.ignore_eos);
+        self.stopping = deliver_decode_row(
+            self,
+            DecodeToken {
                 id: token,
                 logprob: None,
-            })
-            .is_err()
-        {
-            self.stopping = true;
-            return;
-        }
-        if self.emitted >= self.request.max_tokens {
-            let _ = self.request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens: self.emitted,
-            });
-            self.stopping = true;
-            return;
-        }
-        self.next = token;
+                stop,
+            },
+        );
     }
 }
 
@@ -867,6 +860,17 @@ fn send_scheduled(request: &GenerateRequest, prompt_tokens: usize, cached_tokens
             cached_tokens,
         })
         .is_ok()
+}
+
+fn reject_newcomer(request: &GenerateRequest, message: String) {
+    let prompt_tokens = request.prompt_tokens.len();
+    if send_scheduled(request, prompt_tokens, 0) {
+        let _ = request.token_tx.send(TokenEvent::Rejected {
+            message,
+            prompt_tokens,
+            completion_tokens: 0,
+        });
+    }
 }
 
 /// Everything the engine thread owns for the life of the process. CUDA state
@@ -936,6 +940,7 @@ impl EngineState {
         &mut self,
         kv: &mut GemmaKv,
         need: AdmissionNeed,
+        evict_cache: bool,
         can_wait: bool,
     ) -> ReservationDecision {
         loop {
@@ -958,10 +963,11 @@ impl EngineState {
             let Some(message) = refusal else {
                 return ReservationDecision::Ready;
             };
-            if self
-                .prefix_cache
-                .as_mut()
-                .is_some_and(PrefixCache::evict_lru)
+            if evict_cache
+                && self
+                    .prefix_cache
+                    .as_mut()
+                    .is_some_and(PrefixCache::evict_lru)
             {
                 continue;
             }
@@ -971,6 +977,65 @@ impl EngineState {
                 ReservationDecision::Refused(message)
             };
         }
+    }
+
+    fn resolve_newcomer_kv(&mut self, request: &GenerateRequest) -> (GemmaKv, Option<u64>) {
+        match self
+            .prefix_cache
+            .as_mut()
+            .and_then(|cache| cache.resolve(&request.prompt_tokens))
+        {
+            Some((entry, t)) => match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
+                Ok(kv) => (kv, Some(entry.id)),
+                Err(err) => {
+                    log::warn!("gemma4 prefix-cache restore failed (falling back): {err:#}");
+                    (self.serve.alloc_kv(), None)
+                }
+            },
+            None => (self.serve.alloc_kv(), None),
+        }
+    }
+
+    fn prepare_newcomer(&mut self, item: Submitted, options: NewcomerOptions) -> PreparedNewcomer {
+        let (request, prefix) = item;
+        if request.token_tx.is_closed() {
+            return PreparedNewcomer::Done;
+        }
+        let context_len = match validate_request(&request, prefix.hit_tokens(), self.max_context) {
+            Ok(len) => len,
+            Err(message) => {
+                reject_newcomer(&request, message);
+                return PreparedNewcomer::Done;
+            }
+        };
+        let (mut kv, resumed) = self.resolve_newcomer_kv(&request);
+        let new_tokens = request.prompt_tokens.len() - kv.local.seq_len();
+        if options
+            .max_new_tokens
+            .is_some_and(|limit| new_tokens > limit)
+        {
+            return PreparedNewcomer::Requeue((request, prefix));
+        }
+        let need = if options.reserve_whole {
+            AdmissionNeed::Tokens(new_tokens)
+        } else {
+            AdmissionNeed::GlobalPages(global_account_pages(context_len))
+        };
+        match self.reserve_with_eviction(&mut kv, need, options.evict_cache, options.can_wait) {
+            ReservationDecision::Ready => {}
+            ReservationDecision::Requeue => {
+                return PreparedNewcomer::Requeue((request, prefix));
+            }
+            ReservationDecision::Refused(message) => {
+                reject_newcomer(&request, message);
+                return PreparedNewcomer::Done;
+            }
+        }
+        let prompt_tokens = request.prompt_tokens.len();
+        if !send_scheduled(&request, prompt_tokens, kv.local.seq_len()) {
+            return PreparedNewcomer::Done;
+        }
+        PreparedNewcomer::Ready((request, kv, resumed), new_tokens)
     }
 
     fn load(
@@ -1180,47 +1245,6 @@ impl EngineState {
         pending: &mut VecDeque<Submitted>,
         attempts: &mut usize,
     ) -> Admitted {
-        let (request, prefix) = item;
-        let sink = request.token_tx.clone();
-        if sink.is_closed() {
-            return Admitted::Done;
-        }
-        let prompt_tokens = request.prompt_tokens.len();
-        // Scheduled is paired with whatever ends the request, so a refusal
-        // emits it first rather than leaving the client with no lifecycle.
-        let reject = |message: String| {
-            if send_scheduled(&request, prompt_tokens, 0) {
-                let _ = sink.send(TokenEvent::Rejected {
-                    message,
-                    prompt_tokens,
-                    completion_tokens: 0,
-                });
-            }
-            Admitted::Done
-        };
-        let context_len = match validate_request(&request, prefix.hit_tokens(), self.max_context) {
-            Ok(len) => len,
-            Err(message) => return reject(message),
-        };
-
-        let mut resumed = None;
-        let mut kv = match self
-            .prefix_cache
-            .as_mut()
-            .and_then(|cache| cache.resolve(&request.prompt_tokens))
-        {
-            Some((entry, t)) => match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
-                Ok(kv) => {
-                    resumed = Some(entry.id);
-                    kv
-                }
-                Err(err) => {
-                    log::warn!("gemma4 prefix-cache restore failed (falling back): {err:#}");
-                    self.serve.alloc_kv()
-                }
-            },
-            None => self.serve.alloc_kv(),
-        };
         // The lane prefills whole on its own stream, so a lane-bound
         // admission still reserves everything up front. A chunked
         // admission reserves nothing here: every segment admits its own
@@ -1228,25 +1252,19 @@ impl EngineState {
         // — parked first segments across several walkers would exhaust
         // the one shared segment transient the pool provisions.
         let lane_takes = self.lane.is_some() && !active.is_empty();
-        let need = if self.mix_chunk.is_none() || lane_takes {
-            AdmissionNeed::Tokens(prompt_tokens - kv.local.seq_len())
-        } else {
-            // A chunked admission reserves per segment; the whole-account
-            // door (see `global_account_pages`) still answers up front.
-            AdmissionNeed::GlobalPages(global_account_pages(context_len))
+        let options = NewcomerOptions {
+            reserve_whole: self.mix_chunk.is_none() || lane_takes,
+            evict_cache: true,
+            can_wait,
+            max_new_tokens: None,
         };
-        match self.reserve_with_eviction(&mut kv, need, can_wait) {
-            ReservationDecision::Ready => {}
-            ReservationDecision::Requeue => {
-                return Admitted::Requeue(Box::new((request, prefix)));
-            }
-            ReservationDecision::Refused(message) => return reject(message),
-        }
-        // A restored prefix is what the bridge reports as cached: the
-        // resumed KV's frontier is exactly the token count served from it.
-        if !send_scheduled(&request, prompt_tokens, kv.local.seq_len()) {
-            return Admitted::Done;
-        }
+        let (request, mut kv, resumed) = match self.prepare_newcomer(item, options) {
+            PreparedNewcomer::Ready(newcomer, _) => newcomer,
+            PreparedNewcomer::Done => return Admitted::Done,
+            PreparedNewcomer::Requeue(item) => return Admitted::Requeue(Box::new(item)),
+        };
+        let prompt_tokens = request.prompt_tokens.len();
+        let sink = request.token_tx.clone();
 
         // Overlapped admission: the prefill launches onto the lane stream
         // and this call returns immediately — decode steps continue while it
@@ -1285,91 +1303,30 @@ impl EngineState {
                     && newcomers.len() + active.len() < self.slots
                     && *attempts < self.slots
                 {
-                    let Some((cand, cand_prefix)) = pending.pop_front() else {
+                    let Some(candidate) = pending.pop_front() else {
                         break;
                     };
                     *attempts += 1;
-                    let cand_sink = cand.token_tx.clone();
-                    if cand_sink.is_closed() {
-                        continue;
-                    }
-                    let cand_context_len =
-                        match validate_request(&cand, cand_prefix.hit_tokens(), self.max_context) {
-                            Ok(len) => len,
-                            Err(message) => {
-                                let n = cand.prompt_tokens.len();
-                                if send_scheduled(&cand, n, 0) {
-                                    let _ = cand_sink.send(TokenEvent::Rejected {
-                                        message,
-                                        prompt_tokens: n,
-                                        completion_tokens: 0,
-                                    });
-                                }
-                                continue;
-                            }
-                        };
-                    let cand_len = cand.prompt_tokens.len();
-                    let mut cand_resumed = None;
-                    let mut cand_kv = match self
-                        .prefix_cache
-                        .as_mut()
-                        .and_then(|cache| cache.resolve(&cand.prompt_tokens))
-                    {
-                        Some((entry, t)) => {
-                            match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
-                                Ok(kv) => {
-                                    cand_resumed = Some(entry.id);
-                                    kv
-                                }
-                                Err(err) => {
-                                    log::warn!(
-                                        "gemma4 prefix-cache restore failed (falling back): {err:#}"
-                                    );
-                                    self.serve.alloc_kv()
-                                }
-                            }
-                        }
-                        None => self.serve.alloc_kv(),
+                    let options = NewcomerOptions {
+                        reserve_whole: self.mix_chunk.is_none(),
+                        evict_cache: false,
+                        can_wait: true,
+                        max_new_tokens: self
+                            .mix_chunk
+                            .is_none()
+                            .then_some(MIX_GATHER_ROWS - rows_budget),
                     };
-                    let new_tokens = cand_len - cand_kv.local.seq_len();
-                    if self.mix_chunk.is_some() {
-                        // A chunked candidate reserves nothing locally: its
-                        // segments admit their own pages inside the walk;
-                        // the whole-account door still answers here.
-                        let cand_global_want = global_account_pages(cand_context_len);
-                        if cand_global_want
-                            > cand_kv.global.held_pages() + self.serve.global_pool.available_pages()
-                        {
-                            pending.push_front((cand, cand_prefix));
+                    match self.prepare_newcomer(candidate, options) {
+                        PreparedNewcomer::Ready(newcomer, new_tokens) => {
+                            rows_budget += new_tokens;
+                            newcomers.push(newcomer);
+                        }
+                        PreparedNewcomer::Done => {}
+                        PreparedNewcomer::Requeue(candidate) => {
+                            pending.push_front(candidate);
                             break;
                         }
-                        if !send_scheduled(&cand, cand_len, cand_kv.local.seq_len()) {
-                            continue;
-                        }
-                        rows_budget += new_tokens;
-                        newcomers.push((cand, cand_kv, cand_resumed));
-                        continue;
                     }
-                    if rows_budget + new_tokens > MIX_GATHER_ROWS {
-                        pending.push_front((cand, cand_prefix));
-                        break;
-                    }
-                    if admit_tokens(
-                        &self.serve.local_pool,
-                        &self.serve.global_pool,
-                        &mut cand_kv,
-                        new_tokens,
-                    )
-                    .is_err()
-                    {
-                        pending.push_front((cand, cand_prefix));
-                        break;
-                    }
-                    if !send_scheduled(&cand, cand_len, cand_kv.local.seq_len()) {
-                        continue;
-                    }
-                    rows_budget += new_tokens;
-                    newcomers.push((cand, cand_kv, cand_resumed));
                 }
                 return self.mixed_admission(newcomers, active);
             }
@@ -2206,42 +2163,59 @@ impl EngineState {
 /// admission share; `row_base` is the row's offset into the step's logits
 /// (the mixed step's row 0 is the newcomer). A stop token retires the
 /// request without being emitted; a send failure retires a cancelled one.
+struct DecodeToken {
+    id: u32,
+    logprob: Option<TokenLogprob>,
+    stop: bool,
+}
+
+fn deliver_decode_row(entry: &mut Active, token: DecodeToken) -> bool {
+    if token.stop {
+        let _ = entry.request.token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: entry.prompt_tokens,
+            completion_tokens: entry.emitted,
+        });
+        return true;
+    }
+    entry.emitted += 1;
+    if entry
+        .request
+        .token_tx
+        .send(TokenEvent::Token {
+            id: token.id,
+            logprob: token.logprob,
+        })
+        .is_err()
+    {
+        return true;
+    }
+    if entry.emitted >= entry.request.max_tokens {
+        let _ = entry.request.token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            prompt_tokens: entry.prompt_tokens,
+            completion_tokens: entry.emitted,
+        });
+        return true;
+    }
+    entry.next = token.id;
+    false
+}
+
 fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_base: usize) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
-        if sampled.stops[row + row_base] {
-            let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: entry.prompt_tokens,
-                completion_tokens: entry.emitted,
-            });
+        let index = row + row_base;
+        if deliver_decode_row(
+            entry,
+            DecodeToken {
+                id: sampled.picked[index],
+                logprob: sampled.logprobs[index].take(),
+                stop: sampled.stops[index],
+            },
+        ) {
             retire.push(row);
-            continue;
         }
-        let token = sampled.picked[row + row_base];
-        entry.emitted += 1;
-        if entry
-            .request
-            .token_tx
-            .send(TokenEvent::Token {
-                id: token,
-                logprob: sampled.logprobs[row + row_base].take(),
-            })
-            .is_err()
-        {
-            retire.push(row);
-            continue;
-        }
-        if entry.emitted >= entry.request.max_tokens {
-            let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: entry.prompt_tokens,
-                completion_tokens: entry.emitted,
-            });
-            retire.push(row);
-            continue;
-        }
-        entry.next = token;
     }
     for row in retire.into_iter().rev() {
         active.swap_remove(row);

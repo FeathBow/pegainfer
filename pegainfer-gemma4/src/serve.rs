@@ -548,6 +548,92 @@ struct SplitKvState {
     cap: usize,
 }
 
+struct SplitKvSpec {
+    label: &'static str,
+    slots: usize,
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+    cap: usize,
+    chunk_size_d: CudaSlice<i32>,
+}
+
+struct SplitKvLaunch<'a> {
+    metadata: ops::Hd512DecodeMetadata<'a>,
+    o_indptr_d: &'a CudaSlice<i32>,
+    valid_mask_d: &'a CudaSlice<u8>,
+    tmp_v: &'a mut CudaSlice<bf16>,
+    tmp_s: &'a mut CudaSlice<f32>,
+    cap: usize,
+}
+
+impl SplitKvState {
+    fn new(ctx: &DeviceContext, spec: SplitKvSpec) -> Result<Self> {
+        let label = spec.label;
+        let alloc = |what: &'static str| {
+            move |err| anyhow::anyhow!("{label} split {what} alloc failed: {err}")
+        };
+        Ok(Self {
+            request_indices_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("request indices"))?,
+            kv_tile_indices_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("tile indices"))?,
+            chunk_size_d: spec.chunk_size_d,
+            o_indptr_d: ctx
+                .stream
+                .alloc_zeros(spec.rows + 1)
+                .map_err(alloc("o_indptr"))?,
+            valid_mask_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("valid mask"))?,
+            tmp_v: ctx
+                .stream
+                .alloc_zeros(spec.slots * spec.heads * spec.head_dim)
+                .map_err(alloc("tmp_v"))?,
+            tmp_s: ctx
+                .stream
+                .alloc_zeros(spec.slots * spec.heads)
+                .map_err(alloc("tmp_s"))?,
+            cap: spec.cap,
+        })
+    }
+
+    fn upload_csr(&mut self, ctx: &DeviceContext, csr: &ops::SplitKvCsr) -> Result<()> {
+        upload_prefix(ctx, &mut self.request_indices_d, &csr.request_indices)?;
+        upload_prefix(ctx, &mut self.kv_tile_indices_d, &csr.kv_tile_indices)?;
+        upload_prefix(ctx, &mut self.o_indptr_d, &csr.o_indptr)?;
+        upload_prefix(ctx, &mut self.valid_mask_d, &csr.block_valid_mask)
+    }
+
+    fn metadata<'a>(
+        &'a mut self,
+        page_indices: &'a CudaSlice<i32>,
+        page_indptr: &'a CudaSlice<i32>,
+        last_page_len: &'a CudaSlice<i32>,
+    ) -> SplitKvLaunch<'a> {
+        SplitKvLaunch {
+            metadata: ops::Hd512DecodeMetadata::new(
+                page_indices,
+                page_indptr,
+                last_page_len,
+                &self.request_indices_d,
+                &self.kv_tile_indices_d,
+                &self.chunk_size_d,
+            ),
+            o_indptr_d: &self.o_indptr_d,
+            valid_mask_d: &self.valid_mask_d,
+            tmp_v: &mut self.tmp_v,
+            tmp_s: &mut self.tmp_s,
+            cap: self.cap,
+        }
+    }
+}
+
 /// The host buffers a split-KV pseudo expansion fills, borrowed apart so one
 /// builder serves every step shape.
 struct PseudoTables<'a> {
@@ -888,36 +974,18 @@ impl GemmaServe {
                     .alloc_zeros(factor * max_rows)
                     .map_err(alloc("global pseudo last-page lens"))?,
             },
-            global_split: SplitKvState {
-                request_indices_d: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots)
-                    .map_err(alloc("global split request indices"))?,
-                kv_tile_indices_d: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots)
-                    .map_err(alloc("global split tile indices"))?,
-                chunk_size_d: global_chunk,
-                o_indptr_d: ctx
-                    .stream
-                    .alloc_zeros(factor * max_rows + 1)
-                    .map_err(alloc("global split o_indptr"))?,
-                valid_mask_d: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots)
-                    .map_err(alloc("global split valid mask"))?,
-                tmp_v: ctx
-                    .stream
-                    .alloc_zeros(
-                        global_split_slots * global_split_heads * self.global_geom.head_dim,
-                    )
-                    .map_err(alloc("global split tmp_v"))?,
-                tmp_s: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots * global_split_heads)
-                    .map_err(alloc("global split tmp_s"))?,
-                cap: global_split_cap,
-            },
+            global_split: SplitKvState::new(
+                ctx,
+                SplitKvSpec {
+                    label: "global",
+                    slots: global_split_slots,
+                    rows: factor * max_rows,
+                    heads: global_split_heads,
+                    head_dim: self.global_geom.head_dim,
+                    cap: global_split_cap,
+                    chunk_size_d: global_chunk,
+                },
+            )?,
             steady: None,
             local_origins: ctx.stream.alloc_zeros(max_rows).map_err(alloc("origins"))?,
             ids: ctx.stream.alloc_zeros(max_rows).map_err(alloc("ids"))?,
@@ -1501,13 +1569,10 @@ impl GemmaServe {
                 scratch.q_prep.seq_len = factor * seq_len;
                 scratch.attn.hidden_dim = q_dim / factor;
                 scratch.attn.seq_len = factor * seq_len;
-                let meta = ops::Hd512DecodeMetadata::new(
+                let launch = split.metadata(
                     &global_tables.pseudo_pages,
                     &global_tables.pseudo_indptr,
                     &global_tables.pseudo_last,
-                    &split.request_indices_d,
-                    &split.kv_tile_indices_d,
-                    &split.chunk_size_d,
                 );
                 ops::paged_attention_batch_decode_split_kv_hd512_into(
                     ctx,
@@ -1516,12 +1581,12 @@ impl GemmaServe {
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     family_layer,
-                    &meta,
-                    &split.o_indptr_d,
-                    &split.valid_mask_d,
-                    &mut split.tmp_v,
-                    &mut split.tmp_s,
-                    factor * seq_len * split.cap,
+                    &launch.metadata,
+                    launch.o_indptr_d,
+                    launch.valid_mask_d,
+                    launch.tmp_v,
+                    launch.tmp_s,
+                    factor * seq_len * launch.cap,
                     &mut scratch.attn,
                     geom.num_q_heads / factor,
                     1.0,
@@ -1590,13 +1655,10 @@ impl GemmaServe {
                 scratch.q_prep.seq_len = factor * seq_len;
                 scratch.attn.hidden_dim = q_dim / factor;
                 scratch.attn.seq_len = factor * seq_len;
-                let meta = ops::Hd512DecodeMetadata::new(
+                let launch = split.metadata(
                     &global_tables.pseudo_pages,
                     &global_tables.pseudo_indptr,
                     &global_tables.pseudo_last,
-                    &split.request_indices_d,
-                    &split.kv_tile_indices_d,
-                    &split.chunk_size_d,
                 );
                 ops::paged_attention_batch_decode_split_kv_hd512_into(
                     ctx,
@@ -1605,12 +1667,12 @@ impl GemmaServe {
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     family_layer,
-                    &meta,
-                    &split.o_indptr_d,
-                    &split.valid_mask_d,
-                    &mut split.tmp_v,
-                    &mut split.tmp_s,
-                    factor * batch * split.cap,
+                    &launch.metadata,
+                    launch.o_indptr_d,
+                    launch.valid_mask_d,
+                    launch.tmp_v,
+                    launch.tmp_s,
+                    factor * batch * launch.cap,
                     &mut scratch.attn,
                     geom.num_q_heads / factor,
                     1.0,
@@ -1664,19 +1726,7 @@ impl GemmaServe {
         upload_prefix(ctx, &mut global_tables.pseudo_pages, pages)?;
         upload_prefix(ctx, &mut global_tables.pseudo_indptr, indptr)?;
         upload_prefix(ctx, &mut global_tables.pseudo_last, last_lens)?;
-        upload_prefix(
-            ctx,
-            &mut global_split.request_indices_d,
-            &csr.request_indices,
-        )?;
-        upload_prefix(
-            ctx,
-            &mut global_split.kv_tile_indices_d,
-            &csr.kv_tile_indices,
-        )?;
-        upload_prefix(ctx, &mut global_split.o_indptr_d, &csr.o_indptr)?;
-        upload_prefix(ctx, &mut global_split.valid_mask_d, &csr.block_valid_mask)?;
-        Ok(())
+        global_split.upload_csr(ctx, &csr)
     }
 
     fn decode_fingerprint(&self, kvs: &[&mut GemmaKv], padded: usize) -> Option<SteadyDecode> {
