@@ -34,7 +34,7 @@ use crate::nvfp4::QuantSource;
 /// redemption, prefetch join and unmap fall between them, and the allocations
 /// submitted under `record_api_wall_ms` execute under
 /// `execute_and_drain_wall_ms`. Only `elapsed_ms` is a total.
-pub(crate) struct LoadStats {
+struct LoadStats {
     /// Every required tensor at its dtype.
     manifest_bytes: usize,
     /// Free-before minus free-after. Signed: this measures the device, not the
@@ -44,11 +44,14 @@ pub(crate) struct LoadStats {
     /// Config, headers, classification. No device. The advisory prefetch
     /// workers start inside this window and keep running past it.
     validate_wall_ms: f64,
-    /// Submitting one allocation and one staging plan per tensor. Wider than
-    /// the shared loader's `alloc_api_wall`, which times the allocs alone.
+    /// Submitting one allocation and one staging plan per BF16-staged tensor
+    /// (the shared loader's plan). Wider than the shared loader's
+    /// `alloc_api_wall`, which times the allocs alone; the A4B expert byte
+    /// staging sits outside this window.
     record_api_wall_ms: f64,
-    /// The checkpoint is consumed here, so this carries the source read as
-    /// well as the transfer.
+    /// The BF16 staged tensors are consumed here, source read and transfer.
+    /// The A4B expert upload, Marlin repack and scale preparation follow
+    /// after both windows, inside the total only.
     execute_and_drain_wall_ms: f64,
     /// The whole call, unmap included.
     elapsed_ms: f64,
@@ -477,7 +480,7 @@ impl Gemma4Weights {
         model_path: &str,
         device_ordinal: usize,
         config: Gemma4Config,
-    ) -> Result<(Self, LoadStats)> {
+    ) -> Result<Self> {
         let started = Instant::now();
         let manifest = Manifest::from_config(&config)?;
         let manifest_bytes = manifest.weight_bytes()?;
@@ -535,7 +538,7 @@ impl Gemma4Weights {
             stats.record_api_wall_ms,
             stats.execute_and_drain_wall_ms
         );
-        Ok((weights, stats))
+        Ok(weights)
     }
 }
 

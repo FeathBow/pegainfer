@@ -1074,7 +1074,7 @@ impl EngineState {
                  the default {MAX_CONTEXT} ceiling"
             );
         }
-        let (weights, _) = Gemma4Weights::from_safetensors(dir, device, config)?;
+        let weights = Gemma4Weights::from_safetensors(dir, device, config)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
         policy.check_against_vocab(vocab)?;

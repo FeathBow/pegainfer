@@ -30,7 +30,7 @@ fn stack_with_storage(
 ) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
     let config = Gemma4Config::from_file(&dir).expect("config");
-    let (weights, _) =
+    let weights =
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
     let serve = GemmaServe::new(&ctx, weights, max_context, storage, pages, pages).expect("serve");
