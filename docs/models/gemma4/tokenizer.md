@@ -94,8 +94,9 @@ frontend today, so changing it touches every model line and needs its own review
 
 ## BOS comes from the template, not the tokenizer
 
-`add_special_tokens` is a no-op for this tokenizer: every probe encodes identically with it on
-and off. The leading `<bos>` in a chat request comes from the template. An engine that adds BOS
+`add_special_tokens` was established as a no-op for this tokenizer by the retired token-id
+probes (every probe encoded identically with it on and off); the fixture no longer carries them.
+The leading `<bos>` in a chat request comes from the template. An engine that adds BOS
 itself would double it.
 
 ## EOS is declared three times
