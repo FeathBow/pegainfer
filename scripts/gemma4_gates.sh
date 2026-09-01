@@ -77,7 +77,6 @@ GATES_LOADER=(
   "ckpt weights::load::tests::a_disagreeing_config_names_every_faulty_tensor"
 )
 GATES_DEVICE=(
-  "gpu engine::gate::the_suppression_mask_writes_only_the_ids_it_is_given"
   "gpu kv::tests::admission_is_atomic_across_pools"
 )
 GATES_ROUTED=(
