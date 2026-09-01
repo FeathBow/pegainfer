@@ -609,3 +609,49 @@ impl UnixAnchor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::RejectReason;
+    use crate::engine::scheduler_pair;
+
+    fn request() -> Request {
+        Request {
+            prompt_tokens: vec![1, 2],
+            params: crate::sampler::SamplingParams::default(),
+            max_tokens: 1,
+            lora_adapter: None,
+            kv_transfer_params: None,
+            logprobs: 0,
+            echo: false,
+            trace_parent: None,
+            client_label: None,
+        }
+    }
+
+    #[test]
+    fn unsupported_rejection_is_rendered_for_vllm() {
+        let (handle, _backend) = scheduler_pair();
+        let control = handle.submit(request());
+        let mut stream = SteppedStream::new("unsupported".into(), control, Span::noop(), None);
+        let mut update = RequestUpdate::empty(stream.control.id());
+        update.terminal = Some(Terminal::Rejected {
+            reason: RejectReason::Unsupported {
+                feature: "kv_transfer".into(),
+            },
+            prompt_tokens: 2,
+        });
+
+        let (output, terminated) = reduce_update(&mut stream, update, &UnixAnchor::now());
+        let output = output.expect("rejection produces a wire output");
+        assert!(terminated);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+        assert_eq!(
+            output.stop_reason,
+            Some(StopReason::Text(
+                "this engine does not support kv_transfer".into()
+            ))
+        );
+    }
+}
