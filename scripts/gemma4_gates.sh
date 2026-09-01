@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Maintainer runner for the Gemma 4 checkpoint-backed gates and the kernels
-# crate's Gemma router contract.
+# Maintainer runner for the Gemma 4 checkpoint-backed gates and the Gemma
+# contracts that live in the kernels and frontend crates.
 #
 # The checkpoint-backed gates need real weights, fixtures and a device; the
-# kernels router contract needs only a device. This script owns their execution:
+# kernels contracts need only a device. This script owns their execution:
 # it refuses to start unless every prerequisite is present, it holds each
 # discovered gate set against the manifest here so a gate cannot quietly leave
 # the suite. It claims one physical device for the suite's lifetime and runs one
@@ -121,7 +121,17 @@ GATES_FP8_PROFILE=(
 # against `tests/*.rs` below, so a new binary fails the check rather than
 # going unowned.
 INTEGRATION_TARGETS=()
+# Frontend-owned integration binaries: the chat-render parity gate rides the
+# frontend crate (which owns the render path) but stays under this runner's
+# manifest and execution ownership.
+FRONTEND_CRATE=pegainfer-frontend
+FRONTEND_INTEGRATION_TARGETS=(gemma4_tokenizer_parity)
+# shellcheck disable=SC2034
+GATES_GEMMA4_TOKENIZER_PARITY=(
+  "ckpt,chatgolden string_form_chat_renders_match_hf_reference"
+)
 
+CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
 FIXTURES=(
   test_data/gemma4-12b-hf-golden.safetensors
   test_data/gemma4-12b-hf-window-golden.safetensors
@@ -283,12 +293,18 @@ print(f"preflight: {len(fixtures)} fixtures agree on revision {revision[:12]}")
 PY
 }
 
+require_chatgolden() {
+  [ -f "$CHAT_GOLDEN" ] || die "reference $CHAT_GOLDEN is missing (dump it on the test box first)"
+}
+
 
 # --- membership: the crate's ignored set must be exactly the manifest ------
 ignored_in() {
   local crate=$1
   shift
-  cargo test --release -p "$crate" --features "$FEATURE" "$@" -- \
+  local feat=(--features "$FEATURE")
+  [ "$crate" = "$FRONTEND_CRATE" ] && feat=()
+  cargo test --release -p "$crate" "${feat[@]}" "$@" -- \
     --ignored --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
 }
 
@@ -338,6 +354,11 @@ declared=$(printf '%s\n' "${INTEGRATION_TARGETS[@]}" | sort)
 [ "$discovered" = "$declared" ] || die \
   "integration binaries disagree with INTEGRATION_TARGETS:"$'\n'"on disk: $discovered"$'\n'"declared: $declared"
 
+discovered=$(find "$FRONTEND_CRATE/tests" -maxdepth 1 -name '*.rs' -exec basename {} .rs \; 2>/dev/null | sort)
+declared=$(printf '%s\n' "${FRONTEND_INTEGRATION_TARGETS[@]}" | sort)
+[ "$discovered" = "$declared" ] || die \
+  "frontend integration binaries disagree with FRONTEND_INTEGRATION_TARGETS:"$'\n'"on disk: $discovered"$'\n'"declared: $declared"
+
 all_gates=()
 append_gate() {
   local needs=$1 target=$2 gate=$3 profile=${4:-}
@@ -362,6 +383,16 @@ for target in "${INTEGRATION_TARGETS[@]}"; do
     "$(ignored_in "$CRATE" --test "$target")" "$(printf '%s\n' "${target_names[@]}" | sort)"
   for entry in "${!group}"; do
     append_gate "${entry%% *}" "$target" "${entry##* }"
+  done
+done
+for target in "${FRONTEND_INTEGRATION_TARGETS[@]}"; do
+  group="GATES_$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')[@]"
+  target_names=()
+  for entry in "${!group}"; do target_names+=("${entry##* }"); done
+  check_membership "frontend integration binary $target" \
+    "$(ignored_in "$FRONTEND_CRATE" --test "$target")" "$(printf '%s\n' "${target_names[@]}" | sort)"
+  for entry in "${!group}"; do
+    append_gate "${entry%% *}" "frontend:$target" "${entry##* }"
   done
 done
 for entry in "${GATES_KERNELS[@]}"; do
@@ -394,7 +425,7 @@ needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
 needs=" ${needs//,/ } "
 demanded=""
-for want in gpu ckpt moeckpt prompts fixtures; do
+for want in gpu ckpt moeckpt prompts fixtures chatgolden; do
   case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
 done
 echo "gemma4 gates: prerequisites$demanded"
@@ -416,7 +447,12 @@ for entry in "${selected[@]}"; do
   test_crate=$CRATE
   require_gpu_env=0
   ignored_args=(--ignored)
-  if [ "$target" = kernels ]; then
+  feature_args=(--features "$FEATURE")
+  if [[ $target == frontend:* ]]; then
+    test_crate=$FRONTEND_CRATE
+    target_args=(--test "${target#frontend:}")
+    feature_args=()
+  elif [ "$target" = kernels ]; then
     test_crate=$KERNELS_CRATE
     target_args=(--lib)
   elif [[ $target == kernels:* ]]; then
@@ -440,7 +476,7 @@ for entry in "${selected[@]}"; do
     model_env=(env PEGAINFER_REQUIRE_GPU=1)
   fi
   echo "--- [$profile] $gate"
-  if "${model_env[@]}" cargo test --release -p "$test_crate" --features "$FEATURE" \
+  if "${model_env[@]}" cargo test --release -p "$test_crate" "${feature_args[@]}" \
       "${target_args[@]}" -- \
       "${ignored_args[@]}" --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
     completed=$((completed + 1))
