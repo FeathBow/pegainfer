@@ -843,7 +843,28 @@ struct EngineState {
     admit_coalesce: Option<std::time::Duration>,
 }
 
+/// The scheduler thread is not the thread that loaded the engine: the
+/// primary context must be made current there and the thread-local cuBLAS
+/// handle created, or the first eager GEMM fails with an invalid handle.
+/// Same three steps the Qwen3 model thread takes.
+fn bind_engine_thread(ctx: &DeviceContext) -> Result<()> {
+    let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
+    anyhow::ensure!(
+        err == 0,
+        "cudaSetDevice({}) on the scheduler thread failed: cudaError={err}",
+        ctx.device_ordinal
+    );
+    ctx.ctx
+        .bind_to_thread()
+        .map_err(|e| anyhow::anyhow!("bind the CUDA context to the scheduler thread: {e}"))?;
+    unsafe { pegainfer_core::ffi::cublas_init() };
+    Ok(())
+}
+
 struct Gemma4Scheduler {
+    /// Set once the driver thread has bound the context; see
+    /// [`bind_engine_thread`].
+    thread_bound: bool,
     state: EngineState,
     pending: VecDeque<QueuedRequest>,
     active: Vec<Active>,
@@ -855,6 +876,7 @@ impl Gemma4Scheduler {
     fn new(state: EngineState) -> Self {
         let door = state.coalesce_door();
         Self {
+            thread_bound: false,
             state,
             pending: VecDeque::new(),
             active: Vec::new(),
@@ -2220,6 +2242,10 @@ impl Scheduler for Gemma4Scheduler {
     }
 
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        if !self.thread_bound {
+            bind_engine_thread(&self.state.ctx)?;
+            self.thread_bound = true;
+        }
         if self.walk.is_some() {
             return self.advance_walk(ledger);
         }
