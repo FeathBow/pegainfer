@@ -1347,7 +1347,7 @@ impl EngineState {
             &request.request.prompt_tokens,
             resumed,
         );
-        self.first_token_flow(request, kv, &mut logits, ledger)
+        Ok(self.first_token_flow(request, kv, &mut logits, ledger))
     }
 
     /// Sample and settle a prefill's first token from logits row 0 — the
@@ -1358,7 +1358,7 @@ impl EngineState {
         kv: GemmaKv,
         logits: &mut HiddenStates,
         ledger: &mut RequestLedger,
-    ) -> Result<Admitted> {
+    ) -> Admitted {
         let sampled = {
             let rows = [SampleRow {
                 params: &request.request.params,
@@ -1382,22 +1382,20 @@ impl EngineState {
             Err(err) => {
                 log::error!("gemma4 first-token sampling failed: {err:#}");
                 ledger.fail(request.id, format!("first-token sampling failed: {err:#}"));
-                return Ok(Admitted::Done);
+                return Admitted::Done;
             }
         };
-        Ok(
-            match settle_first_token(
-                &self.policy,
-                request,
-                kv,
-                sampled.picked[0],
-                sampled.logprobs[0].take(),
-                ledger,
-            ) {
-                Some(entry) => Admitted::Active(Box::new(entry)),
-                None => Admitted::Done,
-            },
-        )
+        match settle_first_token(
+            &self.policy,
+            request,
+            kv,
+            sampled.picked[0],
+            sampled.logprobs[0].take(),
+            ledger,
+        ) {
+            Some(entry) => Admitted::Active(Box::new(entry)),
+            None => Admitted::Done,
+        }
     }
 
     /// Launch one whole-prompt prefill onto the lane stream and record the
@@ -1511,7 +1509,7 @@ impl EngineState {
             resumed,
         );
         if let Admitted::Active(entry) =
-            self.first_token_flow(request, kv, &mut pass.logits, ledger)?
+            self.first_token_flow(request, kv, &mut pass.logits, ledger)
         {
             active.push(*entry);
         }
@@ -1594,7 +1592,7 @@ impl EngineState {
         Ok(())
     }
 
-    fn start_mixed_walk(&mut self, chunk: usize, newcomers: Vec<Newcomer>) -> Walk {
+    fn start_mixed_walk(chunk: usize, newcomers: Vec<Newcomer>) -> Walk {
         let walkers = newcomers
             .into_iter()
             .map(|(request, kv, resumed)| Walker {
@@ -2001,7 +1999,7 @@ impl EngineState {
     ) -> Result<Admitted> {
         if let Some(chunk) = self.mix_chunk {
             debug_assert!(walk.is_none());
-            *walk = Some(self.start_mixed_walk(chunk, newcomers));
+            *walk = Some(Self::start_mixed_walk(chunk, newcomers));
             return Ok(Admitted::Done);
         }
 

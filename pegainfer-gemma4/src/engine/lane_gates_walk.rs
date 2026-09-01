@@ -4,8 +4,8 @@ use pegainfer_frontend::engine::RequestControl;
 
 use super::lane_test_env::scoped_engine_env;
 use super::lane_tests::Harness;
-use super::lane_tests::ids;
 use super::lane_tests::launch;
+use super::lane_tests::pin_live_stream;
 use super::lane_tests::wait_until;
 
 fn load_chunk_state(chunk: &str) -> super::EngineState {

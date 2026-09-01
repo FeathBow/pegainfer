@@ -6,6 +6,7 @@ use super::lane_tests::assert_warm_result;
 use super::lane_tests::ids;
 use super::lane_tests::launch;
 use super::lane_tests::pin_live_stream;
+use super::lane_tests::warm_prompt;
 
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
