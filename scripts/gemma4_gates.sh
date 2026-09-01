@@ -34,7 +34,6 @@ GPU_LOCK_ROOT=/tmp
 #   moeckpt     PEGAINFER_NVFP4_MODEL and the routed config it holds
 #   prompts     the generate fixture, read for its prompts only
 #   fixtures    all four tensor fixtures, held against the checkpoint's digests
-#   chatgolden  the chat/tokenizer reference JSON
 # and a run demands only the union over the gates it selects, so a filter can
 # run a gate without producing the whole suite's prerequisites.
 GATES_NUMERIC_PARITY=(
@@ -120,12 +119,7 @@ GATES_FP8_PROFILE=(
 # array per binary, named GATES_<TARGET>; the target list itself is held
 # against `tests/*.rs` below, so a new binary fails the check rather than
 # going unowned.
-INTEGRATION_TARGETS=(tokenizer_parity)
-# Expanded indirectly from each name in INTEGRATION_TARGETS.
-# shellcheck disable=SC2034
-GATES_TOKENIZER_PARITY=(
-  "ckpt,chatgolden string_form_chat_renders_match_hf_reference"
-)
+INTEGRATION_TARGETS=()
 
 FIXTURES=(
   test_data/gemma4-12b-hf-golden.safetensors
@@ -134,7 +128,6 @@ FIXTURES=(
   test_data/gemma4-12b-generate.safetensors
 )
 PROMPT_FIXTURE=test_data/gemma4-12b-generate.safetensors
-CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
 
 die() { echo "gemma4 gates: $*" >&2; exit 1; }
 
@@ -234,9 +227,6 @@ require_prompts() {
   [ -f "$PROMPT_FIXTURE" ] || die "fixture $PROMPT_FIXTURE is missing (dump it on the test box first)"
 }
 
-require_chatgolden() {
-  [ -f "$CHAT_GOLDEN" ] || die "reference $CHAT_GOLDEN is missing (dump it on the test box first)"
-}
 
 require_fixtures() {
   require_ckpt
@@ -403,7 +393,7 @@ needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
 needs=" ${needs//,/ } "
 demanded=""
-for want in gpu ckpt moeckpt prompts fixtures chatgolden; do
+for want in gpu ckpt moeckpt prompts fixtures; do
   case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
 done
 echo "gemma4 gates: prerequisites$demanded"

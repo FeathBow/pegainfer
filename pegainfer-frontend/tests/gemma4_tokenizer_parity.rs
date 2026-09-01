@@ -1,5 +1,9 @@
 //! Chat-render parity against a Hugging Face reference dumped by
-//! `tools/accuracy/dump_gemma4_tokenizer_golden.py`. Point
+//! `tools/accuracy/dump_gemma4_tokenizer_golden.py`. Owned by the frontend
+//! crate because the contract under test is the chat-render path (the
+//! vendored vllm renderer against the reference's Jinja2); the Gemma engine
+//! only supplies the fixture. Run it directly:
+//! `cargo test -p pegainfer-frontend --test gemma4_tokenizer_parity -- --ignored`. Point
 //! `PEGAINFER_TEST_MODEL_PATH` at the pinned 12B checkpoint the reference was
 //! dumped from and run with `--ignored`; the file-hash guard binds it to
 //! exactly that checkpoint.

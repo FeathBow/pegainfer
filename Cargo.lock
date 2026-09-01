@@ -3686,13 +3686,16 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tower",
  "uuid",
+ "vllm-chat",
  "vllm-engine-core-client",
  "vllm-server",
+ "vllm-text",
  "zeromq",
 ]
 
@@ -3710,11 +3713,8 @@ dependencies = [
  "pegainfer-sample",
  "safetensors",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "tokio",
- "vllm-chat",
- "vllm-text",
 ]
 
 [[package]]
