@@ -514,8 +514,9 @@ impl Gemma4Weights {
         let device_free_bytes = free_device_bytes()?;
         drop(shards);
         // A few hundred ms at this size. Qwen3 backgrounds it to protect its
-        // ready time; kept synchronous here so the reported total is the whole
-        // cost. Lift that spawn into core once an executor wants it too.
+        // ready time; kept synchronous here so the unmap's host cost lands
+        // inside the reported submission total. Lift that spawn into core
+        // once an executor wants it too.
         drop(mmaps);
 
         let stats = LoadStats {
@@ -531,7 +532,8 @@ impl Gemma4Weights {
         info!(
             "Gemma 4 weights resident: {:.2} GiB manifest, {:.2} GiB device, {:.2} GiB free, \
              {} modality tensors skipped; \
-             {:.0} ms total, of which {:.0} validate, {:.0} record-api, {:.0} execute-and-drain",
+             {:.0} ms submission total, of which {:.0} validate, {:.0} record-api, \
+             {:.0} execute-and-drain (expert kernels enqueued, not drained)",
             gib(stats.manifest_bytes as i64),
             gib(stats.device_bytes),
             gib(stats.device_free_bytes as i64),
