@@ -1,5 +1,6 @@
 //! The Gemma 4 engine: one owned thread with iteration-level scheduling.
-//! Prefill runs at the step boundary, whole unless the chunk knob splits it;
+//! Prefill runs at the step boundary, whole unless the chunk knob splits it
+//! (the overlap lane always prefills whole);
 //! every active request then
 //! advances one token per batched decode step, sharing each layer's weight
 //! pass.
@@ -216,7 +217,7 @@ fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
 /// Holds arrivals that would invade a live decode batch so one window's
 /// arrivals land as a back-to-back burst of admissions: the stream's tail
 /// gap prices the number of interruptions. One mixed step merges extra
-/// prompts only with chunking or while its leader is under
+/// prompts only with chunking or while the gathered rows stay under
 /// `MIX_GATHER_ROWS`. The cohort bounds free-slot capacity, not a batch
 /// across completions; idle engines admit on sight and shallow batches skip.
 struct CoalesceDoor {
@@ -599,15 +600,16 @@ fn global_account_pages(context_len: usize) -> usize {
 /// sampler-row capacity so a burst still leaves decode rows headroom.
 const MIX_MAX_PROMPTS: usize = 4;
 
-/// The gathered step's prompt-row ceiling. Gathering amortizes only the
-/// step floor while every live stream's inter-token gap pays the whole
-/// gathered step, so absorbing long
-/// prompts into one step trades a large certain loss for a small fixed
-/// win. On 12B, the floor measured ~27 ms and each row ~0.2 ms; at 16
-/// coincident ~1900-token prompts, an unbounded gather tripled the stream's
-/// p99 gap for a sub-2% wall saving. The 26B calibration is pending. Short
-/// bursts are where the floor dominates; the ceiling keeps the gather there,
-/// and a long prompt keeps its own step.
+/// The unchunked follower-gather budget, not a step row ceiling: the
+/// leader's unseen suffix counts against it but the leader itself is never
+/// bounded (a long leader still rides the live decode batch, alone), and
+/// the chunked walk ignores it — the chunk knob prices rows per step
+/// instead. The trade it bounds: gathering amortizes only the step floor
+/// while every live stream's inter-token gap pays the whole gathered step,
+/// so absorbing long prompts trades a large certain loss for a small fixed
+/// win; short bursts are where the floor dominates, and the budget keeps
+/// the gather there. Calibration measurements live in the benchmark
+/// records, not here.
 const MIX_GATHER_ROWS: usize = 512;
 
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
