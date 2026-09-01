@@ -33,7 +33,9 @@ use crate::nvfp4::QuantSource;
 /// The wall figures are probes, not a partition: context creation, slot
 /// redemption, prefetch join and unmap fall between them, and the allocations
 /// submitted under `record_api_wall_ms` execute under
-/// `execute_and_drain_wall_ms`. Only `elapsed_ms` is a total.
+/// `execute_and_drain_wall_ms`. `elapsed_ms` is the submission total: it
+/// samples when the call returns, after the A4B expert kernels are enqueued
+/// but without draining them.
 struct LoadStats {
     /// Every required tensor at its dtype.
     manifest_bytes: usize,
@@ -41,8 +43,9 @@ struct LoadStats {
     /// process, so anything else running on it moves the number too.
     device_bytes: i64,
     device_free_bytes: usize,
-    /// Config, headers, classification. No device. The advisory prefetch
-    /// workers start inside this window and keep running past it.
+    /// Manifest, shard index and header classification (the config arrives
+    /// parsed from the caller). No device. The advisory prefetch workers
+    /// start inside this window and keep running past it.
     validate_wall_ms: f64,
     /// Submitting one allocation and one staging plan per BF16-staged tensor
     /// (the shared loader's plan). Wider than the shared loader's
@@ -50,10 +53,10 @@ struct LoadStats {
     /// staging sits outside this window.
     record_api_wall_ms: f64,
     /// The BF16 staged tensors are consumed here, source read and transfer.
-    /// The A4B expert upload, Marlin repack and scale preparation follow
-    /// after both windows, inside the total only.
+    /// The A4B expert upload, Marlin repack and scale preparation are
+    /// enqueued after both windows and are not waited on by any figure here.
     execute_and_drain_wall_ms: f64,
-    /// The whole call, unmap included.
+    /// The whole submission call, unmap included; see the struct note.
     elapsed_ms: f64,
     skipped_modality_tensors: usize,
 }
