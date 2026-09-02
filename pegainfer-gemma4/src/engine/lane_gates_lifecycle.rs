@@ -105,13 +105,12 @@ fn lane_lifecycle_script(mode: &str) {
         (4, FinishReason::Length)
     );
 
-    harness.shutdown(&[]);
+    harness.shutdown(&[&streamer]);
     let cancelled_terminals = harness.steps.terminals_after_close(cancelled.id());
     assert!(
         cancelled_terminals.is_empty(),
         "frontend abort must retire silently: {cancelled_terminals:?}"
     );
-    drop(streamer);
 }
 
 fn gather_lifecycle_script() {

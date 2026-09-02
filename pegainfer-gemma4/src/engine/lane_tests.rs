@@ -84,10 +84,17 @@ impl Harness {
             .join
             .is_finished();
         if !finished {
-            let _ = wait_until(Duration::from_secs(10), || {
+            let drained = wait_until(Duration::from_secs(10), || {
                 let metrics = self.metrics();
                 metrics.num_running_reqs == 0 && metrics.num_waiting_reqs == 0
             });
+            if !drained {
+                let metrics = self.metrics();
+                panic!(
+                    "scheduler did not drain within 10s: running {} waiting {}",
+                    metrics.num_running_reqs, metrics.num_waiting_reqs
+                );
+            }
         }
         let scheduler = self
             .scheduler

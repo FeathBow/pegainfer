@@ -20,6 +20,23 @@ pub(super) struct StepCollector {
     buffered: HashMap<RequestId, VecDeque<RequestUpdate>>,
 }
 
+/// A request the scheduler refused or failed before scheduling sends no
+/// further update, so waiting for its Scheduled would block until the
+/// stream closes at shutdown, which the waiting test never reaches.
+fn ended_before_scheduled(id: RequestId, terminal: &Terminal) -> ! {
+    match terminal {
+        Terminal::Rejected { reason, .. } => {
+            panic!("request {id:?} was rejected before it was scheduled: {reason}")
+        }
+        Terminal::Failed { message, .. } => {
+            panic!("request {id:?} failed before it was scheduled: {message}")
+        }
+        Terminal::Finished { reason, .. } => {
+            panic!("request {id:?} finished before it was scheduled: {reason:?}")
+        }
+    }
+}
+
 impl StepCollector {
     pub(super) fn new(steps: StepReceiver) -> Self {
         Self {
@@ -54,6 +71,11 @@ impl StepCollector {
         let mut held = Vec::new();
         loop {
             let update = self.next_for(id);
+            if let Some(terminal) = &update.terminal
+                && update.scheduled.is_none()
+            {
+                ended_before_scheduled(id, terminal);
+            }
             let scheduled = update.scheduled.is_some();
             held.push(update);
             if scheduled {
@@ -72,6 +94,14 @@ impl StepCollector {
                 .steps
                 .blocking_recv()
                 .expect("step stream closed before the admission burst");
+            for update in &step.updates {
+                if let Some(terminal) = &update.terminal
+                    && update.scheduled.is_none()
+                    && ids.contains(&update.id)
+                {
+                    ended_before_scheduled(update.id, terminal);
+                }
+            }
             let any = ids.iter().any(|id| {
                 step.updates
                     .iter()
