@@ -1176,8 +1176,10 @@ impl EngineState {
                 sampler_graphs.push(graph);
                 bucket *= 2;
             }
-            ctx.sync()?;
         }
+        // The KV pools, arena and warm passes were enqueued on this stream. The lane
+        // stream and everything after it must see them complete, graphs or not.
+        ctx.sync()?;
         let lane = lane_mode
             .map(|mode| AsyncPrefillLane::new(&ctx, mode))
             .transpose()?;
