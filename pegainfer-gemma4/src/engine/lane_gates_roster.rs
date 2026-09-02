@@ -138,7 +138,7 @@ fn run_refill_episode(harness: &mut Harness, prompt: Vec<u32>, budget: usize) ->
 
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-fn an_idle_refill_drops_the_retired_fingerprint() {
+fn an_idle_refill_matches_a_fresh_engine() {
     let prompts = crate::testkit::generate_fixture_prompts();
     let first_len = 64usize;
     let budget = 8usize;

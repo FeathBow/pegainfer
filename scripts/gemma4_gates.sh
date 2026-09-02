@@ -44,7 +44,7 @@ GATES_NUMERIC_PARITY=(
 GATES_ADMISSION=(
   "gpu,ckpt,prompts serve::oracle::mixed_step_matches_serial"
   "gpu,ckpt,prompts serve::oracle::fp8_mixed_walk_holds_its_structure"
-  "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_walk_matches_the_serial_path"
+  "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_walk_does_not_depend_on_its_batching"
   "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_transient_leaves_headroom"
 )
 # These production contracts apply to both checkpoint geometries. They stay
@@ -63,7 +63,7 @@ GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_gates_roster::the_coalesce_door_releases_one_admission_burst"
   "gpu,ckpt,prompts engine::lane_gates_roster::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
   "gpu,ckpt,prompts engine::lane_gates_roster::the_full_roster_keeps_its_pipeline_under_a_queue"
-  "gpu,ckpt,prompts engine::lane_gates_roster::an_idle_refill_drops_the_retired_fingerprint"
+  "gpu,ckpt,prompts engine::lane_gates_roster::an_idle_refill_matches_a_fresh_engine"
   "gpu,ckpt engine::lane_gates_lifecycle::the_raise_reaches_the_frontend"
   "ckpt engine::lane_gates_lifecycle::the_raise_refuses_without_its_prerequisites"
 )
