@@ -133,13 +133,18 @@ GATES_GEMMA4_TOKENIZER_PARITY=(
 )
 
 CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
+# The fixture set is named by the checkpoint it was dumped from; the
+# committed set is 12b. Another tag selects fixtures dumped for another
+# checkpoint under the same names, and the gates are told where they are.
+FIXTURE_TAG=${PEGAINFER_GEMMA4_FIXTURE_TAG:-12b}
+[[ $FIXTURE_TAG =~ ^[a-z0-9]+$ ]] || { echo "gemma4 gates: PEGAINFER_GEMMA4_FIXTURE_TAG must be alphanumeric" >&2; exit 1; }
 FIXTURES=(
-  test_data/gemma4-12b-hf-golden.safetensors
-  test_data/gemma4-12b-hf-window-golden.safetensors
-  test_data/gemma4-12b-hf-longctx-golden.safetensors
-  test_data/gemma4-12b-generate.safetensors
+  test_data/gemma4-$FIXTURE_TAG-hf-golden.safetensors
+  test_data/gemma4-$FIXTURE_TAG-hf-window-golden.safetensors
+  test_data/gemma4-$FIXTURE_TAG-hf-longctx-golden.safetensors
+  test_data/gemma4-$FIXTURE_TAG-generate.safetensors
 )
-PROMPT_FIXTURE=test_data/gemma4-12b-generate.safetensors
+PROMPT_FIXTURE=test_data/gemma4-$FIXTURE_TAG-generate.safetensors
 
 die() { echo "gemma4 gates: $*" >&2; exit 1; }
 
@@ -154,6 +159,10 @@ gate_is_in() {
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || die "cannot enter the repository root"
+export PEGAINFER_GEMMA4_GOLDEN=$root/${FIXTURES[0]}
+export PEGAINFER_GEMMA4_WINDOW_GOLDEN=$root/${FIXTURES[1]}
+export PEGAINFER_GEMMA4_LONGCTX_GOLDEN=$root/${FIXTURES[2]}
+export PEGAINFER_GEMMA4_GENERATE=$root/${FIXTURES[3]}
 
 [ -z "${PEGAINFER_KV_FP8+x}" ] || die \
   "PEGAINFER_KV_FP8 is ambient; PEGAINFER_GATE_STORAGE is the only storage switch"
