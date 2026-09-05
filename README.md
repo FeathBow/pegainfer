@@ -3,7 +3,7 @@
     <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/banner-mobile-dark.svg">
     <source media="(max-width: 600px)" srcset="docs/assets/banner-mobile-light.svg">
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
-    <img src="docs/assets/banner-light.svg" width="1000" alt="PegaInfer — LLM inference in Rust and CUDA. Model-specific engines. Shared serving infrastructure. Dense, hybrid, and MoE models.">
+    <img src="docs/assets/banner-light.svg" width="1000" alt="PegaInfer — LLM inference in Rust and CUDA. Model-specific engines. Shared infrastructure.">
   </picture>
 </p>
 
