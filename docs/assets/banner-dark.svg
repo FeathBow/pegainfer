@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1080" height="280" viewBox="0 0 1080 280" font-family="Arial, Helvetica, sans-serif" role="img" aria-labelledby="banner-title banner-description">
   <title id="banner-title">PegaInfer — LLM inference in Rust and CUDA</title>
-  <desc id="banner-description">PegaInfer with the original winged-horse emblem. Model-specific engines. Shared infrastructure.</desc>
+  <desc id="banner-description">PegaInfer with the original winged-horse emblem. Built in Rust. Tuned for production inference.</desc>
   <defs>
     <clipPath id="emblem-clip">
       <rect width="320" height="320" rx="20" />
@@ -14,5 +14,5 @@
   </svg>
   <text x="202" y="70" font-family="ui-monospace, monospace" font-size="16" font-weight="500" letter-spacing="2" fill="#a3afbe">RUST + CUDA</text>
   <text x="196" y="174" font-size="108" font-weight="700" letter-spacing="-5" fill="#528bff">PegaInfer</text>
-  <text x="202" y="222" font-size="27" fill="#f0f6fc">Model-specific engines. Shared infrastructure.</text>
+  <text x="202" y="222" font-size="27" fill="#f0f6fc">Built in Rust. Tuned for production inference.</text>
 </svg>
