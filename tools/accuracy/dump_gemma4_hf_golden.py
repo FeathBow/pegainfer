@@ -36,6 +36,13 @@ SEED = 0x_4E11_A404
 TOP_K = 64
 SHORT_LEN = 9
 HASHED_FILES = ("config.json", "generation_config.json")
+
+def input_device(model, device: str):
+    """Where the prompt ids go: the requested device, or the sharded model's first
+    device when `--device auto` spread the weights over several GPUs."""
+    return model.device if device == "auto" else device
+
+
 # Where the final RMSNorm sits, as a cut target alongside integer layer indices.
 FINAL_NORM = "final_norm"
 METADATA_KEY = "gemma4_golden"
@@ -241,9 +248,9 @@ def main() -> int:
     tensors: dict[str, torch.Tensor] = {}
     for name, tokens, probed in cases:
         case_cuts = cuts if probed else []
-        hidden, logits = run_case(model, text_model, case_cuts, tokens, args.device)
+        hidden, logits = run_case(model, text_model, case_cuts, tokens, input_device(model, args.device))
         replay_hidden, replay_logits = run_case(
-            model, text_model, case_cuts, tokens, args.device
+            model, text_model, case_cuts, tokens, input_device(model, args.device)
         )
         reproducible = torch.equal(logits, replay_logits) and (
             hidden is None or torch.equal(hidden, replay_hidden)

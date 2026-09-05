@@ -86,7 +86,7 @@ def main() -> None:
         )
         model.eval()
         for case, text in PROMPTS.items():
-            input_ids = tokenizer(text, return_tensors="pt").input_ids.to(args.device)
+            input_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device if args.device == "auto" else args.device)
             prompt_ids[case] = input_ids[0].tolist()
             generated, step_margins = greedy_with_margins(model, input_ids)
             if impl == "sdpa" and (generated, step_margins) != greedy_with_margins(
