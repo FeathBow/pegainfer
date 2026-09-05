@@ -74,10 +74,12 @@ fn backend_floor(
     (floor, top1)
 }
 
-const WINDOW_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/gemma4-12b-hf-window-golden.safetensors"
-);
+fn window_fixture() -> String {
+    crate::testkit::fixture_path(
+        "PEGAINFER_GEMMA4_WINDOW_GOLDEN",
+        "gemma4-12b-hf-window-golden.safetensors",
+    )
+}
 
 /// One case's run through the serving path: the prompt prefilled in steps of
 /// `chunk` tokens (the whole prompt when zero), then its teacher-forced
@@ -181,10 +183,12 @@ fn score_rows(
     (max_abs, top1)
 }
 
-const LONGCTX_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/gemma4-12b-hf-longctx-golden.safetensors"
-);
+fn longctx_fixture() -> String {
+    crate::testkit::fixture_path(
+        "PEGAINFER_GEMMA4_LONGCTX_GOLDEN",
+        "gemma4-12b-hf-longctx-golden.safetensors",
+    )
+}
 
 /// A case's sdpa rows with a borrowed tolerance: where eager could not fit
 /// next to the tower, the widest dual-backend case lends its floor — the
@@ -304,8 +308,8 @@ fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn context_waypoints_match_hf() {
     let (ctx, serve, dir) = stack_with(32900, 2200);
-    let window_bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
-    let long_bytes = std::fs::read(LONGCTX_FIXTURE).expect("read longctx fixture");
+    let window_bytes = std::fs::read(window_fixture()).expect("read window fixture");
+    let long_bytes = std::fs::read(longctx_fixture()).expect("read longctx fixture");
     validate_waypoint_provenance(&dir, &window_bytes, &long_bytes);
     let window = safetensors::SafeTensors::deserialize(&window_bytes).expect("window fixture");
     let long = safetensors::SafeTensors::deserialize(&long_bytes).expect("longctx fixture");
@@ -478,7 +482,7 @@ fn judge_agreement(case: &AgreementCase, floor: usize, fp8: usize) {
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn fp8_argmax_agreement_meets_the_bf16_floor() {
-    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let bytes = std::fs::read(window_fixture()).expect("read window fixture");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("window fixture");
     let cases = [("w1023_prompt", usize::MAX, 2), ("w4096_prompt", 2048, 8)]
         .map(|(name, cut, stride)| agreement_case(&fixture, name, cut, stride));
@@ -560,10 +564,7 @@ fn incremental_serving_matches_recompute() {
     let (ctx, serve, _dir) = load_stack();
     // The golden fixture's short prompt: real text, and the tokens the
     // ceiling below was calibrated on. Read for its prompt only.
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../test_data/gemma4-12b-hf-golden.safetensors"
-    );
+    let path = crate::testkit::golden_path();
     let bytes = std::fs::read(path).expect("read golden fixture (dump on the box first)");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
     let (_, tokens_i32) = i32_tensor(&fixture, "short_tokens");
@@ -628,9 +629,9 @@ fn incremental_serving_matches_recompute() {
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn greedy_matches_hf_generate() {
     let (ctx, serve, dir) = load_stack();
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../test_data/gemma4-12b-generate.safetensors"
+    let path = crate::testkit::fixture_path(
+        "PEGAINFER_GEMMA4_GENERATE",
+        "gemma4-12b-generate.safetensors",
     );
     let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
     // Provenance: the golden fixture fingerprints the checkpoint files, so
