@@ -132,12 +132,17 @@ GATES_GEMMA4_TOKENIZER_PARITY=(
   "ckpt,chatgolden string_form_chat_renders_match_hf_reference"
 )
 
-CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
 # The fixture set is named by the checkpoint it was dumped from; the
 # committed set is 12b. Another tag selects fixtures dumped for another
 # checkpoint under the same names, and the gates are told where they are.
 FIXTURE_TAG=${PEGAINFER_GEMMA4_FIXTURE_TAG:-12b}
 [[ $FIXTURE_TAG =~ ^[a-z0-9]+$ ]] || { echo "gemma4 gates: PEGAINFER_GEMMA4_FIXTURE_TAG must be alphanumeric" >&2; exit 1; }
+# The committed chat reference predates the tag, so 12b keeps its own name.
+if [ "$FIXTURE_TAG" = 12b ]; then
+  CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
+else
+  CHAT_GOLDEN=test_data/gemma4-$FIXTURE_TAG-tokenizer-golden.json
+fi
 FIXTURES=(
   test_data/gemma4-$FIXTURE_TAG-hf-golden.safetensors
   test_data/gemma4-$FIXTURE_TAG-hf-window-golden.safetensors
@@ -163,6 +168,7 @@ export PEGAINFER_GEMMA4_GOLDEN=$root/${FIXTURES[0]}
 export PEGAINFER_GEMMA4_WINDOW_GOLDEN=$root/${FIXTURES[1]}
 export PEGAINFER_GEMMA4_LONGCTX_GOLDEN=$root/${FIXTURES[2]}
 export PEGAINFER_GEMMA4_GENERATE=$root/${FIXTURES[3]}
+export PEGAINFER_GEMMA4_CHAT_GOLDEN=$root/$CHAT_GOLDEN
 
 [ -z "${PEGAINFER_KV_FP8+x}" ] || die \
   "PEGAINFER_KV_FP8 is ambient; PEGAINFER_GATE_STORAGE is the only storage switch"
