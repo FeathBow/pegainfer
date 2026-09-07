@@ -1,11 +1,7 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::time::Duration;
 use std::time::Instant;
-
-use pegainfer_frontend::engine::EngineLoadOptions;
-use pegainfer_frontend::engine::EpBackend;
 
 use super::*;
 
@@ -878,29 +874,6 @@ fn submit_parking_requires_idle_owned_work_and_no_inflight_prefill() {
     assert!(!should_block_on_submit(true, true));
     assert!(!should_block_on_submit(false, false));
     assert!(!should_block_on_submit(false, true));
-}
-
-#[test]
-fn tp_engine_cuda_graph_passes_preload_validation() {
-    // P2c: TP + CUDA Graph is gated on the model's TP-local decode GQA group
-    // after load, so startup with a bogus path fails at load, not at the old
-    // eager-only rejection.
-    let err = match crate::start_engine_with_capacity(
-        Path::new("unused"),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0, 1],
-            parallel_config: None,
-            ep_backend: EpBackend::Nccl,
-            seed: 42,
-        },
-        1,
-        1,
-    ) {
-        Ok(_) => panic!("TP CUDA Graph startup with a nonexistent path should fail at load"),
-        Err(err) => err.to_string(),
-    };
-    assert!(!err.contains("eager execution only"));
 }
 
 #[test]

@@ -47,7 +47,7 @@ pub(crate) struct RecurrentState {
 pub(crate) struct LinearStatePointerTables {
     pub(crate) state_ptrs: Vec<CudaSlice<u64>>,
     pub(crate) conv_state_ptrs: Vec<CudaSlice<u64>>,
-    batch_size: usize,
+    capacity: usize,
 }
 
 /// Per-layer element counts shared by allocation and reservation:
@@ -109,7 +109,7 @@ impl LinearStatePointerTables {
         Ok(Self {
             state_ptrs,
             conv_state_ptrs,
-            batch_size: capacity,
+            capacity,
         })
     }
 
@@ -143,9 +143,9 @@ impl LinearStatePointerTables {
             recurrent_states.len()
         );
         anyhow::ensure!(
-            batch_size <= self.batch_size,
+            batch_size <= self.capacity,
             "{label} pointer table batch {batch_size} exceeds capacity {}",
-            self.batch_size
+            self.capacity
         );
         let tables = self
             .state_ptrs
@@ -191,9 +191,9 @@ impl LinearStatePointerTables {
     ) -> Result<()> {
         let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
         anyhow::ensure!(
-            self.batch_size >= batch_size,
+            self.capacity >= batch_size,
             "{label} pointer table capacity {} is smaller than batch {batch_size}",
-            self.batch_size
+            self.capacity
         );
         anyhow::ensure!(
             self.state_ptrs.len() == num_linear_layers

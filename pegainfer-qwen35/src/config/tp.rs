@@ -128,8 +128,7 @@ impl LocalGeometry {
             });
         }
         // Fail closed on an indivisible key-head count rather than falling
-        // back to replication; value-head divisibility follows from the
-        // Config35 value % key invariant and needs no second guard.
+        // back to replication.
         if !config.linear_num_key_heads.is_multiple_of(tp.world_size()) {
             return Err(ConfigError::TpIndivisible {
                 field: "linear_num_key_heads",
@@ -161,7 +160,7 @@ impl LocalGeometry {
             local_linear_num_key_heads,
             local_linear_num_value_heads,
             local_linear_v_dim,
-            // [q_local | k_local | v_local] in storage order; k == q.
+            // k rows mirror q rows.
             local_linear_qkv_dim: local_linear_q_dim * 2 + local_linear_v_dim,
         })
     }
@@ -207,7 +206,6 @@ impl LocalGeometry {
         self.local_full_attn_gated_q_dim
     }
 
-    // ── Linear-attention local dims ───────────────────────────────────────
     // TP1 contract: at world_size 1 every local dim equals the global dim, so
     // all linear-attention kernels/buffers/state keep their pre-TP shapes.
 
@@ -219,7 +217,7 @@ impl LocalGeometry {
         self.local_linear_num_value_heads
     }
 
-    /// Local fused qkv rows: [q_local | k_local | v_local] in storage order.
+    /// Local fused qkv projection rows (q, k and v segments, each head-local).
     pub(crate) fn local_linear_qkv_dim(&self) -> usize {
         self.local_linear_qkv_dim
     }

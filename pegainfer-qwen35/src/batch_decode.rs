@@ -632,9 +632,6 @@ impl Qwen35Model {
 
             match &layer.attn {
                 LayerKind::FullAttention(attn) => {
-                    // The eager TP path passes a per-step prefill plan when the
-                    // TP-local GQA group has no compiled batch-decode kernel;
-                    // graph capture always passes None (rerouted earlier).
                     match prefill_attn_plan {
                         Some(plan) => self.batch_decode_full_attention_via_prefill(
                             attn, kv_buffer, layout, plan, full_idx, padded_bs, bufs,
@@ -830,9 +827,6 @@ impl Qwen35Model {
     /// Iterates 0..`padded_bs`. Real requests are in 0..real_bs; padding slots
     /// (real_bs..padded_bs) run but their output columns are ignored by the caller.
     /// All GPU addresses are stable per slot index, making this CUDA Graph safe.
-    ///
-    /// `out_proj` is column-sharded, so its partial hidden sum is the one
-    /// linear-attention output all-reduced under TP (no-op at world_size 1).
     fn batch_decode_linear_attention_slots(
         &self,
         attn: &LinearAttentionLayer,

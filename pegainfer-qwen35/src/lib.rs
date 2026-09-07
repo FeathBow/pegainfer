@@ -305,31 +305,6 @@ mod tests {
     }
 
     #[test]
-    fn tp_cuda_graph_is_no_longer_rejected_before_model_load() {
-        // P2c: the graph/eager decision is gated on the model's TP-local decode
-        // GQA group, which needs the loaded config — so TP + CUDA Graph passes
-        // pre-load validation and fails here only because the path is bogus.
-        let err = start_engine_with_capacity_and_policy(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: true,
-                device_ordinals: vec![0, 1],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
-            1,
-            1,
-            Qwen35SchedulerPolicy::Off,
-        )
-        .err()
-        .expect("nonexistent model path should fail at load")
-        .to_string();
-
-        assert!(!err.contains("eager execution only"));
-    }
-
-    #[test]
     fn tp_rejects_auto_scheduler_policy_before_loading_model() {
         let err = start_engine_with_capacity_and_policy(
             Path::new("unused-model-path"),

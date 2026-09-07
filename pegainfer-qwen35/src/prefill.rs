@@ -436,8 +436,6 @@ impl Qwen35Model {
         Ok(projected)
     }
 
-    /// `out_proj` is column-sharded, so its partial hidden sum is the one
-    /// linear-attention output all-reduced under TP (no-op at world_size 1).
     fn prefill_linear_attention(
         &self,
         attn: &LinearAttentionLayer,
@@ -501,7 +499,7 @@ impl Qwen35Model {
 
         *linear_idx += 1;
 
-        // Output projection (batched), then all-reduce the partial hidden sum.
+        // Output projection (batched)
         let mut projected = ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)?;
         self.all_reduce_hidden(&mut projected)?;
         Ok(projected)

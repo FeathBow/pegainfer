@@ -7,10 +7,11 @@
 //! The Qwen3.5 fixture is produced through HF's incremental `past_key_values`
 //! path so the oracle matches pegainfer's prefill + decode shape.
 //!
-//! Qwen3.5 currently has no eager batched decode path; decode goes through the
-//! CUDA-graph bucketed path. This gate therefore covers sequential bs=1,
-//! bucket-straddling batched graph passes, and slot compaction after a request
-//! is dropped mid-replay.
+//! Single-GPU decode goes through the CUDA-graph bucketed path; under TP it is
+//! one batched eager step per rank, or pre-captured graphs when the decode GQA
+//! group has a compiled kernel. This gate covers sequential bs=1,
+//! bucket-straddling batched passes, slot compaction after a request is
+//! dropped mid-replay, and the TP2 eager and graph variants.
 
 use std::collections::HashMap;
 use std::path::Path;

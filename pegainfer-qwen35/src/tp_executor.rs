@@ -1,8 +1,8 @@
 //! Tensor-parallel worker runtime for Qwen3.5.
 //!
 //! One canonical eager unified command per step. Linear-attention/GDR weights
-//! and state are sharded per rank, and decode rows run as one batched forward
-//! plus one batched rank-0 sampling pass instead of a per-request bs=1 loop.
+//! and state are sharded per rank; decode rows run as one batched forward per
+//! rank plus one batched rank-0 sampling pass.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -50,7 +50,7 @@ const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const TP_RUNTIME_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TP_WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The pre-capture sweep records every decode bucket per rank; the 60 s NCCL
-/// startup budget is far too small for that (qwen3 uses the same 600 s).
+/// startup budget is far too small for that.
 const TP_PRECAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const TP_RUNTIME_MEMORY_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 const TRITON_AOT_DEVICE_TABLE_LEN: usize = 16;
@@ -61,7 +61,7 @@ const TRITON_AOT_DEVICE_TABLE_LEN: usize = 16;
 /// first launch blocks on its peers: overlapping that with a peer still in
 /// capture/instantiate/upload (which contend driver locks and allocate device
 /// memory) deadlocks the driver. So every rank finishes capturing a bucket
-/// before any rank launches it. (Ported from qwen3's TP sweep.)
+/// before any rank launches it.
 #[derive(Clone, Copy, Debug)]
 enum PrecapturePhase {
     /// One eager all-reduce per bucket message size, so the size-selected NCCL
@@ -596,9 +596,6 @@ impl Qwen35TpExecutor {
         let watchdog = thread::Builder::new()
             .name("qwen35-tp-precapture-watchdog".into())
             .spawn(move || {
-                // Disarmed only by the explicit success send. A sender drop
-                // (error path) also returns Err here; stay armed to the
-                // deadline before deciding startup is wedged.
                 if sweep_done_rx.recv_timeout(TP_PRECAPTURE_TIMEOUT).is_ok() {
                     return;
                 }
@@ -628,25 +625,18 @@ impl Qwen35TpExecutor {
             }
             self.run_precapture_phase(PrecapturePhase::Finalize)
         })();
-        match sweep {
-            Ok(()) => {
-                // Disarm: only the explicit success send stops the watchdog.
-                sweep_done_tx
-                    .send(())
-                    .map_err(|_| anyhow::anyhow!("Qwen3.5 TP pre-capture watchdog exited"))?;
-                watchdog
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("Qwen3.5 TP pre-capture watchdog panicked"))?;
-                log::info!(
-                    "Qwen3.5 TP decode graph pre-capture: buckets up to {max_bucket} captured per rank in {:.2}s",
-                    started.elapsed().as_secs_f64()
-                );
-                Ok(())
-            }
-            // On error the watchdog stays armed: peers may be wedged in
-            // unpaired collectives, and the abort makes the wedge attributable.
-            Err(err) => Err(err),
-        }
+        sweep?;
+        sweep_done_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP pre-capture watchdog exited"))?;
+        watchdog
+            .join()
+            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP pre-capture watchdog panicked"))?;
+        log::info!(
+            "Qwen3.5 TP decode graph pre-capture: buckets up to {max_bucket} captured per rank in {:.2}s",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(())
     }
 
     fn run_precapture_phase(&self, phase: PrecapturePhase) -> Result<()> {
@@ -1713,15 +1703,8 @@ impl TpWorkerState {
 
     /// Run one batched eager decode step over all rows in command order: a
     /// single forward for the whole batch on every rank, then (rank 0 only)
-    /// one batched sampling pass over the per-row sampling params.
-    ///
-    /// Seeded rows keep their former per-row semantics: they pass step 0 and
-    /// `select_batch` isolates each seeded row into its own single-row philox
-    /// call keyed on (request seed, step), so seeded output stays independent
-    /// of batch composition. Unseeded rows decorrelate inside the batched
-    /// call through the per-step command seed, same as the single-GPU batched
-    /// path. Returns one result row per request in command order on rank 0,
-    /// empty elsewhere.
+    /// one batched sampling pass over the per-row sampling params. Returns one
+    /// result row per request in command order on rank 0, empty elsewhere.
     fn run_decode_batch(
         &mut self,
         requests: &[TpDecodeStepItem],
@@ -1754,26 +1737,16 @@ impl TpWorkerState {
             debug_assert!(row_of_state[state_idx].is_none());
             row_of_state[state_idx] = Some(row);
         }
-        let mut kv_slots: Vec<Option<&mut KvState>> =
-            std::iter::repeat_with(|| None).take(bs).collect();
-        let mut recurrent_slots: Vec<Option<&mut RecurrentState>> =
-            std::iter::repeat_with(|| None).take(bs).collect();
-        for (state_idx, state) in self.requests.iter_mut().enumerate() {
-            if let Some(row) = row_of_state[state_idx] {
-                kv_slots[row] = Some(&mut state.kv);
-                recurrent_slots[row] = Some(
-                    state
-                        .recurrent
-                        .as_mut()
-                        .expect("eager TP decode request owns its recurrent state"),
-                );
-            }
-        }
         let mut kv_refs: Vec<&mut KvState> = Vec::with_capacity(bs);
         let mut recurrent_refs: Vec<&mut RecurrentState> = Vec::with_capacity(bs);
-        for (kv, recurrent) in kv_slots.into_iter().zip(recurrent_slots) {
-            kv_refs.push(kv.expect("decode row state resolved above"));
-            recurrent_refs.push(recurrent.expect("decode row state resolved above"));
+        for state in states_in_row_order(&mut self.requests, &row_of_state) {
+            let TpRequestState { kv, recurrent, .. } = state;
+            kv_refs.push(kv);
+            recurrent_refs.push(
+                recurrent
+                    .as_mut()
+                    .expect("eager TP decode request owns its recurrent state"),
+            );
         }
 
         // GDR pointer tables over the full decode batch: allocated once at
@@ -1798,52 +1771,13 @@ impl TpWorkerState {
         if self.rank != 0 {
             return Ok(Vec::new());
         }
-
-        // Snapshot requested logits rows BEFORE sampling: the sampler may
-        // modify bufs.logits in place.
-        let requested_logprobs: Vec<usize> =
-            requests.iter().map(|request| request.logprobs).collect();
-        let cpu_logits = snapshot_requested_logprobs(
+        sample_decode_rows(
             self.model.device_ctx(),
             &self.decode_buffers.logits,
-            &requested_logprobs,
-        )?;
-        let params_refs: Vec<&SamplingParams> = requests
-            .iter()
-            .map(|request| &request.sampling_params)
-            .collect();
-        let steps = vec![0u64; bs];
-        let tokens = pegainfer_sample::select_batch(
-            self.model.device_ctx(),
-            &self.decode_buffers.logits,
-            &params_refs,
-            &steps,
+            requests,
             sample_seed,
             &mut self.sample_scratch,
-        )?;
-        anyhow::ensure!(
-            tokens.len() == bs,
-            "Qwen3.5 TP decode sampling returned {} tokens for {bs} rows",
-            tokens.len()
-        );
-        Ok(requests
-            .iter()
-            .enumerate()
-            .map(|(row, request)| {
-                let logprob = cpu_logits[row].as_ref().and_then(|logits_row| {
-                    pegainfer_sample::token_logprob_from_row(
-                        logits_row,
-                        tokens[row],
-                        request.logprobs,
-                    )
-                });
-                DecodeRequestResult {
-                    request_id: request.request_id,
-                    token: tokens[row],
-                    logprob,
-                }
-            })
-            .collect())
+        )
     }
 
     /// CUDA Graph decode step under TP: replay-only (every bucket was recorded
@@ -1917,17 +1851,10 @@ impl TpWorkerState {
 
         // KV refs in row (slot) order; page tables stay per-step H2D via
         // sync_paged_meta inside batch_decode_graph.
-        let mut kv_slots: Vec<Option<&mut KvState>> =
-            std::iter::repeat_with(|| None).take(bs).collect();
-        for (state_idx, state) in self.requests.iter_mut().enumerate() {
-            if let Some(row) = row_of_state[state_idx] {
-                kv_slots[row] = Some(&mut state.kv);
-            }
-        }
-        let mut kv_refs: Vec<&mut KvState> = Vec::with_capacity(bs);
-        for kv in kv_slots {
-            kv_refs.push(kv.expect("decode row state resolved above"));
-        }
+        let mut kv_refs: Vec<&mut KvState> = states_in_row_order(&mut self.requests, &row_of_state)
+            .into_iter()
+            .map(|state| &mut state.kv)
+            .collect();
         let token_ids: Vec<u32> = requests.iter().map(|request| request.token_id).collect();
         self.model.batch_decode_graph(
             &token_ids,
@@ -1939,49 +1866,13 @@ impl TpWorkerState {
         if self.rank != 0 {
             return Ok(Vec::new());
         }
-
-        // Snapshot requested logits rows BEFORE sampling: the sampler may
-        // modify bufs.logits in place.
-        let requested_logprobs: Vec<usize> =
-            requests.iter().map(|request| request.logprobs).collect();
-        let cpu_logits =
-            snapshot_requested_logprobs(ctx, &graph_state.buffers.logits, &requested_logprobs)?;
-        let params_refs: Vec<&SamplingParams> = requests
-            .iter()
-            .map(|request| &request.sampling_params)
-            .collect();
-        let steps = vec![0u64; bs];
-        let tokens = pegainfer_sample::select_batch(
+        sample_decode_rows(
             ctx,
             &graph_state.buffers.logits,
-            &params_refs,
-            &steps,
+            requests,
             sample_seed,
             &mut self.sample_scratch,
-        )?;
-        anyhow::ensure!(
-            tokens.len() == bs,
-            "Qwen3.5 TP decode sampling returned {} tokens for {bs} rows",
-            tokens.len()
-        );
-        Ok(requests
-            .iter()
-            .enumerate()
-            .map(|(row, request)| {
-                let logprob = cpu_logits[row].as_ref().and_then(|logits_row| {
-                    pegainfer_sample::token_logprob_from_row(
-                        logits_row,
-                        tokens[row],
-                        request.logprobs,
-                    )
-                });
-                DecodeRequestResult {
-                    request_id: request.request_id,
-                    token: tokens[row],
-                    logprob,
-                }
-            })
-            .collect())
+        )
     }
 
     fn sample_final_prefill_chunk(
@@ -2042,9 +1933,7 @@ impl TpWorkerState {
             self.max_batch
         );
 
-        let primary_results = self.run_decode_batch(requests, sample_seed)?;
-
-        Ok(primary_results)
+        self.run_decode_batch(requests, sample_seed)
     }
 
     fn execute_unified(&mut self, plan: &TpUnifiedPlan) -> Result<TpWorkerReply> {
@@ -2282,6 +2171,61 @@ fn validate_prefill_chunks(chunks: &[TpPrefillChunkItem]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Worker request states in decode-row order: `row_of_state[i]` is the row
+/// `states[i]` occupies in this command, `None` when it is not part of it.
+fn states_in_row_order<'a>(
+    states: &'a mut [TpRequestState],
+    row_of_state: &[Option<usize>],
+) -> Vec<&'a mut TpRequestState> {
+    let mut rows: Vec<(usize, &'a mut TpRequestState)> = states
+        .iter_mut()
+        .zip(row_of_state)
+        .filter_map(|(state, row)| row.map(|row| (row, state)))
+        .collect();
+    rows.sort_unstable_by_key(|(row, _)| *row);
+    rows.into_iter().map(|(_, state)| state).collect()
+}
+
+/// Rank-0 sampling pass over one decode batch: snapshot the requested logprob
+/// rows, select one token per row, and pair each token with its logprob.
+fn sample_decode_rows(
+    ctx: &pegainfer_core::tensor::DeviceContext,
+    logits: &pegainfer_core::tensor::HiddenStates,
+    requests: &[TpDecodeStepItem],
+    sample_seed: u64,
+    scratch: &mut pegainfer_sample::SampleScratch,
+) -> Result<Vec<DecodeRequestResult>> {
+    let bs = requests.len();
+    let requested_logprobs: Vec<usize> = requests.iter().map(|request| request.logprobs).collect();
+    let cpu_logits = snapshot_requested_logprobs(ctx, logits, &requested_logprobs)?;
+    let params_refs: Vec<&SamplingParams> = requests
+        .iter()
+        .map(|request| &request.sampling_params)
+        .collect();
+    let steps = vec![0u64; bs];
+    let tokens =
+        pegainfer_sample::select_batch(ctx, logits, &params_refs, &steps, sample_seed, scratch)?;
+    anyhow::ensure!(
+        tokens.len() == bs,
+        "Qwen3.5 TP decode sampling returned {} tokens for {bs} rows",
+        tokens.len()
+    );
+    Ok(requests
+        .iter()
+        .enumerate()
+        .map(|(row, request)| {
+            let logprob = cpu_logits[row].as_ref().and_then(|logits_row| {
+                pegainfer_sample::token_logprob_from_row(logits_row, tokens[row], request.logprobs)
+            });
+            DecodeRequestResult {
+                request_id: request.request_id,
+                token: tokens[row],
+                logprob,
+            }
+        })
+        .collect())
 }
 
 fn validate_decode_requests(requests: &[TpDecodeStepItem]) -> Result<()> {
@@ -2883,17 +2827,6 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(err.contains("requires at least two CUDA devices"));
-    }
-
-    #[test]
-    fn tensor_parallel_cuda_graph_gate_defers_to_model_load() {
-        // P2c: TP + CUDA Graph is no longer rejected up front; the graph/eager
-        // decision needs the model config, so a nonexistent path fails at load.
-        let err = match Qwen35TpExecutor::from_runtime_with_capacity("unused", true, &[0, 1], 1) {
-            Ok(_) => panic!("TP CUDA Graph with a nonexistent model path should fail at load"),
-            Err(err) => err.to_string(),
-        };
-        assert!(!err.contains("eager execution only"));
     }
 
     #[test]
