@@ -765,6 +765,26 @@ pub fn load_tensor_2d(
     DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
 }
 
+fn tensor_2d_dims(
+    tensor: &safetensors::tensor::TensorView<'_>,
+    name: &str,
+) -> Result<(usize, usize)> {
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 2,
+        "Tensor '{name}' expected 2D, got shape {shape:?}"
+    );
+    Ok((shape[0], shape[1]))
+}
+
+fn check_row_range(name: &str, row_offset: usize, rows: usize, total_rows: usize) -> Result<()> {
+    anyhow::ensure!(
+        row_offset + rows <= total_rows,
+        "2D row range out of bounds for '{name}': row_offset={row_offset} rows={rows} total_rows={total_rows}"
+    );
+    Ok(())
+}
+
 pub fn load_tensor_2d_row_shard(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -774,25 +794,8 @@ pub fn load_tensor_2d_row_shard(
     rows: usize,
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
-    let shape = tensor.shape();
-    if shape.len() != 2 {
-        return Err(anyhow::anyhow!(
-            "Tensor '{}' expected 2D, got shape {:?}",
-            name,
-            shape
-        ));
-    }
-    let total_rows = shape[0];
-    let cols = shape[1];
-    if row_offset + rows > total_rows {
-        return Err(anyhow::anyhow!(
-            "2D row shard out of bounds for '{}': row_offset={} rows={} total_rows={}",
-            name,
-            row_offset,
-            rows,
-            total_rows
-        ));
-    }
+    let (total_rows, cols) = tensor_2d_dims(&tensor, name)?;
+    check_row_range(name, row_offset, rows, total_rows)?;
     let elems = tensor_bf16_cow(&tensor, name)?;
     let start = row_offset * cols;
     let end = (row_offset + rows) * cols;
@@ -824,16 +827,7 @@ pub fn load_tensor_2d_col_shard(
     cols: usize,
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
-    let shape = tensor.shape();
-    if shape.len() != 2 {
-        return Err(anyhow::anyhow!(
-            "Tensor '{}' expected 2D, got shape {:?}",
-            name,
-            shape
-        ));
-    }
-    let rows = shape[0];
-    let total_cols = shape[1];
+    let (rows, total_cols) = tensor_2d_dims(&tensor, name)?;
     if col_offset + cols > total_cols {
         return Err(anyhow::anyhow!(
             "2D col shard out of bounds for '{}': col_offset={} cols={} total_cols={}",
@@ -858,27 +852,10 @@ pub fn load_tensor_2d_row_stitch(
     ranges: &[(usize, usize)],
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
-    let shape = tensor.shape();
-    if shape.len() != 2 {
-        return Err(anyhow::anyhow!(
-            "Tensor '{}' expected 2D, got shape {:?}",
-            name,
-            shape
-        ));
-    }
-    let total_rows = shape[0];
-    let cols = shape[1];
+    let (total_rows, cols) = tensor_2d_dims(&tensor, name)?;
     let mut total = 0usize;
     for &(row_offset, rows) in ranges {
-        if row_offset + rows > total_rows {
-            return Err(anyhow::anyhow!(
-                "2D row stitch out of bounds for '{}': row_offset={} rows={} total_rows={}",
-                name,
-                row_offset,
-                rows,
-                total_rows
-            ));
-        }
+        check_row_range(name, row_offset, rows, total_rows)?;
         total += rows;
     }
     let elems = tensor_bf16_cow(&tensor, name)?;
@@ -921,18 +898,6 @@ pub fn load_tensor_1d_stitch(
     DeviceVec::from_host(ctx, &host)
 }
 
-/// Load a 1D BF16 element range to GPU (tensor-parallel shard of a 1D weight).
-pub fn load_tensor_1d_shard(
-    ctx: &DeviceContext,
-    shards: &[SafeTensors],
-    weight_map: &HashMap<String, usize>,
-    name: &str,
-    offset: usize,
-    len: usize,
-) -> Result<DeviceVec> {
-    load_tensor_1d_stitch(ctx, shards, weight_map, name, &[(offset, len)])
-}
-
 /// Load a 1D F32 element range to GPU (tensor-parallel shard of a 1D weight).
 pub fn load_tensor_1d_f32_shard(
     ctx: &DeviceContext,
@@ -953,11 +918,7 @@ pub fn load_tensor_1d_f32_shard(
             elems.len()
         ));
     }
-    let gpu_data = ctx
-        .stream
-        .clone_htod(&elems[offset..offset + len])
-        .map_err(|e| anyhow::anyhow!("H2D copy failed for '{}': {}", name, e))?;
-    Ok(gpu_data)
+    upload_f32(ctx, name, &elems[offset..offset + len])
 }
 
 /// Load a 1D F32 tensor to GPU as CudaSlice<f32>.
@@ -970,11 +931,13 @@ pub fn load_tensor_1d_f32(
 ) -> Result<CudaSlice<f32>> {
     let tensor = find_tensor(shards, weight_map, name)?;
     let elems = tensor_f32_cow(&tensor, name)?;
-    let gpu_data = ctx
-        .stream
-        .clone_htod(elems.as_ref())
-        .map_err(|e| anyhow::anyhow!("H2D copy failed for '{}': {}", name, e))?;
-    Ok(gpu_data)
+    upload_f32(ctx, name, elems.as_ref())
+}
+
+fn upload_f32(ctx: &DeviceContext, name: &str, host: &[f32]) -> Result<CudaSlice<f32>> {
+    ctx.stream
+        .clone_htod(host)
+        .map_err(|e| anyhow::anyhow!("H2D copy failed for '{name}': {e}"))
 }
 
 /// Load a 1D I64 tensor into a host `Vec<i64>`.

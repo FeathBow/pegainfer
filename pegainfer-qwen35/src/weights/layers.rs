@@ -4,7 +4,6 @@
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_1d_f32;
 use pegainfer_core::weight_loader::load_tensor_1d_f32_shard;
-use pegainfer_core::weight_loader::load_tensor_1d_shard;
 use pegainfer_core::weight_loader::load_tensor_1d_stitch;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::load_tensor_2d_col_shard;
@@ -30,9 +29,8 @@ pub(crate) struct FullAttentionLayer {
 
 /// Linear attention layer weights (24 layers in Qwen3.5-4B).
 pub(crate) struct LinearAttentionLayer {
-    /// Fused QKV projection: [local_linear_qkv_dim, hidden_size] — rows keep
-    /// the global [q | k | v] segment layout, with each segment restricted to
-    /// this rank's head-local slice (see `linear_qkv_shard_segments`).
+    /// Fused QKV projection: [local_linear_qkv_dim, hidden_size]; row layout
+    /// in `linear_qkv_shard_segments`.
     pub(crate) in_proj_qkv: DeviceMatrix,
     /// Z projection (for output gating): [local_linear_z_dim, hidden_size]
     pub(crate) in_proj_z: DeviceMatrix,
@@ -147,9 +145,6 @@ impl FullAttentionLayer {
 }
 
 impl LinearAttentionLayer {
-    /// Phase 2b: shard linear attention over TP ranks. The value-head unit
-    /// drives z/b/a/dt_bias/A_log rows; the fused qkv weight and its conv need
-    /// per-segment head-local stitching.
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
         Ok(Self {
             in_proj_qkv: src.linear_in_proj_qkv(&format!("{prefix}.in_proj_qkv.weight"))?,
@@ -170,11 +165,7 @@ impl LinearAttentionLayer {
                 &format!("{prefix}.A_log"),
                 src.linear_value_heads,
             )?,
-            // Gated RMSNorm weight is per value-head dim (128) and shared by
-            // every head: replicated, never sharded.
             norm_weight: src.tensor_1d_f32(&format!("{prefix}.norm.weight"))?,
-            // Row-parallel out_proj: shard input columns to the local z dim;
-            // the layer all-reduces the partial sum.
             out_proj: src
                 .col_shard_if_needed(&format!("{prefix}.out_proj.weight"), src.linear_z)?,
         })
@@ -287,7 +278,13 @@ impl<'a> WeightSource<'a> {
         (offset, len): (usize, usize),
     ) -> Result<DeviceVec> {
         if self.geometry.is_sharded() {
-            load_tensor_1d_shard(self.ctx, self.shards, self.weight_map, name, offset, len)
+            load_tensor_1d_stitch(
+                self.ctx,
+                self.shards,
+                self.weight_map,
+                name,
+                &[(offset, len)],
+            )
         } else {
             self.tensor_1d(name)
         }
@@ -452,14 +449,6 @@ mod tests {
             assert_eq!(r0.1, r1.1);
             assert_eq!(r1.0, r0.0 + r0.1);
         }
-    }
-
-    #[test]
-    fn linear_conv1d_shard_segments_scale_by_kernel_dim() {
-        let config = test_config();
-        let rank1 = linear_conv1d_shard_segments(&config, test_geometry(1, 2));
-        // conv1d.weight is [qkv * 4]: same ranges as qkv, scaled by 4.
-        assert_eq!(rank1, [(4096, 4096), (12288, 4096), (24576, 8192)]);
     }
 
     #[test]
