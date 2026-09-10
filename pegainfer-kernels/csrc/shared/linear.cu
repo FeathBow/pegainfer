@@ -2,10 +2,17 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <map>
 #include <mutex>
 
@@ -179,6 +186,147 @@ static cublasStatus_t lt_plan_create(LtGemmPlan &plan, int M, int N, int K) {
     return status;
   }
   return cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, M, N, M);
+}
+
+// The table above dies with the process, so every start re-searches shapes whose
+// winner was already known here. This carries winners across processes. It is a
+// cache and never a source of truth: every failure below falls back to the
+// online search, changing start-up time and never a result.
+//
+// Off unless PEGAINFER_GEMM_LT_CACHE names a file.
+static const char *lt_store_path() {
+  static const char *cached = [] {
+    const char *s = std::getenv("PEGAINFER_GEMM_LT_CACHE");
+    return (s != nullptr && *s != '\0') ? s : nullptr;
+  }();
+  return cached;
+}
+
+// A stored winner only means anything under the conditions that produced it, and
+// the device ordinal the in-process key uses is not one of them — ordinal 0 on
+// another machine is other hardware. So the on-disk key carries what actually
+// decides the ranking, plus the runtime, driver and library versions, because
+// cublasLtMatmulAlgo_t is opaque and is not promised to survive a version change.
+static bool lt_store_key(int device, int M, int N, int K, std::string &out) {
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+    return false;
+  }
+  int runtime = 0;
+  if (cudaRuntimeGetVersion(&runtime) != cudaSuccess) {
+    return false;
+  }
+  // Reports the CUDA level the installed driver supports, not its build number,
+  // so a driver update that keeps the same level is not distinguished here.
+  int driver = 0;
+  if (cudaDriverGetVersion(&driver) != cudaSuccess) {
+    return false;
+  }
+  std::string name(prop.name);
+  for (char &c : name) {
+    if (c == ' ') {
+      c = '_';
+    }
+  }
+  char buf[512];
+  // dtype and layout are constants of this translation unit; recorded anyway so
+  // a future width cannot silently adopt a bf16 winner.
+  const int n = std::snprintf(buf, sizeof(buf), "%s %d.%d %d %d %d %zu %d %d %d bf16 TN %zu",
+                              name.c_str(), prop.major, prop.minor, prop.multiProcessorCount,
+                              runtime, driver, cublasLtGetVersion(), M, N, K, LT_WORKSPACE_SIZE);
+  if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) {
+    return false;
+  }
+  out.assign(buf);
+  return true;
+}
+
+// 8 words of 16 hex digits, 7 separators, terminator.
+static const size_t LT_ALGO_HEX_CAP = 8 * 16 + 7 + 1;
+
+static bool lt_algo_encode(const cublasLtMatmulAlgo_t &algo, char *out, size_t cap) {
+  size_t off = 0;
+  for (int i = 0; i < 8; ++i) {
+    const int n = std::snprintf(out + off, cap - off, i == 0 ? "%016llx" : " %016llx",
+                                static_cast<unsigned long long>(algo.data[i]));
+    if (n <= 0 || static_cast<size_t>(n) >= cap - off) {
+      return false;
+    }
+    off += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+static bool lt_algo_decode(const char *text, cublasLtMatmulAlgo_t &algo) {
+  unsigned long long v[8];
+  if (std::sscanf(text, "%llx %llx %llx %llx %llx %llx %llx %llx", &v[0], &v[1], &v[2], &v[3],
+                  &v[4], &v[5], &v[6], &v[7]) != 8) {
+    return false;
+  }
+  for (int i = 0; i < 8; ++i) {
+    algo.data[i] = static_cast<uint64_t>(v[i]);
+  }
+  return true;
+}
+
+// Later entries override earlier ones, which is what makes the append-only write
+// below safe: a re-tune adds a line rather than rewriting the file.
+static bool lt_store_lookup(const char *path, const std::string &key,
+                            cublasLtMatmulAlgo_t &algo) {
+  std::FILE *f = std::fopen(path, "r");
+  if (f == nullptr) {
+    return false;
+  }
+  const std::string prefix = "v1 " + key + " ";
+  char line[1024];
+  bool found = false;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::strncmp(line, prefix.c_str(), prefix.size()) != 0) {
+      continue;
+    }
+    cublasLtMatmulAlgo_t candidate{};
+    if (lt_algo_decode(line + prefix.size(), candidate)) {
+      algo = candidate;
+      found = true;
+    }
+  }
+  std::fclose(f);
+  return found;
+}
+
+static void lt_store_append(const char *path, const std::string &key,
+                            const cublasLtMatmulAlgo_t &algo) {
+  char hex[LT_ALGO_HEX_CAP];
+  if (!lt_algo_encode(algo, hex, sizeof(hex))) {
+    return;
+  }
+  char line[1024];
+  const int n = std::snprintf(line, sizeof(line), "v1 %s %s\n", key.c_str(), hex);
+  if (n <= 0 || static_cast<size_t>(n) >= sizeof(line)) {
+    return;
+  }
+  // O_APPEND with one write of a line far under PIPE_BUF: concurrent writers
+  // interleave whole lines instead of tearing one, so this needs no lock and no
+  // rewrite, and a crash cannot leave half a file. Both failures below lose an
+  // entry, which the next tune writes again.
+  const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (fd < 0) {
+    return;
+  }
+  const ssize_t written = ::write(fd, line, static_cast<size_t>(n));
+  (void)written;
+  ::close(fd);
+}
+
+// A matching key is not enough. The stored bytes are an opaque struct another
+// process wrote; ask cublasLt whether they still describe something runnable
+// against these descriptors, and whether it fits the workspace we will hand it.
+static bool lt_algo_usable(const LtGemmPlan &plan, const cublasLtMatmulAlgo_t &algo) {
+  cublasLtMatmulHeuristicResult_t result{};
+  const cublasStatus_t status = cublasLtMatmulAlgoCheck(g_lt_handle, plan.op, plan.a, plan.b,
+                                                        plan.c, plan.c, &algo, &result);
+  return status == CUBLAS_STATUS_SUCCESS && result.state == CUBLAS_STATUS_SUCCESS &&
+         result.workspaceSize <= LT_WORKSPACE_SIZE;
 }
 
 // Repeats a tuning pass spends on one candidate. Timing noise is roughly a fixed
@@ -542,6 +690,39 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     }
   } claim{shared_key};
 
+  // A winner an earlier process on this machine already paid for, if the store
+  // has one that still checks out. Publishing follows the same path the search
+  // would, so the in-process table and every waiter see one behaviour.
+  const char *const store_path = lt_store_path();
+  std::string store_key;
+  const bool store_keyed = store_path != nullptr && lt_store_key(device, M, N, K, store_key);
+  if (store_keyed) {
+    cublasLtMatmulAlgo_t stored{};
+    if (lt_store_lookup(store_path, store_key, stored)) {
+      LtGemmPlan reused;
+      if (lt_plan_create(reused, M, N, K) == CUBLAS_STATUS_SUCCESS &&
+          lt_algo_usable(reused, stored)) {
+        reused.algo = stored;
+        {
+          std::lock_guard<std::mutex> lock(g_lt_tuned_mu);
+          g_lt_tuned_algos[shared_key] = LtTunedEntry{true, stored};
+        }
+        g_lt_tuned_cv.notify_all();
+        claim.published = true;
+        g_lt_plans.emplace(key, reused);
+        return static_cast<int>(cudaSuccess);
+      }
+      // The one store outcome worth saying out loud: a key that matches but no
+      // longer applies is a library or driver change under a file written before
+      // it, and staying silent would make a whole stale file look like a miss.
+      std::fprintf(stderr,
+                   "gemm_lt_tune: stored algo rejected for [%s]; retuning "
+                   "(cublasLt or driver moved under this cache?)\n",
+                   store_key.c_str());
+      lt_plan_destroy(reused);
+    }
+  }
+
   LtGemmPlan plan;
   cublasStatus_t status = lt_plan_create(plan, M, N, K);
   cublasLtMatmulHeuristicResult_t results[16];
@@ -639,6 +820,9 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   }
   g_lt_tuned_cv.notify_all();
   claim.published = true;
+  if (store_keyed) {
+    lt_store_append(store_path, store_key, plan.algo);
+  }
   g_lt_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
 }
