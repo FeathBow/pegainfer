@@ -329,6 +329,44 @@ static bool lt_algo_usable(const LtGemmPlan &plan, const cublasLtMatmulAlgo_t &a
          result.workspaceSize <= LT_WORKSPACE_SIZE;
 }
 
+// One launch before an algo is published. `gemm_lt_cuda` says the tuned kernel has
+// already executed and CUDA Graph capture leans on that; the search path gets it from
+// its timing loop, while an algo adopted from the store has never run in this process.
+static bool lt_algo_warm(const LtGemmPlan &plan, const __nv_bfloat16 *W, int M, int N, int K,
+                         cudaStream_t stream) {
+  __nv_bfloat16 *x = nullptr;
+  __nv_bfloat16 *y = nullptr;
+  bool ok = cudaMalloc(&x, static_cast<size_t>(K) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  if (ok) {
+    ok = cudaMemset(x, 0, static_cast<size_t>(K) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  }
+  if (ok) {
+    ok = cudaMalloc(&y, static_cast<size_t>(M) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  }
+  if (ok) {
+    const float h_alpha = 1.0f;
+    const float h_beta = 0.0f;
+    ok = cublasLtMatmul(g_lt_handle, plan.op, &h_alpha,
+                        W, plan.a,
+                        x, plan.b,
+                        &h_beta,
+                        y, plan.c,
+                        y, plan.c,
+                        &plan.algo, g_lt_workspace, LT_WORKSPACE_SIZE,
+                        stream) == CUBLAS_STATUS_SUCCESS;
+  }
+  if (ok) {
+    ok = cudaStreamSynchronize(stream) == cudaSuccess;
+  }
+  if (x != nullptr) {
+    cudaFree(x);
+  }
+  if (y != nullptr) {
+    cudaFree(y);
+  }
+  return ok;
+}
+
 // Repeats a tuning pass spends on one candidate. Timing noise is roughly a fixed
 // cost per launch, so a GEMM reading more weight bytes settles into a stable
 // ranking in fewer repeats.
@@ -700,9 +738,13 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     cublasLtMatmulAlgo_t stored{};
     if (lt_store_lookup(store_path, store_key, stored)) {
       LtGemmPlan reused;
+      bool adopted = false;
       if (lt_plan_create(reused, M, N, K) == CUBLAS_STATUS_SUCCESS &&
           lt_algo_usable(reused, stored)) {
         reused.algo = stored;
+        adopted = lt_algo_warm(reused, Ws[0], M, N, K, stream);
+      }
+      if (adopted) {
         {
           std::lock_guard<std::mutex> lock(g_lt_tuned_mu);
           g_lt_tuned_algos[shared_key] = LtTunedEntry{true, stored};
@@ -713,8 +755,9 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
         return static_cast<int>(cudaSuccess);
       }
       // The one store outcome worth saying out loud: a key that matches but no
-      // longer applies is a library or driver change under a file written before
-      // it, and staying silent would make a whole stale file look like a miss.
+      // longer applies — or no longer runs — is a library or driver change under
+      // a file written before it, and staying silent would make a whole stale
+      // file look like a miss.
       std::fprintf(stderr,
                    "gemm_lt_tune: stored algo rejected for [%s]; retuning "
                    "(cublasLt or driver moved under this cache?)\n",
