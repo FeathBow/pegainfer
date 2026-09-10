@@ -188,12 +188,16 @@ static cublasStatus_t lt_plan_create(LtGemmPlan &plan, int M, int N, int K) {
   return cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, M, N, M);
 }
 
-// The table above dies with the process, so every start re-searches shapes whose
-// winner was already known here. This carries winners across processes. It is a
-// cache and never a source of truth: every failure below falls back to the
-// online search, changing start-up time and never a result.
-//
-// Off unless PEGAINFER_GEMM_LT_CACHE names a file.
+// The tuned table above dies with the process, so every start re-searches shapes
+// whose winner was already known here. Behind PEGAINFER_GEMM_LT_CACHE a winner is
+// carried across processes. It is a cache and never a source of truth: every
+// failure below falls back to the online search, changing start-up time and never
+// a result. The record format and the file live in lt_algo_store.cu.
+extern "C" int pegainfer_lt_store_lookup(const char *path, const char *key,
+                                         unsigned long long out[8]);
+extern "C" void pegainfer_lt_store_append(const char *path, const char *key,
+                                          const unsigned long long words[8]);
+
 static const char *lt_store_path() {
   static const char *cached = [] {
     const char *s = std::getenv("PEGAINFER_GEMM_LT_CACHE");
@@ -239,83 +243,6 @@ static bool lt_store_key(int device, int M, int N, int K, std::string &out) {
   }
   out.assign(buf);
   return true;
-}
-
-// 8 words of 16 hex digits, 7 separators, terminator.
-static const size_t LT_ALGO_HEX_CAP = 8 * 16 + 7 + 1;
-
-static bool lt_algo_encode(const cublasLtMatmulAlgo_t &algo, char *out, size_t cap) {
-  size_t off = 0;
-  for (int i = 0; i < 8; ++i) {
-    const int n = std::snprintf(out + off, cap - off, i == 0 ? "%016llx" : " %016llx",
-                                static_cast<unsigned long long>(algo.data[i]));
-    if (n <= 0 || static_cast<size_t>(n) >= cap - off) {
-      return false;
-    }
-    off += static_cast<size_t>(n);
-  }
-  return true;
-}
-
-static bool lt_algo_decode(const char *text, cublasLtMatmulAlgo_t &algo) {
-  unsigned long long v[8];
-  if (std::sscanf(text, "%llx %llx %llx %llx %llx %llx %llx %llx", &v[0], &v[1], &v[2], &v[3],
-                  &v[4], &v[5], &v[6], &v[7]) != 8) {
-    return false;
-  }
-  for (int i = 0; i < 8; ++i) {
-    algo.data[i] = static_cast<uint64_t>(v[i]);
-  }
-  return true;
-}
-
-// Later entries override earlier ones, which is what makes the append-only write
-// below safe: a re-tune adds a line rather than rewriting the file.
-static bool lt_store_lookup(const char *path, const std::string &key,
-                            cublasLtMatmulAlgo_t &algo) {
-  std::FILE *f = std::fopen(path, "r");
-  if (f == nullptr) {
-    return false;
-  }
-  const std::string prefix = "v1 " + key + " ";
-  char line[1024];
-  bool found = false;
-  while (std::fgets(line, sizeof(line), f) != nullptr) {
-    if (std::strncmp(line, prefix.c_str(), prefix.size()) != 0) {
-      continue;
-    }
-    cublasLtMatmulAlgo_t candidate{};
-    if (lt_algo_decode(line + prefix.size(), candidate)) {
-      algo = candidate;
-      found = true;
-    }
-  }
-  std::fclose(f);
-  return found;
-}
-
-static void lt_store_append(const char *path, const std::string &key,
-                            const cublasLtMatmulAlgo_t &algo) {
-  char hex[LT_ALGO_HEX_CAP];
-  if (!lt_algo_encode(algo, hex, sizeof(hex))) {
-    return;
-  }
-  char line[1024];
-  const int n = std::snprintf(line, sizeof(line), "v1 %s %s\n", key.c_str(), hex);
-  if (n <= 0 || static_cast<size_t>(n) >= sizeof(line)) {
-    return;
-  }
-  // O_APPEND with one write of a line far under PIPE_BUF: concurrent writers
-  // interleave whole lines instead of tearing one, so this needs no lock and no
-  // rewrite, and a crash cannot leave half a file. Both failures below lose an
-  // entry, which the next tune writes again.
-  const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-  if (fd < 0) {
-    return;
-  }
-  const ssize_t written = ::write(fd, line, static_cast<size_t>(n));
-  (void)written;
-  ::close(fd);
 }
 
 // A matching key is not enough. The stored bytes are an opaque struct another
@@ -735,8 +662,11 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   std::string store_key;
   const bool store_keyed = store_path != nullptr && lt_store_key(device, M, N, K, store_key);
   if (store_keyed) {
-    cublasLtMatmulAlgo_t stored{};
-    if (lt_store_lookup(store_path, store_key, stored)) {
+    unsigned long long words[8];
+    if (pegainfer_lt_store_lookup(store_path, store_key.c_str(), words) == 1) {
+      cublasLtMatmulAlgo_t stored{};
+      static_assert(sizeof(stored.data) == sizeof(words), "algo blob is eight 64-bit words");
+      std::memcpy(&stored.data, words, sizeof(words));
       LtGemmPlan reused;
       bool adopted = false;
       if (lt_plan_create(reused, M, N, K) == CUBLAS_STATUS_SUCCESS &&
@@ -864,7 +794,9 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   g_lt_tuned_cv.notify_all();
   claim.published = true;
   if (store_keyed) {
-    lt_store_append(store_path, store_key, plan.algo);
+    unsigned long long words[8];
+    std::memcpy(words, &plan.algo.data, sizeof(words));
+    pegainfer_lt_store_append(store_path, store_key.c_str(), words);
   }
   g_lt_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
