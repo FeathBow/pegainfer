@@ -181,13 +181,15 @@ def run_case(model, text_model, cuts, tokens, device):
     handles = []
 
     def record(kind, target):
+        # On the host: `--device auto` can leave the probes on different
+        # GPUs, which the stack below refuses.
         def pre(_mod, args, kwargs):
             hidden = args[0] if args else kwargs["hidden_states"]
-            captured[(kind, target)] = hidden.detach().clone()
+            captured[(kind, target)] = hidden.detach().to("cpu", copy=True)
 
         def post(_mod, _args, _kwargs, out):
             hidden = out[0] if isinstance(out, tuple) else out
-            captured[(kind, target)] = hidden.detach().clone()
+            captured[(kind, target)] = hidden.detach().to("cpu", copy=True)
 
         module = text_model.norm if target == FINAL_NORM else text_model.layers[target]
         if kind == "in":
