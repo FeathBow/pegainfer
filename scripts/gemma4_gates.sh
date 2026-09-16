@@ -80,6 +80,7 @@ GATES_TILELANG_GLOBAL=(
   "gpu,ckpt,prompts,tlgeom serve::oracle::the_replacement_global_kernel_matches_the_incumbent"
   "gpu,ckpt,prompts,tlgeom serve::oracle::the_replacement_global_decode_matches_the_incumbent"
   "gpu,ckpt,prompts,tlgeom serve::oracle::the_folded_pool_matches_the_split_one"
+  "gpu,ckpt,tlgeom engine::lane_gates_roster::the_full_roster_serves_through_the_generated_kernels"
 )
 # The disagreeing-config gate deliberately fails before any device is opened.
 GATES_LOADER=(

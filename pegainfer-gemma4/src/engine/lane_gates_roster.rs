@@ -131,6 +131,37 @@ fn the_full_roster_keeps_its_pipeline_under_a_queue() {
     harness.shutdown(&[]);
 }
 
+/// The generated states at the slot ceiling. The kernels those states serve
+/// through declare how many requests one plan may name; a step with every
+/// slot held, half of them decoding while the other half's prompts across
+/// the window are admitted, is the step that reaches it.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, a build that carries the generated kernels, a GPU, and --test-threads=1"]
+fn the_full_roster_serves_through_the_generated_kernels() {
+    for knob in ["tilelang", "tilelang640"] {
+        let mut harness = launch(&[
+            (super::DECODE_SLOTS_ENV, "16"),
+            (super::GLOBAL_ATTN_ENV, knob),
+        ]);
+        let first: Vec<_> = (0..8u32)
+            .map(|i| harness.submit(ids(1100 + 3 * i as usize, i + 1), 12))
+            .collect();
+        for request in &first {
+            harness.steps.wait_tokens(request.id(), 2);
+        }
+        let second: Vec<_> = (8..16u32)
+            .map(|i| harness.submit(ids(1100 + 3 * i as usize, i + 1), 12))
+            .collect();
+        for (slot, request) in first.iter().chain(&second).enumerate() {
+            let drained = harness
+                .steps
+                .drain(request.id(), &format!("{knob} slot {slot}"));
+            assert_eq!(drained.tokens, 12, "{knob}: slot {slot} finished short");
+        }
+        harness.shutdown(&[]);
+    }
+}
+
 fn run_refill_episode(harness: &mut Harness, prompt: Vec<u32>, budget: usize) -> Drained {
     let request = harness.submit(prompt, budget);
     harness.steps.drain(request.id(), "refill episode")

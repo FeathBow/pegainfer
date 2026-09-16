@@ -199,9 +199,11 @@ LOCAL_WINDOW = 1024
 
 # The serving arena's maxima, in the units each tensor is indexed in. A step
 # is always smaller; see the module docstring.
-MAX_BATCH = 8
 CEILING = 262144
 SLOTS = 16
+# A step's requests, the prompts being admitted and the rows decoding beside
+# them, each hold a slot, so a prefill plan never names more than the slots.
+MAX_BATCH = SLOTS
 Q_ROWS = CEILING + defs.BLOCK_M
 POOL_PAGES = SLOTS * (CEILING // PAGE_SIZE) + 1
 PAGE_TABLE_LEN = SLOTS * (CEILING // PAGE_SIZE)
