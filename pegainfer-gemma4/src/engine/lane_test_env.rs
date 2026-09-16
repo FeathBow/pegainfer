@@ -18,7 +18,7 @@ impl Drop for EnvGuard {
     }
 }
 
-const SERVING_KNOBS: [&str; 7] = [
+const SERVING_KNOBS: [&str; 8] = [
     super::ASYNC_PREFILL_ENV,
     super::PREFIX_CACHE_ENV,
     super::MIX_CHUNK_TOKENS_ENV,
@@ -26,6 +26,7 @@ const SERVING_KNOBS: [&str; 7] = [
     super::DECODE_SLOTS_ENV,
     super::ADMIT_COALESCE_ENV,
     super::KV_FP8_ENV,
+    super::GLOBAL_ATTN_ENV,
 ];
 
 pub(super) fn scoped_engine_env(overrides: &[(&str, &str)]) -> EnvGuard {

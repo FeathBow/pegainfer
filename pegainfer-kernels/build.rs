@@ -1490,35 +1490,104 @@ fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &
 }
 
 // ===========================================================================
-// k3 tilelang: BEGIN — K3 TileLang decode kernels (AOT).
+// tilelang: BEGIN — TileLang AOT kernel families.
 //
-// Self-contained section: everything the `k3` feature needs to turn
-// `pegainfer-k3/kernels/generate.py` into objects lives between these two
-// markers plus one `cfg!(feature = "k3")` block inside `main`.
+// Self-contained section: everything a model line needs to turn its
+// `generate.py` into objects lives between these two markers plus one
+// `cfg!(feature = ...)` block per family inside `main`. A family is a row in
+// the table below; the tiers, the arch handling and the nvcc flags are shared.
 //
 // Three tiers, first one that works wins:
 //   1. generate — run the generator with a build-host Python that has the
 //      pinned TileLang. Preferred; this is what a dev box and the GPU CI
 //      builders take.
-//   2. pre-generated — `PEGAINFER_K3_TILELANG_PREGEN=<dir>` points at a
+//   2. pre-generated — `PEGAINFER_<label>_TILELANG_PREGEN=<dir>` points at a
 //      directory produced earlier by `generate.py --vendor-includes`, for
 //      hosts that cannot install TileLang. The directory carries its own
 //      `manifest.txt` with the CUDA files and header include paths.
 //   3. stub — no Python, no pre-generated dir: compile launchers that return
 //      `cudaErrorNotSupported`, so a featureless/CI build stays green and a
-//      K3 decode attempt fails loudly instead of silently computing garbage.
+//      call fails loudly instead of silently computing garbage.
 // ===========================================================================
 
-struct K3TileLangArtifacts {
+struct TileLangArtifacts {
     cu_files: Vec<PathBuf>,
     template_include: PathBuf,
     cutlass_include: PathBuf,
+    /// nvcc flags the generator states its bodies were compiled with; leaving
+    /// one out is a silent numerical difference from the gated kernel.
+    nvcc_flags: Vec<String>,
+    /// Entry points the generator says it emitted, as `(name, parameters)`.
+    /// C has no mangling, so a stub whose parameters drifted from the real
+    /// launcher would link and then be called wrongly; these are checked
+    /// against the family's own list instead.
+    launchers: Vec<(String, String)>,
     /// Arch the bodies were lowered for, e.g. `sm_103a`.
     arch: Option<String>,
+    /// The attention geometry the bodies were compiled for. Re-exported, so
+    /// a caller refuses another checkpoint before it loads weights.
+    geometry: Option<String>,
+    /// Dynamic shared memory one block opts into. A device whose per-block
+    /// limit is under it cannot run the bodies at all.
+    smem: Option<String>,
 }
 
-/// `extern "C"` entry points the generator emits; the stub tier has to match
-/// this list exactly or the `k3` feature fails to link.
+/// One model line's TileLang kernels. `label` names the family in warnings,
+/// in its `PEGAINFER_<label>_TILELANG_*` variables and, lowercased, in its
+/// artifact directory and stub file, so a family is this row and nothing else.
+struct TileLangFamily {
+    label: &'static str,
+    /// Generator, relative to the workspace root.
+    generator: &'static str,
+    /// Further inputs the generator reads, for rerun tracking.
+    sources: &'static [&'static str],
+    /// `extern "C"` entry points the generator emits; the stub tier has to
+    /// match this list exactly or the feature fails to link.
+    launchers: &'static [(&'static str, &'static str)],
+    /// Lowest SM the lowering supports; below it the build takes the stub.
+    min_sm: u32,
+    /// Manifest keys the crate re-exports for a run-time refusal. A directory
+    /// that predates one of them would leave that refusal fail-open, so it is
+    /// rejected here rather than skipped.
+    required_manifest: &'static [&'static str],
+}
+
+impl TileLangFamily {
+    /// The `cfg` a caller reads to know real bodies were built, not stubs.
+    fn cfg(&self) -> String {
+        format!("{}_tilelang", self.label.to_lowercase())
+    }
+}
+
+const GEMMA4_TILELANG: TileLangFamily = TileLangFamily {
+    label: "GEMMA4",
+    generator: "pegainfer-gemma4/kernels/generate.py",
+    sources: &["pegainfer-gemma4/kernels/tilelang_defs.py"],
+    launchers: GEMMA4_TILELANG_LAUNCHERS,
+    // The key and query loads lower to TMA, which is Hopper and newer.
+    min_sm: 90,
+    required_manifest: &["ARCH", "GEOMETRY", "SMEM"],
+};
+
+/// The hd512 global-attention prefill: the packed query rows and the output,
+/// the plan's page table, its per-request indptrs and final-page fills, and
+/// the run-time extents and pool geometry. The query indptr arrives twice,
+/// on the device for the body and on the host for the launcher's grid.
+const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[(
+    "gemma4_hd512_prefill_varlen",
+    "const void*, const void*, const int*, const int*, const int*, const int*, \
+     const int*, void*, int, int, int, int, int, int, int, int, float",
+)];
+
+const K3_TILELANG: TileLangFamily = TileLangFamily {
+    label: "K3",
+    generator: "pegainfer-k3/kernels/generate.py",
+    sources: &["pegainfer-k3/kernels/tilelang_defs.py"],
+    launchers: K3_TILELANG_LAUNCHERS,
+    min_sm: 0,
+    required_manifest: &[],
+};
+
 const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     (
         "k3_rms_norm_rbs_batched",
@@ -1568,7 +1637,7 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     ),
 ];
 
-fn probe_k3_tilelang_python(candidate: &str) -> Result<String, String> {
+fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
     let output = Command::new(candidate)
         .args(["-c", "import tilelang"])
         .output()
@@ -1584,16 +1653,19 @@ fn probe_k3_tilelang_python(candidate: &str) -> Result<String, String> {
     }
 }
 
-fn find_k3_tilelang_python() -> Result<String, String> {
-    for var in ["PEGAINFER_K3_TILELANG_PYTHON", "PEGAINFER_TILELANG_PYTHON"] {
-        let Ok(candidate) = std::env::var(var) else {
+fn find_tilelang_python(family: &TileLangFamily) -> Result<String, String> {
+    for var in [
+        format!("PEGAINFER_{}_TILELANG_PYTHON", family.label),
+        "PEGAINFER_TILELANG_PYTHON".to_string(),
+    ] {
+        let Ok(candidate) = std::env::var(&var) else {
             continue;
         };
         let candidate = candidate.trim().to_string();
         if candidate.is_empty() {
             return Err(format!("{var} is set but empty."));
         }
-        return probe_k3_tilelang_python(&candidate).map_err(|message| {
+        return probe_tilelang_python(&candidate).map_err(|message| {
             format!("{var}=`{candidate}` could not import TileLang: {message}")
         });
     }
@@ -1611,7 +1683,7 @@ fn find_k3_tilelang_python() -> Result<String, String> {
     candidates.extend(["python3".to_string(), "python".to_string()]);
 
     for candidate in candidates {
-        match probe_k3_tilelang_python(&candidate) {
+        match probe_tilelang_python(&candidate) {
             Ok(path) => return Ok(path),
             Err(message) => diagnostics.push(message),
         }
@@ -1627,7 +1699,7 @@ fn find_k3_tilelang_python() -> Result<String, String> {
 /// being visible to the build host (containers routinely have none), so the
 /// arch is derived from the same SM list nvcc targets and passed explicitly.
 /// Architectures from Hopper on need the `a` (accelerated) variant.
-fn k3_tilelang_arch(sm_targets: &[String]) -> Option<String> {
+fn tilelang_arch(sm_targets: &[String]) -> Option<String> {
     let max_sm = sm_targets
         .iter()
         .filter_map(|sm| sm_numeric_prefix(sm))
@@ -1648,7 +1720,7 @@ fn k3_tilelang_arch(sm_targets: &[String]) -> Option<String> {
 /// the highest SM only. `None` means this nvcc cannot assemble that arch, and
 /// the caller falls back to the stub tier rather than emitting objects that
 /// would fail to link or run.
-fn k3_tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
+fn tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
     let target = arch.strip_prefix("sm_")?;
     nvcc_accepts_gencode(nvcc, target, target).then(|| {
         vec![
@@ -1661,21 +1733,39 @@ fn k3_tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
 /// Parse the `KEY=VALUE` contract the generator prints on stdout and mirrors
 /// into `manifest.txt`: one `CU_PATH` per emitted translation unit, the two
 /// header roots the generated CUDA includes, and the arch the bodies were
-/// lowered for.
-fn parse_k3_tilelang_manifest(text: &str, origin: &str) -> K3TileLangArtifacts {
+/// lowered for. Paths resolve against `base`, the directory the manifest
+/// describes, so a vendored directory answers for its own files wherever it
+/// was copied; an absolute entry passes through unchanged.
+fn parse_tilelang_manifest(text: &str, origin: &str, base: &Path) -> TileLangArtifacts {
     let mut cu_files = Vec::new();
     let mut template_include = None;
     let mut cutlass_include = None;
     let mut arch = None;
+    let mut geometry = None;
+    let mut smem = None;
+    let mut nvcc_flags = Vec::new();
+    let mut launchers = Vec::new();
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("CU_PATH=") {
-            cu_files.push(PathBuf::from(value.trim()));
+            cu_files.push(base.join(value.trim()));
         } else if let Some(value) = line.strip_prefix("TILELANG_TEMPLATE_PATH=") {
-            template_include = Some(PathBuf::from(value.trim()));
+            template_include = Some(base.join(value.trim()));
         } else if let Some(value) = line.strip_prefix("CUTLASS_INCLUDE_DIR=") {
-            cutlass_include = Some(PathBuf::from(value.trim()));
+            cutlass_include = Some(base.join(value.trim()));
         } else if let Some(value) = line.strip_prefix("ARCH=") {
             arch = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("GEOMETRY=") {
+            geometry = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("SMEM=") {
+            smem = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("NVCC_FLAG=") {
+            nvcc_flags.push(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("LAUNCHER=") {
+            let (name, params) = value
+                .trim()
+                .split_once('|')
+                .unwrap_or_else(|| panic!("{origin} has a LAUNCHER without parameters: {value}"));
+            launchers.push((name.to_string(), params.to_string()));
         }
     }
 
@@ -1692,57 +1782,146 @@ fn parse_k3_tilelang_manifest(text: &str, origin: &str) -> K3TileLangArtifacts {
         );
     }
 
-    K3TileLangArtifacts {
+    TileLangArtifacts {
         cu_files,
         template_include,
         cutlass_include,
+        nvcc_flags,
+        launchers,
         arch,
+        geometry,
+        smem,
     }
 }
 
-fn k3_tilelang_pregen_artifacts() -> Option<K3TileLangArtifacts> {
-    let dir = std::env::var("PEGAINFER_K3_TILELANG_PREGEN").ok()?;
+/// Compare two C parameter lists ignoring how they were wrapped.
+fn same_parameters(left: &str, right: &str) -> bool {
+    let normalize = |text: &str| {
+        text.split(',')
+            .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+    };
+    normalize(left) == normalize(right)
+}
+
+/// The generated entry points have to be exactly the ones the stub tier
+/// declares, or the two tiers present different ABIs under one name.
+fn checked_launchers(family: &TileLangFamily, artifacts: &TileLangArtifacts) {
+    if artifacts.launchers.is_empty() {
+        return;
+    }
+    let expected: Vec<_> = family.launchers.iter().map(|(name, _)| *name).collect();
+    let got: Vec<_> = artifacts
+        .launchers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        expected, got,
+        "the {} TileLang generator emits {got:?} where the stub tier declares {expected:?}",
+        family.label
+    );
+    for ((name, declared), (_, generated)) in family.launchers.iter().zip(&artifacts.launchers) {
+        assert!(
+            same_parameters(declared, generated),
+            "{}: the stub declares `{name}({declared})` where the generator \
+             emits `{name}({generated})`",
+            family.label
+        );
+    }
+}
+
+/// The manifest keys the crate turns into run-time refusals have to be there
+/// and parse. A directory generated before one of them exists would otherwise
+/// build, report its bodies as real, and refuse nothing.
+fn checked_manifest_fields(family: &TileLangFamily, artifacts: &TileLangArtifacts) {
+    for key in family.required_manifest {
+        let value = match *key {
+            "ARCH" => artifacts.arch.as_deref(),
+            "GEOMETRY" => artifacts.geometry.as_deref(),
+            "SMEM" => artifacts.smem.as_deref(),
+            other => panic!("{} names an unknown manifest key {other}", family.label),
+        };
+        let ok = match (*key, value) {
+            (_, None | Some("")) => false,
+            ("SMEM", Some(text)) => text.parse::<usize>().is_ok(),
+            ("GEOMETRY", Some(text)) => {
+                text.split(',').count() == 4
+                    && text.split(',').all(|f| f.trim().parse::<usize>().is_ok())
+            }
+            _ => true,
+        };
+        assert!(
+            ok,
+            "the {} TileLang artifacts state {key}={}, which the crate needs to refuse a \
+             device or checkpoint the bodies cannot serve; regenerate the directory with \
+             the current generator",
+            family.label,
+            value.unwrap_or("<missing>")
+        );
+    }
+}
+
+fn tilelang_pregen_artifacts(family: &TileLangFamily) -> Option<TileLangArtifacts> {
+    let var = format!("PEGAINFER_{}_TILELANG_PREGEN", family.label);
+    let dir = std::env::var(&var).ok()?;
     let dir = PathBuf::from(dir.trim());
     let manifest = dir.join("manifest.txt");
     let text = fs::read_to_string(&manifest).unwrap_or_else(|err| {
         panic!(
-            "PEGAINFER_K3_TILELANG_PREGEN={} has no readable manifest.txt: {err}",
+            "{var}={} has no readable manifest.txt: {err}",
             dir.display()
         )
     });
     println!(
-        "cargo:warning=Using pre-generated K3 TileLang CUDA from {}",
+        "cargo:warning=Using pre-generated {} TileLang CUDA from {}",
+        family.label,
         dir.display()
     );
     println!("cargo:rerun-if-changed={}", manifest.display());
-    Some(parse_k3_tilelang_manifest(
+    Some(parse_tilelang_manifest(
         &text,
-        "PEGAINFER_K3_TILELANG_PREGEN manifest.txt",
+        &format!("{var} manifest.txt"),
+        &dir,
     ))
 }
 
-fn generate_k3_tilelang_artifacts(
+fn generate_tilelang_artifacts(
+    family: &TileLangFamily,
     out_dir: &Path,
     sm_targets: &[String],
-) -> Option<K3TileLangArtifacts> {
-    let python = match find_k3_tilelang_python() {
+) -> Option<TileLangArtifacts> {
+    let label = family.label;
+    let python = match find_tilelang_python(family) {
         Ok(python) => python,
         Err(message) => {
-            println!("cargo:warning=K3 TileLang generation unavailable: {message}");
+            println!("cargo:warning={label} TileLang generation unavailable: {message}");
             return None;
         }
     };
-    let arch = k3_tilelang_arch(sm_targets)?;
+    let arch = tilelang_arch(sm_targets)?;
+    let target_sm = arch
+        .trim_start_matches("sm_")
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .parse::<u32>()
+        .unwrap_or(0);
+    if target_sm < family.min_sm {
+        println!(
+            "cargo:warning={label} TileLang generation needs SM{} or newer; this build targets {arch}, so its launchers are NOT_SUPPORTED stubs",
+            family.min_sm
+        );
+        return None;
+    }
 
-    let generator_path = workspace_root().join("pegainfer-k3/kernels/generate.py");
+    let generator_path = workspace_root().join(family.generator);
     assert!(
         generator_path.exists(),
-        "K3 TileLang generator is missing: {}",
+        "{label} TileLang generator is missing: {}",
         generator_path.display()
     );
 
-    let artifact_dir = out_dir.join("tilelang").join("k3");
-    let output = time_phase("tilelang-gen k3", || {
+    let artifact_dir = out_dir.join("tilelang").join(label.to_lowercase());
+    let output = time_phase(format!("tilelang-gen {}", label.to_lowercase()), || {
         Command::new(&python)
             .arg(&generator_path)
             .arg("--out-dir")
@@ -1750,40 +1929,42 @@ fn generate_k3_tilelang_artifacts(
             .arg("--arch")
             .arg(&arch)
             .output()
-            .unwrap_or_else(|err| panic!("failed to run the K3 TileLang generator: {err}"))
+            .unwrap_or_else(|err| panic!("failed to run the {label} TileLang generator: {err}"))
     });
     assert!(
         output.status.success(),
-        "K3 TileLang generator failed. stdout: {} stderr: {}",
+        "{label} TileLang generator failed. stdout: {} stderr: {}",
         String::from_utf8_lossy(&output.stdout).trim(),
         String::from_utf8_lossy(&output.stderr).trim(),
     );
 
-    let mut artifacts = parse_k3_tilelang_manifest(
+    let mut artifacts = parse_tilelang_manifest(
         &String::from_utf8_lossy(&output.stdout),
-        "the K3 TileLang generator",
+        &format!("the {label} TileLang generator"),
+        &artifact_dir,
     );
     artifacts.arch.get_or_insert(arch.clone());
-    println!("cargo:warning=Generated K3 TileLang CUDA for {arch}");
+    println!("cargo:warning=Generated {label} TileLang CUDA for {arch}");
     println!("cargo:rerun-if-changed={}", generator_path.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        workspace_root()
-            .join("pegainfer-k3/kernels/tilelang_defs.py")
-            .display()
-    );
+    for source in family.sources {
+        println!(
+            "cargo:rerun-if-changed={}",
+            workspace_root().join(source).display()
+        );
+    }
     Some(artifacts)
 }
 
 /// Launchers that refuse every shape, for build hosts with neither TileLang
-/// nor a pre-generated directory. Keeps the `k3` feature linkable; any decode
+/// nor a pre-generated directory. Keeps the family's feature linkable; any
 /// call fails fast with `cudaErrorNotSupported`.
-fn write_k3_tilelang_stub(out_dir: &Path) -> PathBuf {
-    let mut source = String::from(
-        "// Generated by pegainfer-kernels/build.rs: no K3 TileLang artifacts.\n\
-         #include <cuda_runtime.h>\n",
+fn write_tilelang_stub(family: &TileLangFamily, out_dir: &Path) -> PathBuf {
+    let label = family.label;
+    let mut source = format!(
+        "// Generated by pegainfer-kernels/build.rs: no {label} TileLang artifacts.\n\
+         #include <cuda_runtime.h>\n"
     );
-    for (name, params) in K3_TILELANG_LAUNCHERS {
+    for (name, params) in family.launchers {
         writeln!(
             source,
             "extern \"C\" int {name}({params}, cudaStream_t) {{\n  \
@@ -1791,25 +1972,39 @@ fn write_k3_tilelang_stub(out_dir: &Path) -> PathBuf {
         )
         .expect("string write cannot fail");
     }
-    let stub_path = out_dir.join("k3_tilelang_stub.cu");
+    let stub_path = out_dir.join(format!("{}_tilelang_stub.cu", label.to_lowercase()));
     fs::write(&stub_path, source)
-        .unwrap_or_else(|err| panic!("failed to write the K3 TileLang stub: {err}"));
+        .unwrap_or_else(|err| panic!("failed to write the {label} TileLang stub: {err}"));
     stub_path
 }
 
-fn k3_tilelang_nvcc_tasks(
+fn tilelang_nvcc_tasks(
+    family: &TileLangFamily,
     out_dir: &Path,
     cuda_include: &Path,
     arch_args: &[String],
     sm_targets: &[String],
     nvcc: &str,
 ) -> Vec<NvccTask> {
-    println!("cargo:rerun-if-env-changed=PEGAINFER_K3_TILELANG_PYTHON");
-    println!("cargo:rerun-if-env-changed=PEGAINFER_K3_TILELANG_PREGEN");
-    println!("cargo:rerun-if-env-changed=PEGAINFER_K3_TILELANG_JOBS");
+    let label = family.label;
+    for knob in ["PYTHON", "PREGEN", "JOBS"] {
+        println!("cargo:rerun-if-env-changed=PEGAINFER_{label}_TILELANG_{knob}");
+    }
+    // The interpreter search falls back to this one.
+    println!("cargo:rerun-if-env-changed=PEGAINFER_TILELANG_PYTHON");
+    // Which tier ran is a build-time fact with no other way across: the stub
+    // links under the same name, so a caller that needed to know would have
+    // to launch a kernel and read back an error code, after the weights are
+    // loaded. Declared unconditionally, set only when real bodies were built.
+    let cfg = family.cfg();
+    println!("cargo::rustc-check-cfg=cfg({cfg})");
 
-    let artifacts = k3_tilelang_pregen_artifacts()
-        .or_else(|| generate_k3_tilelang_artifacts(out_dir, sm_targets));
+    let artifacts = tilelang_pregen_artifacts(family)
+        .or_else(|| generate_tilelang_artifacts(family, out_dir, sm_targets));
+    if let Some(artifacts) = artifacts.as_ref() {
+        checked_launchers(family, artifacts);
+        checked_manifest_fields(family, artifacts);
+    }
 
     // Generated bodies need the arch they were lowered for; the stub is plain
     // host code and rides the generic arch list.
@@ -1817,29 +2012,48 @@ fn k3_tilelang_nvcc_tasks(
         let arch = artifacts
             .arch
             .clone()
-            .or_else(|| k3_tilelang_arch(sm_targets))
+            .or_else(|| tilelang_arch(sm_targets))
             .unwrap_or_default();
-        let Some(gencode) = k3_tilelang_gencode(&arch, nvcc) else {
+        let Some(gencode) = tilelang_gencode(&arch, nvcc) else {
             println!(
-                "cargo:warning=nvcc cannot assemble {arch}, which the K3 TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
+                "cargo:warning=nvcc cannot assemble {arch}, which the {label} TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
             );
             return None;
         };
         Some((artifacts, gencode))
     });
 
-    let (cu_files, extra_includes, tilelang_arch_args) = match generated {
+    let (cu_files, extra_args, tilelang_arch_args) = match generated {
         Some((artifacts, gencode)) => {
-            let includes = vec![
+            println!("cargo::rustc-cfg={cfg}");
+            // One arch per generation, so a multi-SM build carries SASS for
+            // that one alone and a caller can refuse the other devices.
+            println!(
+                "cargo::rustc-env=PEGAINFER_{label}_TILELANG_ARCH={}",
+                artifacts.arch.clone().unwrap_or_default()
+            );
+            println!(
+                "cargo::rustc-env=PEGAINFER_{label}_TILELANG_GEOMETRY={}",
+                artifacts.geometry.clone().unwrap_or_default()
+            );
+            println!(
+                "cargo::rustc-env=PEGAINFER_{label}_TILELANG_SMEM={}",
+                artifacts.smem.clone().unwrap_or_default()
+            );
+            let mut extra = vec![
                 "-I".to_string(),
                 artifacts.template_include.to_string_lossy().to_string(),
                 "-I".to_string(),
                 artifacts.cutlass_include.to_string_lossy().to_string(),
             ];
-            (artifacts.cu_files, includes, gencode)
+            // The bodies are compiled the way the generator compiled them:
+            // a pass config that reaches nvcc's line changes the numbers,
+            // not just the code.
+            extra.extend(artifacts.nvcc_flags.iter().cloned());
+            (artifacts.cu_files, extra, gencode)
         }
         None => (
-            vec![write_k3_tilelang_stub(out_dir)],
+            vec![write_tilelang_stub(family, out_dir)],
             Vec::new(),
             arch_args.to_vec(),
         ),
@@ -1870,7 +2084,7 @@ fn k3_tilelang_nvcc_tasks(
                 "-Xcudafe".to_string(),
                 "--diag_suppress=177".to_string(),
             ]);
-            args.extend(extra_includes.iter().cloned());
+            args.extend(extra_args.iter().cloned());
             NvccTask {
                 cu_file,
                 obj_file,
@@ -1881,7 +2095,7 @@ fn k3_tilelang_nvcc_tasks(
 }
 
 // ===========================================================================
-// k3 tilelang: END
+// tilelang: END
 // ===========================================================================
 
 fn main() {
@@ -2404,9 +2618,24 @@ fn main() {
         );
     }
 
-    // k3 tilelang: BEGIN
+    // tilelang: BEGIN
+    if cfg!(feature = "gemma4") {
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &GEMMA4_TILELANG,
+            &out_dir,
+            &cuda_include,
+            &arch_args,
+            &sm_targets,
+            &nvcc,
+        ));
+    } else {
+        println!(
+            "cargo:warning=Gemma 4 TileLang kernels disabled; enable the pegainfer-kernels `gemma4` feature to build them"
+        );
+    }
     if cfg!(feature = "k3") {
-        nvcc_tasks.extend(k3_tilelang_nvcc_tasks(
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &K3_TILELANG,
             &out_dir,
             &cuda_include,
             &arch_args,
@@ -2429,7 +2658,7 @@ fn main() {
             "cargo:warning=K3 TileLang kernels disabled; enable the pegainfer-kernels `k3` feature to build them"
         );
     }
-    // k3 tilelang: END
+    // tilelang: END
 
     nvcc_tasks.sort_by_key(|task| nvcc_task_priority(&task.cu_file));
 

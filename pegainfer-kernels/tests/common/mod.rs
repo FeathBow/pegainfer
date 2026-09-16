@@ -32,3 +32,19 @@ pub(crate) fn device_or_skip() -> Option<DeviceContext> {
         }
     }
 }
+
+/// Deterministic junk, distinct per element, so a row read from the wrong
+/// page, layer or head cannot coincide with the right one. Not every binary
+/// that includes this module fills a buffer.
+#[allow(dead_code)]
+pub(crate) fn fill(seed: u64, n: usize) -> Vec<half::bf16> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            half::bf16::from_f32(((state >> 40) as f32 / 8_388_608.0) - 1.0)
+        })
+        .collect()
+}

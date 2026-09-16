@@ -30,13 +30,17 @@ pub struct PrefillPagedPlan {
     batch_indices_d: CudaSlice<i32>,
     positions_d: CudaSlice<i32>,
     q_indptr_d: CudaSlice<i32>,
+    /// The same boundaries the device copy holds, kept because a launcher
+    /// that sizes its own grid needs them on the host and because the batch
+    /// size is this vector's length, not a second thing to keep in step.
+    /// Never empty: a plan with no requests still carries the leading zero.
+    q_indptr_host: Vec<i32>,
     request_indices_d: CudaSlice<i32>,
     qo_tile_indices_d: CudaSlice<i32>,
     kv_tile_indices_d: CudaSlice<i32>,
     kv_chunk_size_d: CudaSlice<i32>,
     total_num_rows_d: CudaSlice<u32>,
     num_tiles: i32,
-    batch_size: i32,
     total_tokens: usize,
     cta_tile_q: i32,
     head_dim: usize,
@@ -117,8 +121,18 @@ impl PrefillPagedPlan {
     pub fn total_num_rows_d(&self) -> &CudaSlice<u32> {
         &self.total_num_rows_d
     }
+    /// Derived, not stored: the boundaries already say how many requests
+    /// there are, and a second field would be one more thing to keep in
+    /// step. Saturating because an empty vector means no requests — the
+    /// pre-allocated state — rather than a wrapped negative.
     pub fn batch_size(&self) -> i32 {
-        self.batch_size
+        self.q_indptr_host.len().saturating_sub(1) as i32
+    }
+
+    /// The query boundaries, on the host. A caller that has to size a launch
+    /// from them reads these rather than deriving the same walk again.
+    pub fn q_indptr_host(&self) -> &[i32] {
+        &self.q_indptr_host
     }
     pub fn num_tiles(&self) -> i32 {
         self.num_tiles
@@ -190,7 +204,8 @@ impl PrefillPagedPlan {
             "invalid prefill CTA tile override {cta_tile_q_override}"
         );
 
-        let q_indptr_d = ctx.stream.clone_htod(&[0i32, seq_len_i32])?;
+        let q_indptr_host = vec![0i32, seq_len_i32];
+        let q_indptr_d = ctx.stream.clone_htod(&q_indptr_host)?;
         let request_indices_d = ctx.stream.clone_htod(&vec![0i32; num_tiles as usize])?;
         let qo_tile_indices: Vec<i32> = (0..num_tiles).collect();
         let qo_tile_indices_d = ctx.stream.clone_htod(&qo_tile_indices)?;
@@ -205,13 +220,13 @@ impl PrefillPagedPlan {
             batch_indices_d,
             positions_d,
             q_indptr_d,
+            q_indptr_host,
             request_indices_d,
             qo_tile_indices_d,
             kv_tile_indices_d,
             kv_chunk_size_d,
             total_num_rows_d,
             num_tiles,
-            batch_size: 1,
             total_tokens: seq_len,
             cta_tile_q,
             head_dim,
@@ -247,26 +262,26 @@ impl PrefillPagedPlan {
 
         let (max_page_index, max_last_page_len) =
             checked_page_metadata(&host.all_page_indices, &host.last_page_lens_i32)?;
-        let batch_size_i32 = crate::ops::checked_i32(host.batch_size, "prefill plan batch_size")?;
         let cta_tile_q_i32 = crate::ops::checked_i32(host.cta_tile_q, "prefill plan cta_tile_q")?;
         let total_rows_u32 =
             crate::ops::checked_u32(host.total_tokens, "prefill plan total_tokens")?;
 
         // Upload all to GPU
+        let q_indptr_host = host.q_indptr.clone();
         Ok(Self {
             page_indices_d: ctx.stream.clone_htod(&host.all_page_indices)?,
             page_indptr_d: ctx.stream.clone_htod(&host.page_indptr)?,
             last_page_len_d: ctx.stream.clone_htod(&host.last_page_lens_i32)?,
             batch_indices_d: ctx.stream.clone_htod(&host.batch_indices)?,
             positions_d: ctx.stream.clone_htod(&host.positions)?,
-            q_indptr_d: ctx.stream.clone_htod(&host.q_indptr)?,
+            q_indptr_d: ctx.stream.clone_htod(&q_indptr_host)?,
+            q_indptr_host,
             request_indices_d: ctx.stream.clone_htod(&host.request_indices_v)?,
             qo_tile_indices_d: ctx.stream.clone_htod(&host.qo_tile_indices_v)?,
             kv_tile_indices_d: ctx.stream.clone_htod(&host.kv_tile_indices_v)?,
             kv_chunk_size_d: ctx.stream.clone_htod(&host.kv_chunk_sizes)?,
             total_num_rows_d: ctx.stream.clone_htod(&[total_rows_u32])?,
             num_tiles: host.num_tiles,
-            batch_size: batch_size_i32,
             total_tokens: host.total_tokens,
             cta_tile_q: cta_tile_q_i32,
             head_dim,
@@ -295,13 +310,13 @@ impl PrefillPagedPlan {
             batch_indices_d: ctx.stream.alloc_zeros(max_total_tokens)?,
             positions_d: ctx.stream.alloc_zeros(max_total_tokens)?,
             q_indptr_d: ctx.stream.alloc_zeros(max_batch + 1)?,
+            q_indptr_host: vec![0i32],
             request_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
             qo_tile_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
             kv_tile_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(max_batch)?,
             total_num_rows_d: ctx.stream.alloc_zeros(1)?,
             num_tiles: 0,
-            batch_size: 0,
             total_tokens: 0,
             cta_tile_q: 0,
             head_dim: 0,
@@ -345,7 +360,6 @@ impl PrefillPagedPlan {
 
         let (max_page_index, max_last_page_len) =
             checked_page_metadata(&host.all_page_indices, &host.last_page_lens_i32)?;
-        let batch_size_i32 = crate::ops::checked_i32(host.batch_size, "prefill plan batch_size")?;
         let cta_tile_q_i32 = crate::ops::checked_i32(host.cta_tile_q, "prefill plan cta_tile_q")?;
         let total_rows_u32 =
             crate::ops::checked_u32(host.total_tokens, "prefill plan total_tokens")?;
@@ -408,8 +422,10 @@ impl PrefillPagedPlan {
             .memcpy_htod(&host.batch_indices, &mut self.batch_indices_d)?;
         ctx.stream
             .memcpy_htod(&host.positions, &mut self.positions_d)?;
+        self.q_indptr_host.clear();
+        self.q_indptr_host.extend_from_slice(&host.q_indptr);
         ctx.stream
-            .memcpy_htod(&host.q_indptr, &mut self.q_indptr_d)?;
+            .memcpy_htod(&self.q_indptr_host, &mut self.q_indptr_d)?;
         ctx.stream
             .memcpy_htod(&host.request_indices_v, &mut self.request_indices_d)?;
         ctx.stream
@@ -422,7 +438,6 @@ impl PrefillPagedPlan {
             .memcpy_htod(&[total_rows_u32], &mut self.total_num_rows_d)?;
 
         self.num_tiles = host.num_tiles;
-        self.batch_size = batch_size_i32;
         self.total_tokens = host.total_tokens;
         self.cta_tile_q = cta_tile_q_i32;
         self.head_dim = head_dim;
@@ -449,7 +464,6 @@ struct BatchPlanHost {
     kv_tile_indices_v: Vec<i32>,
     kv_chunk_sizes: Vec<i32>,
     num_tiles: i32,
-    batch_size: usize,
     total_tokens: usize,
     cta_tile_q: usize,
 }
@@ -570,7 +584,6 @@ impl BatchPlanHost {
             kv_tile_indices_v,
             kv_chunk_sizes,
             num_tiles,
-            batch_size,
             total_tokens,
             cta_tile_q,
         })
@@ -717,7 +730,7 @@ pub fn prefill_attention_paged_into(
             head_dim as i32,
             layout.page_size as i32,
             total_tokens as i32,
-            plan.batch_size,
+            plan.batch_size(),
             plan.num_tiles,
             stride_page,
             sm_scale,
@@ -1721,10 +1734,10 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     let head_dim = layout.head_dim;
     debug_assert_eq!(head_dim, 256);
     anyhow::ensure!(
-        batch_size == plan.total_tokens && batch_size == plan.batch_size as usize,
+        batch_size == plan.total_tokens && batch_size == plan.batch_size() as usize,
         "decode-via-prefill plan shape mismatch: bs={batch_size}, total_tokens={}, plan_batch={}",
         plan.total_tokens,
-        plan.batch_size
+        plan.batch_size()
     );
 
     scatter_decode_kv_into_paged(
@@ -1793,7 +1806,7 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
             head_dim as i32,
             layout.page_size as i32,
             batch_size as i32,
-            plan.batch_size,
+            plan.batch_size(),
             plan.num_tiles,
             stride_page,
             sm_scale,
@@ -2244,7 +2257,7 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
             head_dim as i32,
             layout.page_size as i32,
             plan.total_tokens as i32,
-            plan.batch_size,
+            plan.batch_size(),
             plan.num_tiles,
             stride_page,
             sm_scale,
@@ -2255,7 +2268,7 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
         anyhow::bail!(
             "batch_prefill_paged_cuda_hd512 (decode via prefill) failed for layer {layer}, \
              bs={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}: {result}{}",
-            plan.batch_size,
+            plan.batch_size(),
             plan.num_tiles,
             crate::ops::ffi_exception_message(result)
         );

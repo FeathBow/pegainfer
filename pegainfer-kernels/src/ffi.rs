@@ -10,6 +10,8 @@ mod deepep;
 mod deepseek_v2_lite;
 #[cfg(feature = "gemma4")]
 mod gemma4;
+#[cfg(feature = "gemma4")]
+mod gemma4_tilelang;
 #[cfg(feature = "glm52")]
 mod glm52;
 #[cfg(feature = "k3")]
@@ -27,6 +29,8 @@ pub use deepep::*;
 pub use deepseek_v2_lite::*;
 #[cfg(feature = "gemma4")]
 pub use gemma4::*;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::*;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "k3")]

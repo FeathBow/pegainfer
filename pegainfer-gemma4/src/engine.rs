@@ -32,8 +32,9 @@ use pegainfer_sample::LogprobRequest;
 use pegainfer_sample::SampleScratch;
 
 use crate::forward::MULTIMODAL_PLACEHOLDER_IDS;
+use crate::kv::GLOBAL_PAGE_SIZE;
 use crate::kv::GemmaKv;
-use crate::kv::PAGE_SIZE;
+use crate::kv::LOCAL_PAGE_SIZE;
 use crate::kv::admit_tokens;
 use crate::prefix_cache::PrefixCache;
 use crate::serve::GemmaServe;
@@ -54,6 +55,7 @@ const MAX_CONTEXT_ENV: &str = "PEGAINFER_MAX_CONTEXT";
 const DECODE_SLOTS_ENV: &str = "PEGAINFER_DECODE_SLOTS";
 const KV_FP8_ENV: &str = "PEGAINFER_KV_FP8";
 const ADMIT_COALESCE_ENV: &str = "PEGAINFER_ADMIT_COALESCE_MS";
+const GLOBAL_ATTN_ENV: &str = "PEGAINFER_GLOBAL_ATTN";
 const MIN_CONTEXT: usize = 1024;
 const MIN_CHUNK_TOKENS: usize = 64;
 const CEILING_DOMAIN: usize = i32::MAX as usize;
@@ -161,6 +163,103 @@ fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>
                  (off | N, {MIN_CHUNK_TOKENS} <= N < {max_context})"
             ),
         },
+    }
+}
+
+/// Which kernel serves the global family's prefill. Unset is the kernel the
+/// line has always used, byte for byte; `tilelang` is the generated one, which
+/// exists only in a build that had TileLang or a pre-generated directory.
+fn tilelang_global_attn() -> Result<bool> {
+    read_env(GLOBAL_ATTN_ENV)?.map_or(Ok(false), |raw| parse_tilelang_global_attn(&raw))
+}
+
+/// Refuse a checkpoint the generated bodies have no kernel for: the launcher
+/// answers `cudaErrorInvalidValue` for another geometry, and it would answer
+/// on the first global prefill.
+pub(crate) fn tilelang_geometry_refusal(config: &crate::config::Gemma4Config) -> Result<()> {
+    if !pegainfer_kernels::ops::gemma4_hd512_prefill_is_built() {
+        return Ok(());
+    }
+    let (heads, kv_heads, head_dim, page) = pegainfer_kernels::ops::gemma4_hd512_prefill_geometry()
+        .context(
+            "the build carries generated kernels but does not state the geometry they were \
+             compiled for; regenerate the TileLang directory with the current generator",
+        )?;
+    let theirs = (
+        config.num_attention_heads,
+        config.num_global_key_value_heads,
+        config.global_head_dim,
+        crate::kv::GLOBAL_PAGE_SIZE,
+    );
+    anyhow::ensure!(
+        theirs == (heads, kv_heads, head_dim, page),
+        "{GLOBAL_ATTN_ENV} asks for kernels compiled for {heads} query heads over \
+         {kv_heads} KV heads at head dim {head_dim} on {page}-row pages, but this \
+         checkpoint's global family is {} over {} at {} on {}-row pages; serve it \
+         through the incumbent kernel",
+        theirs.0,
+        theirs.1,
+        theirs.2,
+        theirs.3
+    );
+    Ok(())
+}
+
+/// Refuse a device the generated bodies cannot run on: generation targets one
+/// arch, whose accelerated target runs on that capability alone, and a block
+/// opts into more shared memory than some architectures of the same number
+/// grant.
+fn ensure_tilelang_device(device: usize) -> Result<()> {
+    if !pegainfer_kernels::ops::gemma4_hd512_prefill_is_built() {
+        return Ok(());
+    }
+    let arch = pegainfer_kernels::ops::gemma4_hd512_prefill_arch().context(
+        "the build carries generated kernels but does not state the arch they were built \
+         for; regenerate the TileLang directory with the current generator",
+    )?;
+    let built: u32 = arch
+        .trim_start_matches("sm_")
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .with_context(|| format!("the build reported an unreadable TileLang arch {arch:?}"))?;
+    let ctx = DeviceContext::new_with_device(device)
+        .with_context(|| format!("open device {device} for the TileLang arch check"))?;
+    let major = ctx.ctx.attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+    )?;
+    let minor = ctx.ctx.attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+    )?;
+    let running = u32::try_from(major * 10 + minor).context("compute capability fits u32")?;
+    anyhow::ensure!(
+        running == built,
+        "{GLOBAL_ATTN_ENV} asks for kernels built for {arch}, but device {device} is \
+         SM{major}.{minor}: the generated bodies carry an image for one arch. Build with \
+         PEGAINFER_CUDA_SM={running}, or serve this device through the incumbent kernel"
+    );
+    let wanted = pegainfer_kernels::ops::gemma4_hd512_prefill_smem().context(
+        "the build carries generated kernels but does not state the shared memory they opt \
+         into; regenerate the TileLang directory with the current generator",
+    )?;
+    let granted = ctx.ctx.attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    )?;
+    let granted = usize::try_from(granted).context("shared-memory limit fits usize")?;
+    anyhow::ensure!(
+        wanted <= granted,
+        "{GLOBAL_ATTN_ENV} asks for kernels whose block opts into {wanted} B of shared \
+         memory, and device {device} grants {granted} B per block; serve it through the \
+         incumbent kernel"
+    );
+    Ok(())
+}
+
+fn parse_tilelang_global_attn(raw: &str) -> Result<bool> {
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "off" => Ok(false),
+        "tilelang" => Ok(true),
+        _ => anyhow::bail!("{GLOBAL_ATTN_ENV}={raw:?} not recognized (off | tilelang)"),
     }
 }
 
@@ -490,11 +589,13 @@ fn validate_request(request: &Request, max_context: usize) -> Result<usize, Reje
 }
 
 /// Both pools' page budgets for one configuration; `None` when the
-/// arithmetic overflows.
+/// arithmetic overflows. The first three counts are not interchangeable:
+/// the transient and the window are local pages, the context is global
+/// ones, and the two families size their pages differently.
 fn pool_pages(
     transient_pages: usize,
     window_pages: usize,
-    context_pages: usize,
+    global_context_pages: usize,
     slots: usize,
     cache_entries: usize,
     entry_global_pages: usize,
@@ -505,7 +606,7 @@ fn pool_pages(
         .checked_add(1)?
         .checked_add(cache_entries.checked_mul(window_pages)?)?;
     let global = slots
-        .checked_mul(context_pages)?
+        .checked_mul(global_context_pages)?
         .checked_add(1)?
         .checked_add(cache_entries.checked_mul(entry_global_pages)?)?;
     Some((local, global))
@@ -517,7 +618,7 @@ fn pool_pages(
 /// request inside it, so a shortfall at this door is an accounting bug
 /// surfacing before any segment runs, not a load signal.
 fn global_account_pages(context_len: usize) -> usize {
-    context_len.div_ceil(PAGE_SIZE)
+    context_len.div_ceil(GLOBAL_PAGE_SIZE)
 }
 
 /// How many prompts one mixed step may absorb: bounded well below the
@@ -1053,6 +1154,20 @@ impl EngineState {
         let admit_coalesce = admit_coalesce_ms()?;
         let slots = decode_slots()?;
         let local_kv_storage = kv_fp8_storage()?;
+        let tilelang_global = tilelang_global_attn()?;
+        // The stub tier links under the same name and refuses at launch, so
+        // without this the answer would arrive after the weights are loaded
+        // and on the first prompt rather than here.
+        anyhow::ensure!(
+            !tilelang_global || pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+            "{GLOBAL_ATTN_ENV}=tilelang needs a build that carries the kernel; \
+             this one fell back to the stub tier, so pegainfer-kernels was \
+             compiled without TileLang and without a pre-generated directory"
+        );
+        if tilelang_global {
+            tilelang_geometry_refusal(&config)?;
+            ensure_tilelang_device(device)?;
+        }
         anyhow::ensure!(
             admit_coalesce.is_none() || lane_mode.is_none(),
             "{ADMIT_COALESCE_ENV} and {ASYNC_PREFILL_ENV} cannot combine: the lane flies one \
@@ -1082,8 +1197,13 @@ impl EngineState {
         // segment. The global family never releases, so it stays linear in
         // context for each request's whole lifetime. Both pools add the
         // padding page they reserve.
-        let context_pages = max_context.div_ceil(PAGE_SIZE);
-        let window_pages = weights.config.sliding_window.div_ceil(PAGE_SIZE) + 1;
+        // The families page at different granularities, so each budget below
+        // names the one it counts: the window and the local transient are
+        // local pages, the global account is global pages. One ceiling in
+        // local pages is not the same number in global pages.
+        let local_context_pages = max_context.div_ceil(LOCAL_PAGE_SIZE);
+        let global_context_pages = max_context.div_ceil(GLOBAL_PAGE_SIZE);
+        let window_pages = weights.config.sliding_window.div_ceil(LOCAL_PAGE_SIZE) + 1;
         // The cache brings its own page budget so cached entries never eat
         // serving headroom.
         let cache_cap = prefix_cache_cap()?;
@@ -1097,14 +1217,14 @@ impl EngineState {
                 // A round's rows split across walkers, and every walker's
                 // reservation rounds up to its own page — so the budget
                 // carries one page of rounding per extra walker.
-                window_pages + chunk.div_ceil(PAGE_SIZE) + (MIX_MAX_PROMPTS - 1)
+                window_pages + chunk.div_ceil(LOCAL_PAGE_SIZE) + (MIX_MAX_PROMPTS - 1)
             }
-            _ => context_pages,
+            _ => local_context_pages,
         };
         let (local_pages, global_pages) = pool_pages(
             transient_pages,
             window_pages,
-            context_pages,
+            global_context_pages,
             slots,
             cache_entries,
             crate::prefix_cache::entry_global_pages(max_context),
@@ -1139,6 +1259,7 @@ impl EngineState {
             local_kv_storage,
             local_pages,
             global_pages,
+            tilelang_global,
         )
         .map_err(|err| {
             err.context(format!(
@@ -2488,6 +2609,20 @@ mod knob_tests {
         assert_eq!(parse_kv_fp8(None).unwrap(), KvStorage::Bf16);
         assert_eq!(parse_kv_fp8(Some("local")).unwrap(), KvStorage::E4m3);
         assert!(parse_kv_fp8(Some("global")).is_err());
+    }
+
+    #[test]
+    fn global_attn_parses_or_refuses() {
+        assert!(!parse_tilelang_global_attn("off").expect("off parses"));
+        assert!(!parse_tilelang_global_attn("").expect("empty parses"));
+        assert!(!parse_tilelang_global_attn("0").expect("zero parses"));
+        assert!(parse_tilelang_global_attn(" TileLang ").expect("trimmed and cased"));
+        for bad in ["on", "1", "flashinfer", "tile", "tilelang:1"] {
+            assert!(
+                parse_tilelang_global_attn(bad).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
     }
 
     #[test]

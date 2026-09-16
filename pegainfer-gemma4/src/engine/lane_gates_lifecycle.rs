@@ -173,6 +173,33 @@ fn the_gathered_lifecycle_completes() {
     gather_lifecycle_script();
 }
 
+/// The knob is refused for a geometry the bodies were not compiled for,
+/// before any weight is read rather than at the first global prefill.
+#[test]
+fn the_knob_is_refused_for_a_geometry_the_build_does_not_carry() {
+    if !pegainfer_kernels::ops::gemma4_hd512_prefill_is_built() {
+        eprintln!("skipping: this build carries the stub, which has no geometry to refuse");
+        return;
+    }
+    let (heads, kv_heads, head_dim, _page) =
+        pegainfer_kernels::ops::gemma4_hd512_prefill_geometry()
+            .expect("a build that carries the bodies states the geometry they were compiled for");
+    let mut config = crate::manifest::schema::sample_config();
+    config.num_attention_heads = heads;
+    config.num_global_key_value_heads = kv_heads;
+    config.global_head_dim = head_dim;
+    super::tilelang_geometry_refusal(&config).expect("its own geometry is accepted");
+
+    config.num_global_key_value_heads = kv_heads + 1;
+    let refusal = super::tilelang_geometry_refusal(&config)
+        .expect_err("one KV head more is a geometry the bodies have no kernel for");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains(&(kv_heads + 1).to_string()) && refusal.contains(&kv_heads.to_string()),
+        "the refusal must name both geometries: {refusal}"
+    );
+}
+
 #[test]
 fn pool_pages_follow_the_knobs() {
     assert_eq!(
@@ -184,4 +211,34 @@ fn pool_pages_follow_the_knobs() {
         Some((262, 4097))
     );
     assert_eq!(super::pool_pages(usize::MAX, 65, 512, 16, 0, 256), None);
+}
+
+/// The door and the startup budget must count the global account in the same
+/// family's page: a request at the serving ceiling asks for its whole account
+/// at once and startup provisions one per slot, so a unit mismatch refuses a
+/// request the pool was built to hold.
+#[test]
+fn the_global_door_fits_inside_what_startup_provisions() {
+    for max_context in [1024usize, 8192, 40960, 262_144] {
+        for slots in [1usize, 4, 16] {
+            let per_slot = super::global_account_pages(max_context);
+            // No cache entries: the tightest the global pool ever is.
+            let (_, global_pages) = super::pool_pages(
+                max_context.div_ceil(crate::kv::LOCAL_PAGE_SIZE),
+                1,
+                max_context.div_ceil(crate::kv::GLOBAL_PAGE_SIZE),
+                slots,
+                0,
+                0,
+            )
+            .expect("budget fits in usize");
+            assert!(
+                slots * per_slot < global_pages,
+                "ceiling {max_context} over {slots} slots: the door asks for \
+                 {per_slot} pages each, {} in all, where startup provisioned \
+                 {global_pages}",
+                slots * per_slot
+            );
+        }
+    }
 }

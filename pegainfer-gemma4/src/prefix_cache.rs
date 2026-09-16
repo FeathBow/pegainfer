@@ -14,7 +14,8 @@
 
 use pegainfer_core::kv_pool::KvReservation;
 
-use crate::kv::PAGE_SIZE;
+use crate::kv::GLOBAL_PAGE_SIZE;
+use crate::kv::LOCAL_PAGE_SIZE;
 
 /// A resume below this many tokens is not worth its page copies.
 const MIN_RESUME_TOKENS: usize = 64;
@@ -36,7 +37,7 @@ fn resume_point(candidate: ResumeCandidate<'_>, window: usize, prompt: &[u32]) -
     let floor = if candidate.local_origin == 0 {
         MIN_RESUME_TOKENS
     } else {
-        (candidate.local_origin * PAGE_SIZE + window).max(MIN_RESUME_TOKENS)
+        (candidate.local_origin * LOCAL_PAGE_SIZE + window).max(MIN_RESUME_TOKENS)
     };
     (resume >= floor).then_some(resume)
 }
@@ -92,7 +93,7 @@ pub(crate) struct PrefixCache {
 /// context. Capture refuses a longer prompt, so the cache can never hold
 /// more than the share of the pool its entries paid for at startup.
 pub(crate) fn entry_global_pages(max_context: usize) -> usize {
-    max_context.div_ceil(PAGE_SIZE) / 2
+    max_context.div_ceil(GLOBAL_PAGE_SIZE) / 2
 }
 
 impl PrefixCache {
@@ -196,8 +197,8 @@ mod tests {
         at_63[63] = 999;
         let mut at_64 = entry.clone();
         at_64[64] = 999;
-        assert_eq!(resume(&entry, 0, PAGE_SIZE, &at_63), None);
-        assert_eq!(resume(&entry, 0, PAGE_SIZE, &at_64), Some(64));
+        assert_eq!(resume(&entry, 0, LOCAL_PAGE_SIZE, &at_63), None);
+        assert_eq!(resume(&entry, 0, LOCAL_PAGE_SIZE, &at_64), Some(64));
     }
 
     #[test]
@@ -205,25 +206,33 @@ mod tests {
         let entry: Vec<u32> = (0..96).collect();
         let mut extended = entry.clone();
         extended.push(999);
-        assert_eq!(resume(&entry, 0, PAGE_SIZE, &extended), Some(96));
-        assert_eq!(resume(&entry, 0, PAGE_SIZE, &entry), Some(95));
-        assert_eq!(resume(&entry, 0, PAGE_SIZE, &[]), None);
+        assert_eq!(resume(&entry, 0, LOCAL_PAGE_SIZE, &extended), Some(96));
+        assert_eq!(resume(&entry, 0, LOCAL_PAGE_SIZE, &entry), Some(95));
+        assert_eq!(resume(&entry, 0, LOCAL_PAGE_SIZE, &[]), None);
 
         let mut before_window = entry.clone();
         before_window[47] = 777;
-        assert_eq!(resume(&entry, 2, PAGE_SIZE, &before_window), None);
+        assert_eq!(resume(&entry, 2, LOCAL_PAGE_SIZE, &before_window), None);
         let mut at_window = entry.clone();
         at_window[48] = 777;
-        assert_eq!(resume(&entry, 2, PAGE_SIZE, &at_window), None);
+        assert_eq!(resume(&entry, 2, LOCAL_PAGE_SIZE, &at_window), None);
         let mut after_minimum = entry.clone();
         after_minimum[64] = 777;
-        assert_eq!(resume(&entry, 2, PAGE_SIZE, &after_minimum), Some(64));
+        assert_eq!(resume(&entry, 2, LOCAL_PAGE_SIZE, &after_minimum), Some(64));
     }
 
     #[test]
     fn global_page_budget_rounds_before_halving() {
-        assert_eq!(entry_global_pages(8192), 256);
-        assert_eq!(entry_global_pages(8193), 256);
-        assert_eq!(entry_global_pages(8224), 257);
+        let pages = 128;
+        let ceiling = pages * GLOBAL_PAGE_SIZE;
+        assert_eq!(entry_global_pages(ceiling), pages / 2);
+        // A token past a page boundary buys a whole page and the halving
+        // truncates it back away; halving the tokens first would round that
+        // same remainder up into an entry the pool never provisioned.
+        assert_eq!(entry_global_pages(ceiling + 1), pages / 2);
+        assert_eq!(
+            entry_global_pages(ceiling + 2 * GLOBAL_PAGE_SIZE),
+            pages / 2 + 1
+        );
     }
 }

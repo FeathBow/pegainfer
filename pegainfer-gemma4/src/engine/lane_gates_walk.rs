@@ -27,9 +27,9 @@ fn the_gathered_transient_leaves_headroom() {
     let window = crate::config::Gemma4Config::from_file(&dir)
         .expect("config")
         .sliding_window;
-    let window_pages = window.div_ceil(crate::kv::PAGE_SIZE) + 1;
+    let window_pages = window.div_ceil(crate::kv::LOCAL_PAGE_SIZE) + 1;
     let provisioned = window_pages
-        + 2048usize.div_ceil(crate::kv::PAGE_SIZE)
+        + 2048usize.div_ceil(crate::kv::LOCAL_PAGE_SIZE)
         + (super::MIX_MAX_PROMPTS - 1)
         + (super::MAX_CONCURRENCY - 1) * window_pages;
     assert_eq!(

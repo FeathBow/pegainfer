@@ -33,8 +33,9 @@ use crate::forward::embed_scale_bf16;
 use crate::forward::logits_tail;
 use crate::forward::logits_tail_into;
 use crate::forward::validate_tokens;
+use crate::kv::GLOBAL_PAGE_SIZE;
 use crate::kv::GemmaKv;
-use crate::kv::PAGE_SIZE;
+use crate::kv::LOCAL_PAGE_SIZE;
 use crate::kv::SlidingLocalKv;
 use crate::kv::admit_tokens;
 use crate::layer::EpilogueScratch;
@@ -753,6 +754,10 @@ pub(crate) struct GemmaServe {
     global_cos: DeviceVec,
     global_sin: DeviceVec,
     cos_max_pos: usize,
+    /// Which kernel the global family's prefill goes through. The two are
+    /// adapters at one seam — same arguments, same meaning — so the choice is
+    /// a flag here rather than a shape the call sites have to know about.
+    tilelang_global_attn: bool,
     /// Model layer index -> index within its family's pool layer axis.
     family_index: Vec<usize>,
 }
@@ -802,6 +807,7 @@ impl GemmaServe {
         local_kv_storage: KvStorage,
         local_pages: usize,
         global_pages: usize,
+        tilelang_global_attn: bool,
     ) -> Result<Self> {
         // One source of truth for geometry, rope tables and layer numbering.
         let config = &weights.config;
@@ -835,7 +841,7 @@ impl GemmaServe {
             locals,
             config.num_key_value_heads,
             config.head_dim,
-            PAGE_SIZE,
+            LOCAL_PAGE_SIZE,
             local_pages,
             local_kv_storage,
         )?;
@@ -844,7 +850,7 @@ impl GemmaServe {
             globals,
             config.num_global_key_value_heads,
             config.global_head_dim,
-            PAGE_SIZE,
+            GLOBAL_PAGE_SIZE,
             global_pages,
         )?;
         let local_geom = LayerGeometry::local_of(config);
@@ -882,7 +888,39 @@ impl GemmaServe {
             global_sin,
             cos_max_pos: max_context,
             family_index,
+            tilelang_global_attn,
         })
+    }
+
+    /// The global family's prefill, through whichever kernel this engine was
+    /// started with. Both are the same fn type, so a drift between them stops
+    /// compiling rather than computing something else.
+    fn global_prefill(
+        &self,
+        ctx: &DeviceContext,
+        q: &HiddenStates,
+        layer: usize,
+        plan: &PrefillPagedPlan,
+        out: &mut HiddenStates,
+        num_q_heads: usize,
+    ) -> Result<()> {
+        let attend = if self.tilelang_global_attn {
+            pegainfer_kernels::ops::gemma4_hd512_prefill_varlen_into
+        } else {
+            ops::batch_prefill_paged_hd512_into
+        };
+        attend(
+            ctx,
+            q,
+            self.global_pool.buffer(),
+            &self.global_pool.layout().kernel_layout(),
+            layer,
+            plan,
+            out,
+            num_q_heads,
+            // The prep folds 1/sqrt(head_dim) into the query rows upstream.
+            1.0,
+        )
     }
 
     /// One arena per engine thread, sized for the decode step; a prompt
@@ -1520,16 +1558,13 @@ impl GemmaServe {
                     geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
-                ops::batch_prefill_paged_hd512_into(
+                self.global_prefill(
                     ctx,
                     &scratch.q_prep,
-                    self.global_pool.buffer(),
-                    &self.global_pool.layout().kernel_layout(),
                     family_layer,
                     global_plan,
                     &mut scratch.attn,
                     geom.num_q_heads,
-                    1.0,
                 )?;
             }
             PrepRef::Batched { global_tables, .. } => {
@@ -1633,16 +1668,13 @@ impl GemmaServe {
                 // chunk plan as a pure decode step.
                 scratch.q_prep.seq_len = prefill_len;
                 scratch.attn.seq_len = prefill_len;
-                ops::batch_prefill_paged_hd512_into(
+                self.global_prefill(
                     ctx,
                     &scratch.q_prep,
-                    self.global_pool.buffer(),
-                    &self.global_pool.layout().kernel_layout(),
                     family_layer,
                     global_prefill_plan,
                     &mut scratch.attn,
                     geom.num_q_heads,
-                    1.0,
                 )?;
                 let batch = seq_len - prefill_len;
                 let factor = self.global_split_factor;

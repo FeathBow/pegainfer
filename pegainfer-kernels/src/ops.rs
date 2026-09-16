@@ -9,6 +9,8 @@ mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]
 mod gemma4;
+#[cfg(feature = "gemma4")]
+mod gemma4_tilelang;
 #[cfg(feature = "glm52")]
 mod glm52;
 #[cfg(feature = "k3")]
@@ -124,6 +126,16 @@ pub use embedding::embedding_decode_into;
 pub use embedding::embedding_rows_into;
 #[cfg(feature = "gemma4")]
 pub use gemma4::*;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd512_prefill_arch;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd512_prefill_geometry;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd512_prefill_is_built;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd512_prefill_smem;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd512_prefill_varlen_into;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "k3")]

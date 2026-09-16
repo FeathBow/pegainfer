@@ -270,7 +270,16 @@ pub(crate) fn admit_tokens(
     }
 }
 
-pub(crate) const PAGE_SIZE: usize = 16;
+/// The sliding family's page. Small pages keep the window's footprint tight,
+/// and its reservations are per page because the front is released page by
+/// page.
+pub(crate) const LOCAL_PAGE_SIZE: usize = 16;
+
+/// The global family's page, sized so one key block is one tile load: at this
+/// head dim a 64-row page keeps 0.93-0.96x of a contiguous tensor's throughput
+/// where four 16-row pages keep 0.52-0.54x. The pool never releases a global
+/// page, so the coarser granularity costs at most 63 tokens per request.
+pub(crate) const GLOBAL_PAGE_SIZE: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -278,9 +287,12 @@ mod tests {
 
     use super::*;
 
+    /// The local family has to be able to grant what the global one refuses,
+    /// or the refusal lands before any reservation exists to roll back and
+    /// the atomicity test passes without exercising the rollback.
     fn tiny_pools(ctx: &DeviceContext) -> (KvPool, KvPool) {
-        let local = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 4).expect("local pool");
-        let global = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 2).expect("global pool");
+        let local = KvPool::new(ctx, 1, 1, 1, LOCAL_PAGE_SIZE, 8).expect("local pool");
+        let global = KvPool::new(ctx, 1, 1, 1, GLOBAL_PAGE_SIZE, 2).expect("global pool");
         (local, global)
     }
 
@@ -297,14 +309,24 @@ mod tests {
         let ctx = DeviceContext::new().expect("GPU required");
         let (local, global) = tiny_pools(&ctx);
         let mut kv = kv_from(&local, &global);
-        let refused = admit_tokens(&local, &global, &mut kv, 17);
-        assert!(refused.is_err(), "partial admission must refuse");
-        assert_eq!(local.available_pages(), 3, "local occupancy must roll back");
-        assert_eq!(global.available_pages(), 1, "global occupancy untouched");
+        let before = (local.available_pages(), global.available_pages());
+        let over_global = GLOBAL_PAGE_SIZE + 1;
+        let refused = admit_tokens(&local, &global, &mut kv, over_global)
+            .expect_err("partial admission must refuse");
+        let refusal = refused.to_string();
+        assert!(
+            refusal.contains("(granted, rolled back)"),
+            "the local family must be the one rolled back, got: {refusal}"
+        );
+        assert_eq!(
+            (local.available_pages(), global.available_pages()),
+            before,
+            "a refused admission leaves both pools as it found them"
+        );
         assert_eq!((kv.local.held_pages(), kv.global.held_pages()), (0, 0));
 
-        admit_tokens(&local, &global, &mut kv, PAGE_SIZE).expect("one page each");
-        assert_eq!((local.available_pages(), global.available_pages()), (2, 0));
+        admit_tokens(&local, &global, &mut kv, LOCAL_PAGE_SIZE).expect("one page each");
+        assert_eq!((local.available_pages(), global.available_pages()), (6, 0));
         assert_eq!((kv.local.held_pages(), kv.global.held_pages()), (1, 1));
     }
 }

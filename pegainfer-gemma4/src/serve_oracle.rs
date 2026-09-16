@@ -33,7 +33,10 @@ fn stack_with_storage(
     let weights =
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
-    let serve = GemmaServe::new(&ctx, weights, max_context, storage, pages, pages).expect("serve");
+    // The oracle measures the kernel the line has always used; the opt-in one
+    // has its own gate.
+    let serve =
+        GemmaServe::new(&ctx, weights, max_context, storage, pages, pages, false).expect("serve");
     eprintln!("oracle stack storage: {storage:?}");
     (ctx, serve, dir)
 }
@@ -488,10 +491,12 @@ fn fp8_argmax_agreement_meets_the_bf16_floor() {
         .map(|(name, cut, stride)| agreement_case(&fixture, name, cut, stride));
     let max_context = cases
         .iter()
-        .map(|case| case.prompt.len().div_ceil(crate::kv::PAGE_SIZE) * crate::kv::PAGE_SIZE)
+        .map(|case| {
+            case.prompt.len().div_ceil(crate::kv::LOCAL_PAGE_SIZE) * crate::kv::LOCAL_PAGE_SIZE
+        })
         .max()
         .expect("agreement cases");
-    let pages = max_context.div_ceil(crate::kv::PAGE_SIZE) + 2;
+    let pages = max_context.div_ceil(crate::kv::LOCAL_PAGE_SIZE) + 2;
 
     let (ctx, bf16, _) = stack_with_storage(max_context, pages, KvStorage::Bf16);
     let bf16_results = cases
@@ -522,6 +527,21 @@ fn fp8_argmax_agreement_meets_the_bf16_floor() {
     }
 }
 
+/// The shape of one logit row, for when two of them disagree: the top few ids
+/// and the range say whether a row is a distribution or garbage.
+fn describe_row(what: &str, row: &[f32]) {
+    let mut ranked: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let lo = row.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let finite = row.iter().filter(|v| v.is_finite()).count();
+    eprintln!(
+        "{what}: range [{lo}, {hi}], finite {finite}/{}, top5 {:?}",
+        row.len(),
+        &ranked[..5.min(ranked.len())]
+    );
+}
+
 /// The two arms run different launch shapes (one-token decode against a
 /// whole-prompt prefill), which this engine does not promise bit-equal, so
 /// the callers bound the raw-logit drift by the calibrated ceiling — but the
@@ -549,6 +569,71 @@ fn serving_recompute(ctx: &DeviceContext, serve: &GemmaServe, tokens: &[u32]) ->
     let host = logits.to_host(ctx).expect("recompute D2H");
     let vocab = logits.hidden_dim;
     host[(logits.seq_len - 1) * vocab..].to_vec()
+}
+
+/// The replacement global-attention kernel against the one it stands in for,
+/// both through the production serving path. The incumbent is asked twice
+/// first, so the tolerance is a measured floor rather than a chosen number.
+/// The prompt leaves the last page partial, where tail handling could differ.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn the_replacement_global_kernel_matches_the_incumbent() {
+    let (ctx, mut serve, dir) = stack_with(4096, 300);
+    assert!(
+        pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+        "this build has no TileLang kernel to compare; the gate needs one that does"
+    );
+    // The runner selects this gate only where the geometry matches.
+    let config = crate::config::Gemma4Config::from_file(&dir).expect("config");
+    crate::engine::tilelang_geometry_refusal(&config).expect(
+        "this gate compares the generated kernel against the incumbent, so it needs a \
+         checkpoint whose global geometry the build was compiled for",
+    );
+    let prompts = crate::testkit::generate_fixture_prompts();
+    let tokens: Vec<u32> = prompts[0].iter().cycle().copied().take(1500).collect();
+    let page = serve.global_pool.layout().page_size;
+    assert!(
+        !tokens.len().is_multiple_of(page),
+        "the prompt has to leave the final global page partial, and {} tokens \
+         divides the pool's {page}-row page",
+        tokens.len()
+    );
+
+    assert!(!serve.tilelang_global_attn);
+    let incumbent = serving_recompute(&ctx, &serve, &tokens);
+    let again = serving_recompute(&ctx, &serve, &tokens);
+    let floor = compare_row(&incumbent, &again, "incumbent against itself");
+    assert!(
+        incumbent
+            .iter()
+            .zip(&again)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the incumbent is not bit-identical run to run, so there is no floor \
+         to measure the replacement against"
+    );
+
+    serve.tilelang_global_attn = true;
+    let replacement = serving_recompute(&ctx, &serve, &tokens);
+    // Report before asserting: when the two disagree, the magnitude and the
+    // shape of each row say which kind of wrong it is, and `compare_row`
+    // stops at the first divergence it finds.
+    describe_row("incumbent", &incumbent);
+    describe_row("replacement", &replacement);
+    let spread = incumbent
+        .iter()
+        .zip(&replacement)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("max |dlogit| between the two kernels: {spread}");
+    let gap = compare_row(&incumbent, &replacement, "replacement against incumbent");
+    eprintln!(
+        "global prefill over {} tokens: floor {floor}, replacement |dlogit| {gap}",
+        tokens.len()
+    );
+    assert!(
+        gap <= 2.0,
+        "replacement |dlogit| {gap} above the line's calibrated 2.0"
+    );
 }
 
 /// One forward path answers for itself: every prompt position's incremental
@@ -1475,7 +1560,7 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
     // pool's padding page.
     let pages = lengths
         .iter()
-        .map(|len| (len + STEPS).div_ceil(PAGE_SIZE))
+        .map(|len| (len + STEPS).div_ceil(LOCAL_PAGE_SIZE))
         .sum::<usize>()
         + 1;
     let (ctx, serve, _dir) = stack_with(2048, pages);
