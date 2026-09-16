@@ -1,13 +1,16 @@
 # Gemma 4 HF golden fixtures
 
-**TL;DR:** three Hugging Face references for Gemma 4 12B. `test_data/gemma4-12b-hf-golden.safetensors`
-covers the window and everything below it — layer-boundary activations at both ends of both layer
-types, plus top-64 logprobs, over a single-token, a nine-token and a 1024-token case.
+**TL;DR:** three Hugging Face references, committed for Gemma 4 12B and dumpable for another size
+under a tag. `test_data/gemma4-12b-hf-golden.safetensors` covers the window and everything below
+it — layer-boundary activations at both ends of both layer types, plus top-64 logprobs, over a
+single-token, a nine-token and a 1024-token case.
 `test_data/gemma4-12b-hf-window-golden.safetensors` goes past it, recorded under both attention
 backends. `test_data/gemma4-12b-hf-longctx-golden.safetensors` takes the same teacher-forced
-comparison to 16384 and 32768 tokens for the raised serving ceiling.
+comparison to 16384 and 32768 tokens for the raised serving ceiling. The `12b` in those names is
+the fixture tag: `PEGAINFER_GEMMA4_FIXTURE_TAG` selects another set under the same three names, and
+a reference whose tower does not fit on one card dumps with `--device auto`.
 
-Last touched: 2026-08.
+Last touched: 2026-09.
 
 ## What the base fixture contains
 
@@ -127,6 +130,42 @@ python tools/accuracy/dump_gemma4_longctx_golden.py <checkpoint-dir> \
     --source-repo google/gemma-4-12B-it --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
 ```
 
+## Another size, under a tag
+
+The three names carry a tag, `12b` for the committed set. Dumping the same three references from
+another checkpoint under another tag, and pointing the runner at that tag, is what gates that size;
+nothing about the fixtures' shape changes, only which checkpoint they answer to. Each fixture
+records the checkpoint's own revision and weight-file digests, and every gate checks them before it
+loads anything, so a set can only be run against the checkpoint it came from.
+
+The reference tower is what limits this. `--device auto` shards it over every visible GPU, which is
+how a 31B window or long-context reference is dumped: the prompts at 16384 and 32768 tokens do not
+fit beside a 60 GiB tower on one card. The base fixture's prompts do fit, so it takes a single
+device. `--device` defaults to `cuda:0`.
+
+```bash
+# the base fixture, one card
+python tools/accuracy/dump_gemma4_hf_golden.py <31b-checkpoint-dir> \
+    test_data/gemma4-31b-hf-golden.safetensors \
+    --source-repo google/gemma-4-31B-it --revision <sha> --device cuda:0
+
+# the two deep ones, tower sharded over the visible GPUs
+python tools/accuracy/dump_gemma4_window_golden.py <31b-checkpoint-dir> \
+    test_data/gemma4-31b-hf-window-golden.safetensors \
+    --source-repo google/gemma-4-31B-it --revision <sha> --device auto
+
+python tools/accuracy/dump_gemma4_longctx_golden.py <31b-checkpoint-dir> \
+    test_data/gemma4-31b-hf-longctx-golden.safetensors \
+    --source-repo google/gemma-4-31B-it --revision <sha> --device auto
+```
+
+The generate fixture the prompt-backed gates read follows the same naming
+(`test_data/gemma4-<tag>-generate.safetensors`, `dump_gemma4_generate.py`), and so does the chat
+reference `docs/models/gemma4/tokenizer.md` describes. A sharded checkpoint is fingerprinted by its
+index plus each shard's header rather than by a single `model.safetensors`, so the provenance check
+holds for both layouts. Only the 12B set is committed; another tag's files are local to the box that
+dumped them, which is why the runner takes paths from the environment.
+
 Two runs against the same checkpoint produce the same bytes, so regeneration is checked with
 `sha256sum` alone. The current fixtures are
 
@@ -161,6 +200,18 @@ compiles them. `scripts/gemma4_gates.sh` runs them:
 PEGAINFER_TEST_MODEL_PATH=<12b-checkpoint> \
   PEGAINFER_NVFP4_MODEL=<26b-checkpoint> \
   PEGAINFER_GATE_GPU=<index-or-UUID> scripts/gemma4_gates.sh [name-filter]
+```
+
+`PEGAINFER_GEMMA4_FIXTURE_TAG` selects the set, defaulting to `12b`; the runner exports each
+fixture's path (`PEGAINFER_GEMMA4_GOLDEN`, `_WINDOW_GOLDEN`, `_LONGCTX_GOLDEN`, `_GENERATE`,
+`_CHAT_GOLDEN`) so the gates read the tagged files rather than hard-coded ones, and it holds the
+whole set against the checkpoint's digests before the first load. To run the suite at 31B:
+
+```bash
+PEGAINFER_GEMMA4_FIXTURE_TAG=31b \
+  PEGAINFER_TEST_MODEL_PATH=<31b-checkpoint> \
+  PEGAINFER_NVFP4_MODEL=<26b-checkpoint> \
+  PEGAINFER_GATE_GPU=<index-or-UUID> scripts/gemma4_gates.sh
 ```
 
 An unfiltered run owns both checkpoint-backed suites. The sync/lane parity, ragged graph/eager
