@@ -100,23 +100,7 @@ fn the_generated_global_prefill_matches_the_one_it_replaces() {
     let a = incumbent.to_host(&ctx).expect("incumbent D2H");
     let b = replacement.to_host(&ctx).expect("replacement D2H");
     assert_eq!(a.len(), b.len());
-    let (mut worst, mut worst_at) = (0.0f32, 0usize);
-    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-        let d = (x - y).abs();
-        // A NaN compares false against everything, so without this it would
-        // leave `worst` at zero and the gate would pass on it.
-        assert!(
-            d.is_finite(),
-            "row {} head {} lane {}: incumbent {x}, replacement {y}",
-            i / (NUM_Q_HEADS * HD),
-            (i % (NUM_Q_HEADS * HD)) / HD,
-            i % HD
-        );
-        if d > worst {
-            worst = d;
-            worst_at = i;
-        }
-    }
+    let (worst, worst_at) = common::worst_delta(&a, &b);
     let row = worst_at / (NUM_Q_HEADS * HD);
     let head = (worst_at % (NUM_Q_HEADS * HD)) / HD;
     eprintln!(

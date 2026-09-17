@@ -1335,7 +1335,11 @@ unsafe extern "C" {
     // Prefill: Q → contiguous q_batch_out; K → straight into the paged KV
     // pool at k_offset_elems (feeds batch_prefill_paged, not single_prefill).
     // V is the K=V fork — the weightless norm of the same raw K, sharing
-    // its denominator — written to v_offset_elems in the same pass.
+    // its denominator — written to v_offset_elems in the same pass. The
+    // pool row is described as bands: `row_width` columns per (token, kv
+    // head) and `fold_rotary`, zero for the split K|V format and the
+    // rotated columns K keeps in the folded one, where both offsets name
+    // the layer's single block.
     pub fn qk_norm_partial_rope_paged_prefill_hd512_cuda(
         q_batch: *const Half,
         k_batch: *const Half,
@@ -1354,7 +1358,8 @@ unsafe extern "C" {
         seq_len: i32,
         start_pos: i32,
         cos_max_pos: i32,
-        rotary_dim: i32,
+        row_width: i32,
+        fold_rotary: i32,
         rms_eps: f32,
         page_size: i32,
         num_pages: i32,
@@ -1384,7 +1389,8 @@ unsafe extern "C" {
         num_kv_heads: i32,
         batch: i32,
         cos_max_pos: i32,
-        rotary_dim: i32,
+        row_width: i32,
+        fold_rotary: i32,
         rms_eps: f32,
         page_size: i32,
         num_pages: i32,

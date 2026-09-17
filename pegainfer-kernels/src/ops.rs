@@ -127,6 +127,10 @@ pub use embedding::embedding_rows_into;
 #[cfg(feature = "gemma4")]
 pub use gemma4::*;
 #[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::GlobalDecodeAttend;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd512_decode_split_kv_into;
+#[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::gemma4_hd512_prefill_arch;
 #[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::gemma4_hd512_prefill_geometry;

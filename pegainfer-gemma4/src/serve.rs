@@ -18,6 +18,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::kv_pool::KvFormat;
 use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::kv_pool::KvStorage;
 use pegainfer_core::ops;
@@ -625,6 +626,7 @@ impl SplitKvState {
                 &self.request_indices_d,
                 &self.kv_tile_indices_d,
                 &self.chunk_size_d,
+                GLOBAL_SPLIT_CHUNK_TOKENS,
             ),
             o_indptr_d: &self.o_indptr_d,
             valid_mask_d: &self.valid_mask_d,
@@ -714,6 +716,48 @@ impl StepArena {
 /// over one KV head halves into pseudo-requests — an exact memory identity
 /// only because MQA gives every query head the same KV head (the 12B
 /// global family's 16 over 1). Anything else fails loud.
+impl GemmaServe {
+    /// The global family's decode read, chosen once by the same flag as its
+    /// prefill: the incumbent through core's door, or this line's own kernel
+    /// straight from the crate that generates it. Same arguments, same
+    /// meaning, one fn type -- which is what lets the call sites not know.
+    fn global_decode_kernel(&self) -> pegainfer_kernels::ops::GlobalDecodeAttend {
+        if self.tilelang_global_attn {
+            pegainfer_kernels::ops::gemma4_hd512_decode_split_kv_into
+        } else {
+            ops::paged_attention_batch_decode_split_kv_hd512_into
+        }
+    }
+}
+
+/// Which kernel serves the global family, and with it how its pool's rows
+/// are laid out. The incumbent and the generated kernel both read the split
+/// K|V rows; the folded rows -- K only where the rotation touches it, V in
+/// full, K's norm weight folded into the query -- are the generated kernel's
+/// alone, so asking for them is asking for it. The format is the pool's for
+/// its whole life, which is why this is one value rather than two flags that
+/// could disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GlobalAttn {
+    Incumbent,
+    TileLang,
+    TileLangFolded,
+}
+
+impl GlobalAttn {
+    pub(crate) fn tilelang(self) -> bool {
+        !matches!(self, Self::Incumbent)
+    }
+
+    /// The global pool's row format, with the family's rotated column count.
+    pub(crate) fn format(self, rotary: usize) -> KvFormat {
+        match self {
+            Self::TileLangFolded => KvFormat::Folded { rotary },
+            Self::Incumbent | Self::TileLang => KvFormat::Split,
+        }
+    }
+}
+
 pub(crate) fn global_split_factor(config: &Gemma4Config) -> Result<usize> {
     const DISPATCHABLE: [usize; 5] = [1, 2, 3, 4, 8];
     let q = config.num_attention_heads;
@@ -756,7 +800,8 @@ pub(crate) struct GemmaServe {
     cos_max_pos: usize,
     /// Which kernel the global family's prefill goes through. The two are
     /// adapters at one seam — same arguments, same meaning — so the choice is
-    /// a flag here rather than a shape the call sites have to know about.
+    /// a flag here rather than a shape the call sites have to know about. A
+    /// folded global pool needs this on: only the generated kernel reads it.
     tilelang_global_attn: bool,
     /// Model layer index -> index within its family's pool layer axis.
     family_index: Vec<usize>,
@@ -807,7 +852,7 @@ impl GemmaServe {
         local_kv_storage: KvStorage,
         local_pages: usize,
         global_pages: usize,
-        tilelang_global_attn: bool,
+        global_attn: GlobalAttn,
     ) -> Result<Self> {
         // One source of truth for geometry, rope tables and layer numbering.
         let config = &weights.config;
@@ -845,13 +890,15 @@ impl GemmaServe {
             local_pages,
             local_kv_storage,
         )?;
-        let global_pool = KvPool::new(
+        let global_pool = KvPool::with_storage_and_format(
             ctx,
             globals,
             config.num_global_key_value_heads,
             config.global_head_dim,
             GLOBAL_PAGE_SIZE,
             global_pages,
+            KvStorage::Bf16,
+            global_attn.format(config.global_rotary_dim),
         )?;
         let local_geom = LayerGeometry::local_of(config);
         let global_geom = LayerGeometry::global_of(config);
@@ -888,7 +935,7 @@ impl GemmaServe {
             global_sin,
             cos_max_pos: max_context,
             family_index,
-            tilelang_global_attn,
+            tilelang_global_attn: global_attn.tilelang(),
         })
     }
 
@@ -1555,7 +1602,6 @@ impl GemmaServe {
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
-                    geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
                 self.global_prefill(
@@ -1589,7 +1635,6 @@ impl GemmaServe {
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
-                    geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
                 // A pure reshape: `[rows, q·512]` and `[factor·rows,
@@ -1599,12 +1644,13 @@ impl GemmaServe {
                 scratch.q_prep.seq_len = factor * seq_len;
                 scratch.attn.hidden_dim = q_dim / factor;
                 scratch.attn.seq_len = factor * seq_len;
+                let attend = self.global_decode_kernel();
                 let launch = split.metadata(
                     &global_tables.pseudo_pages,
                     &global_tables.pseudo_indptr,
                     &global_tables.pseudo_last,
                 );
-                ops::paged_attention_batch_decode_split_kv_hd512_into(
+                attend(
                     ctx,
                     &scratch.q_prep,
                     0,
@@ -1659,7 +1705,6 @@ impl GemmaServe {
                     self.cos_max_pos,
                     geom.num_q_heads,
                     geom.num_kv_heads,
-                    geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
                 // The prompt rows read through the ragged prefill plan —
@@ -1682,12 +1727,13 @@ impl GemmaServe {
                 scratch.q_prep.seq_len = factor * seq_len;
                 scratch.attn.hidden_dim = q_dim / factor;
                 scratch.attn.seq_len = factor * seq_len;
+                let attend = self.global_decode_kernel();
                 let launch = split.metadata(
                     &global_tables.pseudo_pages,
                     &global_tables.pseudo_indptr,
                     &global_tables.pseudo_last,
                 );
-                ops::paged_attention_batch_decode_split_kv_hd512_into(
+                attend(
                     ctx,
                     &scratch.q_prep,
                     factor * prefill_len,

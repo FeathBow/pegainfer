@@ -3,6 +3,8 @@
 //! different admission shape.
 
 use anyhow::Result;
+use pegainfer_core::kv_pool::KvFormat;
+use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::kv_pool::KvStorage;
 
 use super::*;
@@ -35,8 +37,16 @@ fn stack_with_storage(
     let ctx = DeviceContext::new_with_device(0).expect("device context");
     // The oracle measures the kernel the line has always used; the opt-in one
     // has its own gate.
-    let serve =
-        GemmaServe::new(&ctx, weights, max_context, storage, pages, pages, false).expect("serve");
+    let serve = GemmaServe::new(
+        &ctx,
+        weights,
+        max_context,
+        storage,
+        pages,
+        pages,
+        GlobalAttn::Incumbent,
+    )
+    .expect("serve");
     eprintln!("oracle stack storage: {storage:?}");
     (ctx, serve, dir)
 }
@@ -569,6 +579,269 @@ fn serving_recompute(ctx: &DeviceContext, serve: &GemmaServe, tokens: &[u32]) ->
     let host = logits.to_host(ctx).expect("recompute D2H");
     let vocab = logits.hidden_dim;
     host[(logits.seq_len - 1) * vocab..].to_vec()
+}
+
+/// Greedy continuation through the serving path: the prompt in one prefill
+/// step, then `steps` decode steps each fed the previous row's argmax. Every
+/// row is returned, so a divergence is placed at the step it appears, and so
+/// is the context it walked, which a recompute of the same tokens needs.
+fn continue_greedy(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    tokens: &[u32],
+    steps: usize,
+) -> (Vec<Vec<f32>>, Vec<u32>) {
+    let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(ctx, 1, false)
+        .expect("oracle step arena");
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, tokens.len())
+        .expect("admit prompt");
+    let logits = serve.step(ctx, &mut kv, tokens).expect("prefill");
+    let host = logits.to_host(ctx).expect("prefill D2H");
+    let vocab = logits.hidden_dim;
+    let mut rows = vec![host[(logits.seq_len - 1) * vocab..].to_vec()];
+    let mut walked = tokens.to_vec();
+    for _ in 0..steps {
+        let token = u32::try_from(argmax(rows.last().unwrap())).expect("token id");
+        walked.push(token);
+        rows.push(decode_serving(serve, ctx, &mut arena, &mut kv, token).expect("decode"));
+    }
+    (rows, walked)
+}
+
+/// The decode gates' raw-logit line. Correctness at this depth is carried by
+/// the argmax, which [`compare_row`] holds on every row of every cell; this
+/// catches a drift the argmax would not, and is set above the spread a
+/// sixteen-cell sweep measured (worst 7.91) rather than at the edge of it,
+/// because the quantity is chaotic and a tighter line would only flake. What
+/// bounds the kernel's own error is the AOT gate, at 0.002 against fp32.
+const DRIFT_LINE: f32 = 12.0;
+
+/// What a decode row's logits move by when nothing about the maths changes:
+/// every row of a greedy walk against a single prefill of the context that
+/// row saw, one arm two ways, reduced the way the arms are compared.
+///
+/// Printed beside each cell so the reader has the magnitude an already
+/// accepted implementation difference reaches here. It is not the line: a
+/// sweep of sixteen cells put this at 0.31 to 5.75 and the replacement at
+/// 0.56 to 7.91, with neither tracking prompt or length -- lengths a page
+/// apart differ sevenfold and the worst row lands anywhere from the prompt
+/// row to the last. A maximum over a walk of these is a draw from a heavy
+/// tail, so a line derived from it in-run would move with the draw.
+fn neutral_scale(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    rows: &[Vec<f32>],
+    prompt_len: usize,
+    walked: &[u32],
+) -> f32 {
+    let mut worst = 0.0f32;
+    for (i, row) in rows.iter().enumerate() {
+        let recomputed = serving_recompute(ctx, serve, &walked[..prompt_len + i]);
+        worst = worst.max(compare_row(
+            row,
+            &recomputed,
+            &format!("neutral scale row {i}"),
+        ));
+    }
+    worst
+}
+
+/// The contexts the decode gates sweep: every fixture prompt at three
+/// lengths, so a line comes from a spread rather than from one cell.
+fn decode_sweep_cells() -> Vec<(usize, usize)> {
+    let mut cells = Vec::new();
+    for prompt in 0..3 {
+        for len in [512usize, 1500, 3000] {
+            cells.push((prompt, len));
+        }
+    }
+    cells
+}
+
+/// The replacement global-attention decode against the one it stands in for,
+/// over every fixture prompt at three lengths. Each step is compared on its
+/// own row, argmax first, since the arms pick their own next token: that
+/// equality is the correctness the gate carries, and it holds on every row.
+/// The raw-logit line is [`DRIFT_LINE`], and every cell prints its own gap
+/// beside [`neutral_scale`], so the spread is on the record.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn the_replacement_global_decode_matches_the_incumbent() {
+    const STEPS: usize = 16;
+    let (ctx, mut serve, _dir) = stack_with(4096, 300);
+    assert!(
+        pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+        "this build has no TileLang kernel to compare; the gate needs one that does"
+    );
+    let prompts = crate::testkit::generate_fixture_prompts();
+
+    let mut cells = Vec::new();
+    for (prompt, len) in decode_sweep_cells() {
+        let tokens: Vec<u32> = prompts[prompt].iter().cycle().copied().take(len).collect();
+
+        serve.tilelang_global_attn = false;
+        let (incumbent, walked) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        let (again, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        for (i, (a, b)) in incumbent.iter().zip(&again).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "prompt {prompt} at {len}: the incumbent is not bit-identical run to \
+                 run at step {i}, so there is no floor to measure the replacement against"
+            );
+        }
+        let scale = neutral_scale(&ctx, &serve, &incumbent, tokens.len(), &walked);
+
+        serve.tilelang_global_attn = true;
+        let (replacement, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        let mut worst = (0.0f32, 0usize);
+        for (i, (a, b)) in incumbent.iter().zip(&replacement).enumerate() {
+            let gap = compare_row(a, b, &format!("prompt {prompt} at {len}, decode step {i}"));
+            if gap > worst.0 {
+                worst = (gap, i);
+            }
+        }
+        eprintln!(
+            "prompt {prompt} at {len} tokens: floor 0, neutral scale {scale}, \
+             replacement |dlogit| {} at step {}",
+            worst.0, worst.1
+        );
+        cells.push((prompt, len, scale, worst));
+    }
+
+    let widest_scale = cells.iter().fold(0.0f32, |m, c| m.max(c.2));
+    let worst_cell = cells
+        .iter()
+        .max_by(|a, b| a.3.0.total_cmp(&b.3.0))
+        .expect("the sweep ran");
+    let line = DRIFT_LINE;
+    eprintln!(
+        "global decode over {} cells: neutral scale at most {widest_scale}, line {line}, \
+         worst replacement |dlogit| {} at prompt {} length {} step {}",
+        cells.len(),
+        worst_cell.3.0,
+        worst_cell.0,
+        worst_cell.1,
+        worst_cell.3.1
+    );
+    for (prompt, len, _, (gap, step)) in &cells {
+        assert!(
+            *gap <= line,
+            "prompt {prompt} at {len}: replacement |dlogit| {gap} at step {step} above \
+             the drift line of {line}"
+        );
+    }
+}
+
+/// The folded global pool against the split one, both read by the generated
+/// kernels: the rows differ in where K's norm weight is applied, one bf16
+/// rounding apart per element. Every fixture prompt at three lengths. The
+/// split arms run and are kept first, so one pool swap covers the sweep. The
+/// decode rows take [`DRIFT_LINE`]; the prompt row keeps the prefill gate's
+/// 2.0, which one row of one kernel pass can hold.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn the_folded_pool_matches_the_split_one() {
+    const STEPS: usize = 16;
+    let (ctx, mut serve, _dir) = stack_with(4096, 300);
+    assert!(
+        pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+        "this build has no TileLang kernel to compare; the gate needs one that does"
+    );
+    let prompts = crate::testkit::generate_fixture_prompts();
+    serve.tilelang_global_attn = true;
+
+    let cells = decode_sweep_cells();
+    let mut split_arms = Vec::new();
+    for &(prompt, len) in &cells {
+        let tokens: Vec<u32> = prompts[prompt].iter().cycle().copied().take(len).collect();
+        let (split, walked) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        let (again, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        for (i, (a, b)) in split.iter().zip(&again).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "prompt {prompt} at {len}: the split arm is not bit-identical run to \
+                 run at step {i}, so there is no floor to measure the folded one against"
+            );
+        }
+        let scale = neutral_scale(&ctx, &serve, &split, tokens.len(), &walked);
+        split_arms.push((tokens, split, scale));
+    }
+
+    // The same budget of pages, in the other format; the serving path
+    // allocates the pool once in whichever format the knob names.
+    let (layers, heads, head_dim, page_size, pages) = {
+        let layout = serve.global_pool.layout();
+        (
+            layout.num_layers,
+            layout.num_kv_heads,
+            layout.head_dim,
+            layout.page_size,
+            serve.global_pool.capacity_pages(),
+        )
+    };
+    let rotary = serve.weights.config.global_rotary_dim;
+    serve.global_pool = KvPool::with_storage_and_format(
+        &ctx,
+        layers,
+        heads,
+        head_dim,
+        page_size,
+        pages,
+        KvStorage::Bf16,
+        KvFormat::Folded { rotary },
+    )
+    .expect("folded global pool");
+    eprintln!(
+        "global pool re-allocated as {:?}: {} elements per page against the split's",
+        serve.global_pool.layout().format,
+        serve.global_pool.layout().page_stride
+    );
+
+    let widest_scale = split_arms.iter().fold(0.0f32, |m, c| m.max(c.2));
+    let line = DRIFT_LINE;
+    let mut worst_overall = (0.0f32, 0usize, 0usize, 0usize);
+    for ((prompt, len), (tokens, split, scale)) in cells.iter().zip(&split_arms) {
+        let (folded, _) = continue_greedy(&ctx, &serve, tokens, STEPS);
+        let mut worst = (0.0f32, 0usize);
+        for (i, (a, b)) in split.iter().zip(&folded).enumerate() {
+            let gap = compare_row(a, b, &format!("prompt {prompt} at {len}, row {i}"));
+            if i == 0 {
+                assert!(
+                    gap <= 2.0,
+                    "prompt {prompt} at {len}: folded prefill |dlogit| {gap} above the \
+                     prefill line of 2.0"
+                );
+            } else if gap > worst.0 {
+                worst = (gap, i);
+            }
+        }
+        eprintln!(
+            "prompt {prompt} at {len} tokens: floor 0, neutral scale {scale}, \
+             folded decode |dlogit| {} at row {}",
+            worst.0, worst.1
+        );
+        assert!(
+            worst.0 <= line,
+            "prompt {prompt} at {len}: folded decode |dlogit| {} at row {} above the \
+             drift line of {line}",
+            worst.0,
+            worst.1
+        );
+        if worst.0 > worst_overall.0 {
+            worst_overall = (worst.0, worst.1, *prompt, *len);
+        }
+    }
+    eprintln!(
+        "folded against split over {} cells: neutral scale at most {widest_scale}, line \
+         {line}, worst decode |dlogit| {} at prompt {} length {} row {}",
+        cells.len(),
+        worst_overall.0,
+        worst_overall.2,
+        worst_overall.3,
+        worst_overall.1
+    );
 }
 
 /// The replacement global-attention kernel against the one it stands in for,

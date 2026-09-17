@@ -38,6 +38,7 @@ use crate::kv::LOCAL_PAGE_SIZE;
 use crate::kv::admit_tokens;
 use crate::prefix_cache::PrefixCache;
 use crate::serve::GemmaServe;
+use crate::serve::GlobalAttn;
 use crate::serve::StepArena;
 use crate::weights::Gemma4Weights;
 
@@ -166,11 +167,11 @@ fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>
     }
 }
 
-/// Which kernel serves the global family's prefill. Unset is the kernel the
-/// line has always used, byte for byte; `tilelang` is the generated one, which
-/// exists only in a build that had TileLang or a pre-generated directory.
-fn tilelang_global_attn() -> Result<bool> {
-    read_env(GLOBAL_ATTN_ENV)?.map_or(Ok(false), |raw| parse_tilelang_global_attn(&raw))
+/// The knob's value, or the incumbent when it is unset. The generated states
+/// need a build that had TileLang or a pre-generated directory; what each
+/// one serves and over which pool is [`GlobalAttn`]'s.
+fn global_attn() -> Result<GlobalAttn> {
+    read_env(GLOBAL_ATTN_ENV)?.map_or(Ok(GlobalAttn::Incumbent), |raw| parse_global_attn(&raw))
 }
 
 /// Refuse a checkpoint the generated bodies have no kernel for: the launcher
@@ -254,12 +255,15 @@ fn ensure_tilelang_device(device: usize) -> Result<()> {
     Ok(())
 }
 
-fn parse_tilelang_global_attn(raw: &str) -> Result<bool> {
+fn parse_global_attn(raw: &str) -> Result<GlobalAttn> {
     let value = raw.trim().to_ascii_lowercase();
     match value.as_str() {
-        "" | "0" | "off" => Ok(false),
-        "tilelang" => Ok(true),
-        _ => anyhow::bail!("{GLOBAL_ATTN_ENV}={raw:?} not recognized (off | tilelang)"),
+        "" | "0" | "off" => Ok(GlobalAttn::Incumbent),
+        "tilelang" => Ok(GlobalAttn::TileLang),
+        "tilelang640" => Ok(GlobalAttn::TileLangFolded),
+        _ => {
+            anyhow::bail!("{GLOBAL_ATTN_ENV}={raw:?} not recognized (off | tilelang | tilelang640)")
+        }
     }
 }
 
@@ -1154,17 +1158,17 @@ impl EngineState {
         let admit_coalesce = admit_coalesce_ms()?;
         let slots = decode_slots()?;
         let local_kv_storage = kv_fp8_storage()?;
-        let tilelang_global = tilelang_global_attn()?;
+        let global_attn = global_attn()?;
         // The stub tier links under the same name and refuses at launch, so
         // without this the answer would arrive after the weights are loaded
         // and on the first prompt rather than here.
         anyhow::ensure!(
-            !tilelang_global || pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
-            "{GLOBAL_ATTN_ENV}=tilelang needs a build that carries the kernel; \
-             this one fell back to the stub tier, so pegainfer-kernels was \
+            !global_attn.tilelang() || pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+            "{GLOBAL_ATTN_ENV} asks for the generated kernel, which needs a build that \
+             carries it; this one fell back to the stub tier, so pegainfer-kernels was \
              compiled without TileLang and without a pre-generated directory"
         );
-        if tilelang_global {
+        if global_attn.tilelang() {
             tilelang_geometry_refusal(&config)?;
             ensure_tilelang_device(device)?;
         }
@@ -1259,7 +1263,7 @@ impl EngineState {
             local_kv_storage,
             local_pages,
             global_pages,
-            tilelang_global,
+            global_attn,
         )
         .map_err(|err| {
             err.context(format!(
@@ -1268,6 +1272,21 @@ impl EngineState {
                      global pages"
             ))
         })?;
+        // The page count is the budget's; what a page costs is the format's.
+        // Said once here, so a pool that came out a different size than the
+        // format promised is visible at start-up rather than at the OOM.
+        {
+            let layout = serve.global_pool.layout();
+            let pages = serve.global_pool.capacity_pages();
+            let page_bytes = layout.page_stride * layout.storage.elem_bytes();
+            log::info!(
+                "gemma4 global KV pool: {pages} pages x {page_bytes} B ({:?}, {} columns per \
+                 head) = {:.2} GiB",
+                layout.format,
+                layout.format.row_width(layout.head_dim),
+                (pages * page_bytes) as f64 / (1u64 << 30) as f64
+            );
+        }
         let prefix_cache = cache_cap.map(|k| PrefixCache::new(k, sliding_window));
         let mut scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
         let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
@@ -2613,15 +2632,30 @@ mod knob_tests {
 
     #[test]
     fn global_attn_parses_or_refuses() {
-        assert!(!parse_tilelang_global_attn("off").expect("off parses"));
-        assert!(!parse_tilelang_global_attn("").expect("empty parses"));
-        assert!(!parse_tilelang_global_attn("0").expect("zero parses"));
-        assert!(parse_tilelang_global_attn(" TileLang ").expect("trimmed and cased"));
-        for bad in ["on", "1", "flashinfer", "tile", "tilelang:1"] {
-            assert!(
-                parse_tilelang_global_attn(bad).is_err(),
-                "{bad:?} must refuse"
+        for off in ["off", "", "0"] {
+            assert_eq!(
+                parse_global_attn(off).expect("off parses"),
+                GlobalAttn::Incumbent
             );
+        }
+        assert_eq!(
+            parse_global_attn(" TileLang ").expect("trimmed and cased"),
+            GlobalAttn::TileLang
+        );
+        assert_eq!(
+            parse_global_attn("tilelang640").expect("folded parses"),
+            GlobalAttn::TileLangFolded
+        );
+        for bad in [
+            "on",
+            "1",
+            "flashinfer",
+            "tile",
+            "tilelang:1",
+            "640",
+            "tilelang1024",
+        ] {
+            assert!(parse_global_attn(bad).is_err(), "{bad:?} must refuse");
         }
     }
 

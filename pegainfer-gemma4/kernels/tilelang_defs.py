@@ -1,4 +1,10 @@
-"""TileLang definition of Gemma 4's global-attention prefill at head dim 512.
+"""TileLang definitions of Gemma 4's global attention at head dim 512.
+
+Two kernels for the prefill's causal read over a prompt, and two for the
+decode's split-KV read over a request's whole context. The decode is a
+different problem: its compute is trivial and only the bytes in flight
+matter, so what makes it fast is different too, and is written at its own
+definition below.
 
 Authored here, not vendored: upstream has no kernel for this head dim on
 SM90 — FlashInfer's Hopper prefill compiles 64, 128 and 256 only — so the
@@ -60,6 +66,30 @@ QBLK = 8
 PASS_CONFIGS = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}
 
 
+def folded_value_bands(dim, fold_rotary):
+    """Where a folded row's value operand puts each head column, as bands.
+
+    A folded row is `[K_rot | V_identity | V_rot]`, `dim + fold_rotary` wide,
+    in the permutation of `KvFormat::permute` (paged_kv.rs): with
+    `rh = fold_rotary / 2` and `h = dim / 2`, head columns `[0, rh)` and
+    `[h, h + rh)` are the rotated set and come first, then `[rh, h)` and
+    `[h + rh, dim)`. The score operand is the row's first `dim` columns and
+    the value operand its last `dim`, so the value operand's columns hold, in
+    order, `[rh, h)`, `[h + rh, dim)`, then V's rotated set. Undoing that at
+    the store is the whole cost of the format on the read side, and it is
+    four contiguous bands `(operand column, length, head column)`, so the
+    store stays four affine copies rather than one scattered one.
+    """
+    rh = fold_rotary // 2
+    h = dim // 2
+    return (
+        (0, h - rh, rh),
+        (h - rh, h - rh, h + rh),
+        (dim - 2 * rh, rh, 0),
+        (dim - rh, rh, h),
+    )
+
+
 def prefill_varlen(
     heads,
     groups,
@@ -74,6 +104,7 @@ def prefill_varlen(
     num_stages=NUM_STAGES,
     threads=THREADS,
     qblk=QBLK,
+    fold_rotary=0,
 ):
     """Causal GQA prefill over the paged pool, ragged across requests.
 
@@ -83,11 +114,22 @@ def prefill_varlen(
     store predicate and from the walk's own trip count. The two tensors the
     lowering reads through TMA carry their extents in the descriptors the
     launcher builds, so those are the step's own.
+
+    `fold_rotary` is the pool's row format. Zero is the split format: a row
+    is one head of K, and the layer's V rows sit one page after its K rows.
+    Otherwise it is the folded format, `dim + fold_rotary` wide, whose score
+    operand is the row's first `dim` columns and value operand its last
+    `dim`, with the output store undoing the row's column order.
     """
     assert block_N == page_size, "one tile must be one page, or the load splits"
     head_kv = heads // groups
     q_shape = [q_rows, heads, dim]
-    kv_shape = [pool_rows, head_kv, dim]
+    kv_shape = [pool_rows, head_kv, dim + fold_rotary]
+    # The builder takes only TIR ranges as loop iterables, so the four bands
+    # are plain integers here and four written-out loops below.
+    (a_src, a_len, a_dst), (b_src, b_len, b_dst), (c_src, c_len, c_dst), (d_src, d_len, d_dst) = (
+        folded_value_bands(dim, fold_rotary)
+    )
 
     @T.prim_func
     def main(
@@ -186,7 +228,10 @@ def prefill_varlen(
                         # tokens, so the layer's K block starts `layer_row` into
                         # the page and its V block one page further.
                         kb = PageIndices[PageIndptr[b] + k] * rows_per_page + layer_row
-                        T.copy(KV[kb : kb + page_size, kv_head, :], K_shared)
+                        if fold_rotary == 0:
+                            T.copy(KV[kb : kb + page_size, kv_head, :], K_shared)
+                        else:
+                            T.copy(KV[kb : kb + page_size, kv_head, 0:dim], K_shared)
                         for i, j in T.Parallel(block_M, block_N):
                             acc_s[i, j] = T.if_then_else(
                                 q_tile * block_M + i + offset < k * block_N + j, -1e9, 0
@@ -219,10 +264,16 @@ def prefill_varlen(
 
                         for i, j in T.Parallel(block_M, dim):
                             acc_o[i, j] *= scores_scale[i]
-                        T.copy(
-                            KV[kb + page_size : kb + 2 * page_size, kv_head, :],
-                            V_shared,
-                        )
+                        if fold_rotary == 0:
+                            T.copy(
+                                KV[kb + page_size : kb + 2 * page_size, kv_head, :],
+                                V_shared,
+                            )
+                        else:
+                            T.copy(
+                                KV[kb : kb + page_size, kv_head, fold_rotary : fold_rotary + dim],
+                                V_shared,
+                            )
                         T.gemm(
                             S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullCol
                         )
@@ -234,8 +285,318 @@ def prefill_varlen(
                     # buffers already sit at the SM90 dynamic limit, so the store
                     # stages through it rather than its own.
                     T.copy(acc_o, Q_shared)
-                    for i, d in T.Parallel(block_M, dim):
-                        if q_tile * block_M + i < q_len:
-                            Output[row + i, head, d] = Q_shared[i, d]
+                    if fold_rotary == 0:
+                        for i, d in T.Parallel(block_M, dim):
+                            if q_tile * block_M + i < q_len:
+                                Output[row + i, head, d] = Q_shared[i, d]
+                    else:
+                        for i, d in T.Parallel(block_M, a_len):
+                            if q_tile * block_M + i < q_len:
+                                Output[row + i, head, a_dst + d] = Q_shared[i, a_src + d]
+                        for i, d in T.Parallel(block_M, b_len):
+                            if q_tile * block_M + i < q_len:
+                                Output[row + i, head, b_dst + d] = Q_shared[i, b_src + d]
+                        for i, d in T.Parallel(block_M, c_len):
+                            if q_tile * block_M + i < q_len:
+                                Output[row + i, head, c_dst + d] = Q_shared[i, c_src + d]
+                        for i, d in T.Parallel(block_M, d_len):
+                            if q_tile * block_M + i < q_len:
+                                Output[row + i, head, d_dst + d] = Q_shared[i, d_src + d]
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# Decode: split-KV partial and merge. A CTA is one (slot, kv head), a slot one
+# chunk of one request, so every KV byte is read from HBM once and reused from
+# shared memory by the group's heads. Three shapes the lowering forces:
+#
+#   * the gemm wants sixteen rows and a group has eight, so the query tile is
+#     padded with zero rows, never stored.
+#   * that tile is filled elementwise: an eight-row view into it does not
+#     lower, the copy's layout is not a bijection.
+#   * one key tile is one page. A half-page tile lands on a warp partition the
+#     gemm refuses, a narrower block on a layout the copy cannot cover.
+#
+# The partial pass then reads at about 96% of the card's measured read roof at
+# long context; the merge is a small second pass over each request's slots.
+
+DECODE_M_PAD = 16
+DECODE_THREADS = 256
+DECODE_STAGES = 1
+# The folded row is read as one 640-wide tile, 80 KB against the split
+# format's two 64 KB tiles, which is what lets a second stage fit under the
+# SM90 ceiling and the next page's load overlap this page's gemms.
+DECODE_STAGES_FOLDED = 2
+# The merge's first level folds this many slots per CTA; the second level
+# walks the group heads. One level walking every slot of a 163K request is
+# 639 dependent loads on 32 CTAs, and measured at 136 us against 15-20 for
+# the two levels.
+DECODE_MERGE_SPAN = 32
+
+
+def decode_stages(fold_rotary):
+    """The pipeline depth a row format's partial is lowered with."""
+    return DECODE_STAGES_FOLDED if fold_rotary else DECODE_STAGES
+
+
+def decode_partial(
+    heads,
+    groups,
+    dim,
+    page_size,
+    max_rows,
+    max_batch,
+    max_slots,
+    pool_rows,
+    page_table_len,
+    stages=DECODE_STAGES,
+    threads=DECODE_THREADS,
+    fold_rotary=0,
+):
+    """The partial pass: one (slot, kv head) per CTA over that slot's chunk.
+
+    Writes, per slot and query head, the chunk's output normalised by its own
+    row sum, and the row's log-sum-exp in the exp2 domain; the merge below
+    reads both. `chunk_pages` is the chunk the tile indices count in, as
+    pages, and comes from the caller so the two agree by construction.
+    `fold_rotary` is the pool's row format, as for the prefill; the partial
+    output is stored in head order either way, so one merge serves both.
+    """
+    head_kv = heads // groups
+    m_pad = DECODE_M_PAD
+    assert groups <= m_pad, "a group has to fit the padded query tile"
+    (a_src, a_len, a_dst), (b_src, b_len, b_dst), (c_src, c_len, c_dst), (d_src, d_len, d_dst) = (
+        folded_value_bands(dim, fold_rotary)
+    )
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor([max_rows, heads, dim], DTYPE),
+        KV: T.Tensor([pool_rows, head_kv, dim + fold_rotary], DTYPE),
+        PageIndices: T.Tensor([page_table_len], "int32"),
+        PageIndptr: T.Tensor([max_batch + 1], "int32"),
+        LastPageLen: T.Tensor([max_batch], "int32"),
+        RequestIndices: T.Tensor([max_slots], "int32"),
+        KvTileIndices: T.Tensor([max_slots], "int32"),
+        ValidMask: T.Tensor([max_slots], "uint8"),
+        sm_scale: T.float32,
+        rows_per_page: T.int32,
+        layer_row: T.int32,
+        row_offset: T.int32,
+        chunk_pages: T.int32,
+        padded_slots: T.int32,
+        TmpV: T.Tensor([max_slots, heads, dim], DTYPE),
+        TmpS: T.Tensor([max_slots, heads], ACC),
+    ):
+        with T.Kernel(padded_slots, head_kv, threads=threads) as (s, h):
+            scale = sm_scale * 1.44269504
+            Q_shared = T.alloc_shared([m_pad, dim], DTYPE)
+            if fold_rotary == 0:
+                K_shared = T.alloc_shared([page_size, dim], DTYPE)
+                V_shared = T.alloc_shared([page_size, dim], DTYPE)
+            else:
+                # One tile holds the whole row; the score operand is its
+                # first `dim` columns and the value operand its last.
+                KV_shared = T.alloc_shared([page_size, dim + fold_rotary], DTYPE)
+            S_shared = T.alloc_shared([m_pad, page_size], DTYPE)
+            acc_s = T.alloc_fragment([m_pad, page_size], ACC)
+            acc_o = T.alloc_fragment([m_pad, dim], ACC)
+            m_cur = T.alloc_fragment([m_pad], ACC)
+            m_prev = T.alloc_fragment([m_pad], ACC)
+            m_scale = T.alloc_fragment([m_pad], ACC)
+            row_sum = T.alloc_fragment([m_pad], ACC)
+            logsum = T.alloc_fragment([m_pad], ACC)
+
+            if ValidMask[s] != 0:
+                r = RequestIndices[s]
+                t = KvTileIndices[s]
+                pages = PageIndptr[r + 1] - PageIndptr[r]
+                kv_len = (pages - 1) * page_size + LastPageLen[r]
+                first = t * chunk_pages
+                n_pages = T.min(chunk_pages, pages - first)
+
+                for i, d in T.Parallel(m_pad, dim):
+                    Q_shared[i, d] = T.if_then_else(
+                        i < groups, Q[row_offset + r, h * groups + i, d], 0
+                    )
+                T.fill(acc_o, 0)
+                T.fill(logsum, 0)
+                T.fill(m_cur, -T.infinity(ACC))
+
+                for p in T.Pipelined(n_pages, num_stages=stages):
+                    kb = PageIndices[PageIndptr[r] + first + p] * rows_per_page + layer_row
+                    if fold_rotary == 0:
+                        T.copy(KV[kb : kb + page_size, h, :], K_shared)
+                    else:
+                        T.copy(KV[kb : kb + page_size, h, :], KV_shared)
+                    # Keys past the request's length live only in its last page.
+                    for i, j in T.Parallel(m_pad, page_size):
+                        acc_s[i, j] = T.if_then_else(
+                            (first + p) * page_size + j < kv_len, 0, -1e9
+                        )
+                    if fold_rotary == 0:
+                        T.gemm(
+                            Q_shared,
+                            K_shared,
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                    else:
+                        T.gemm(
+                            Q_shared,
+                            KV_shared[:, 0:dim],
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                    T.copy(m_cur, m_prev)
+                    T.fill(m_cur, -T.infinity(ACC))
+                    T.reduce_max(acc_s, m_cur, dim=1, clear=False)
+                    for i in T.Parallel(m_pad):
+                        m_cur[i] = T.max(m_cur[i], m_prev[i])
+                    for i in T.Parallel(m_pad):
+                        m_scale[i] = T.exp2(m_prev[i] * scale - m_cur[i] * scale)
+                    for i, j in T.Parallel(m_pad, page_size):
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - m_cur[i] * scale)
+                    T.reduce_sum(acc_s, row_sum, dim=1)
+                    for i in T.Parallel(m_pad):
+                        logsum[i] = logsum[i] * m_scale[i] + row_sum[i]
+                    T.copy(acc_s, S_shared)
+                    for i, d in T.Parallel(m_pad, dim):
+                        acc_o[i, d] *= m_scale[i]
+                    if fold_rotary == 0:
+                        T.copy(KV[kb + page_size : kb + 2 * page_size, h, :], V_shared)
+                        T.gemm(S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                    else:
+                        T.gemm(
+                            S_shared,
+                            KV_shared[:, fold_rotary : fold_rotary + dim],
+                            acc_o,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+
+                if fold_rotary == 0:
+                    for i, d in T.Parallel(m_pad, dim):
+                        if i < groups:
+                            TmpV[s, h * groups + i, d] = acc_o[i, d] / logsum[i]
+                else:
+                    # The permuted store goes through shared memory, as the
+                    # prefill's does. Storing straight from the accumulator
+                    # with a permuted index lowers to a loop whose thread
+                    # mapping is inferred from the store rather than from the
+                    # fragment, and reads the accumulator in that mapping.
+                    for i, d in T.Parallel(m_pad, dim):
+                        acc_o[i, d] = acc_o[i, d] / logsum[i]
+                    T.copy(acc_o, Q_shared)
+                    for i, d in T.Parallel(m_pad, a_len):
+                        if i < groups:
+                            TmpV[s, h * groups + i, a_dst + d] = Q_shared[i, a_src + d]
+                    for i, d in T.Parallel(m_pad, b_len):
+                        if i < groups:
+                            TmpV[s, h * groups + i, b_dst + d] = Q_shared[i, b_src + d]
+                    for i, d in T.Parallel(m_pad, c_len):
+                        if i < groups:
+                            TmpV[s, h * groups + i, c_dst + d] = Q_shared[i, c_src + d]
+                    for i, d in T.Parallel(m_pad, d_len):
+                        if i < groups:
+                            TmpV[s, h * groups + i, d_dst + d] = Q_shared[i, d_src + d]
+                for i in T.Parallel(m_pad):
+                    if i < groups:
+                        TmpS[s, h * groups + i] = m_cur[i] * scale + T.log2(logsum[i])
+
+    return main
+
+
+def decode_merge_groups(heads, dim, max_batch, max_slots, span=DECODE_MERGE_SPAN, threads=DECODE_THREADS):
+    """The merge's first level: one (request, query head, group of `span`
+    slots) per CTA, folded in place into the group's first slot.
+
+    The standard log-sum-exp combination of the partial pass's state over
+    the group; the group's own state then stands where its first slot was,
+    with the row sum folded into the log-sum-exp so the second level reads a
+    normalised value and one scale, the same contract a single slot has. A
+    CTA past its request's slots does nothing, so the grid can carry the
+    batch's widest request.
+    """
+
+    @T.prim_func
+    def main(
+        TmpV: T.Tensor([max_slots, heads, dim], DTYPE),
+        TmpS: T.Tensor([max_slots, heads], ACC),
+        OIndptr: T.Tensor([max_batch + 1], "int32"),
+        batch: T.int32,
+        groups: T.int32,
+    ):
+        with T.Kernel(batch, heads, groups, threads=threads) as (r, hd, g):
+            acc = T.alloc_fragment([dim], ACC)
+            m_all = T.alloc_local([1], ACC)
+            l_all = T.alloc_local([1], ACC)
+            lo = OIndptr[r] + g * span
+            hi = T.min(OIndptr[r] + (g + 1) * span, OIndptr[r + 1])
+            if lo < hi:
+                m_all[0] = -T.infinity(ACC)
+                for k in T.serial(hi - lo):
+                    m_all[0] = T.max(m_all[0], TmpS[lo + k, hd])
+                l_all[0] = 0
+                T.fill(acc, 0)
+                for k in T.serial(hi - lo):
+                    w = T.exp2(TmpS[lo + k, hd] - m_all[0])
+                    l_all[0] += w
+                    for d in T.Parallel(dim):
+                        acc[d] += w * TmpV[lo + k, hd, d].astype(ACC)
+            # The group folds into its own first slot, so the stores below
+            # land on rows the reads above just took. Every thread reads the
+            # whole of `TmpS` over the group and only its own lanes of
+            # `TmpV`, so without a barrier here a thread that finished the
+            # walk would overwrite state another is still reading. Both
+            # `lo` and `hi` come from the block's own indices, so the barrier
+            # sits outside the branch and every thread reaches it.
+            T.sync_threads()
+            if lo < hi:
+                for d in T.Parallel(dim):
+                    TmpV[lo, hd, d] = acc[d] / l_all[0]
+                # One writer for the scalar: every thread holds the same
+                # value, and a single store says so.
+                if T.get_thread_binding() == 0:
+                    TmpS[lo, hd] = m_all[0] + T.log2(l_all[0])
+
+    return main
+
+
+def decode_merge(heads, dim, max_rows, max_batch, max_slots, span=DECODE_MERGE_SPAN, threads=DECODE_THREADS):
+    """The merge's second level: one (request, query head) per CTA over the
+    request's group heads, `span` slots apart, into the output row.
+    """
+
+    @T.prim_func
+    def main(
+        TmpV: T.Tensor([max_slots, heads, dim], DTYPE),
+        TmpS: T.Tensor([max_slots, heads], ACC),
+        OIndptr: T.Tensor([max_batch + 1], "int32"),
+        row_offset: T.int32,
+        batch: T.int32,
+        Output: T.Tensor([max_rows, heads, dim], DTYPE),
+    ):
+        with T.Kernel(batch, heads, threads=threads) as (r, hd):
+            acc = T.alloc_fragment([dim], ACC)
+            m_all = T.alloc_local([1], ACC)
+            l_all = T.alloc_local([1], ACC)
+            lo = OIndptr[r]
+            hi = OIndptr[r + 1]
+            n_groups = T.ceildiv(hi - lo, span)
+            m_all[0] = -T.infinity(ACC)
+            for k in T.serial(n_groups):
+                m_all[0] = T.max(m_all[0], TmpS[lo + k * span, hd])
+            l_all[0] = 0
+            T.fill(acc, 0)
+            for k in T.serial(n_groups):
+                w = T.exp2(TmpS[lo + k * span, hd] - m_all[0])
+                l_all[0] += w
+                for d in T.Parallel(dim):
+                    acc[d] += w * TmpV[lo + k * span, hd, d].astype(ACC)
+            for d in T.Parallel(dim):
+                Output[row_offset + r, hd, d] = acc[d] / l_all[0]
 
     return main

@@ -304,8 +304,21 @@ because RoPE is the identity there.
 The wrong version is one line away: the paged-KV assembly takes `k_offset_elems` and
 `v_offset_elems` as separate offsets into one buffer, and passing the same offset twice aliases
 them — wrong output rather than a crash. The Gemma entries close this by deriving both offsets from
-one checked layout derivation; other callers still own it. So the cache stores both and
-`layer_stride = 2 × kv_block_len` stays.
+one checked layout derivation; other callers still own it. So under the incumbent kernel the cache
+stores both and `layer_stride = 2 × kv_block_len` stays: FlashInfer's paged view is two base
+pointers and a stride, and cannot express anything else.
+
+The generated kernel is not so bound, and `PEGAINFER_GLOBAL_ATTN=tilelang640` allocates the global
+pool in the folded format (`KvFormat::Folded`): one row of 640 columns per token per head, laid out
+`[K_rot | V_identity | V_rot]`. The proportional RoPE rotates 128 of the 512 columns, and outside
+them `K = V × w_k` exactly, so K is stored only at its rotated columns, V in full with its rotated
+columns moved last, and `w_k` rides the query's identity columns instead. The score operand is the
+row's first 512 columns and the value operand its last 512; the store undoes the permutation. The
+writer is told the row as bands (`row_width`, `fold_rotary`), the readers are lowered per format
+behind one launcher, and `layer_stride` is one block of `page × heads × 640`. The saving is real
+bytes per token — 37.5% of the global family's cache and of every decode step's traffic — at the
+cost of one bf16 rounding on the folded weight, which the format parity and the serving oracle
+hold to the same lines as the kernel swap itself.
 
 One tempting derivative is explicitly **not promised**: storing the pre-fork `k_proj` output
 (8 KiB/token) on offload boundaries to halve the global family's checkpoint growth. The raw

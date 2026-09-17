@@ -78,6 +78,8 @@ GATES_KV_AND_LANES=(
 # prerequisite this script can arrange.
 GATES_TILELANG_GLOBAL=(
   "gpu,ckpt,prompts,tlgeom serve::oracle::the_replacement_global_kernel_matches_the_incumbent"
+  "gpu,ckpt,prompts,tlgeom serve::oracle::the_replacement_global_decode_matches_the_incumbent"
+  "gpu,ckpt,prompts,tlgeom serve::oracle::the_folded_pool_matches_the_split_one"
 )
 # The disagreeing-config gate deliberately fails before any device is opened.
 GATES_LOADER=(
@@ -572,10 +574,13 @@ for entry in "${selected[@]}"; do
   if [ "$require_gpu_env" -eq 1 ]; then
     model_env=(env PEGAINFER_REQUIRE_GPU=1)
   fi
+  # A gate that sweeps prints a row per cell, and the build chatter ahead of
+  # it is longer than it looks; at twenty lines the first cells of a nine-cell
+  # sweep fell off and the table reaching the log was missing its worst rows.
   echo "--- [$profile] $gate"
   if "${model_env[@]}" cargo test --release -p "$test_crate" "${feature_args[@]}" \
       "${target_args[@]}" -- \
-      "${ignored_args[@]}" --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
+      "${ignored_args[@]}" --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -40; then
     completed=$((completed + 1))
   else
     failed+=("[$profile] $gate")

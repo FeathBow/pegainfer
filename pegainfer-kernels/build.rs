@@ -1571,13 +1571,24 @@ const GEMMA4_TILELANG: TileLangFamily = TileLangFamily {
 
 /// The hd512 global-attention prefill: the packed query rows and the output,
 /// the plan's page table, its per-request indptrs and final-page fills, and
-/// the run-time extents and pool geometry. The query indptr arrives twice,
-/// on the device for the body and on the host for the launcher's grid.
-const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[(
-    "gemma4_hd512_prefill_varlen",
-    "const void*, const void*, const int*, const int*, const int*, const int*, \
-     const int*, void*, int, int, int, int, int, int, int, int, float",
-)];
+/// the run-time extents, pool geometry and row format. The query indptr
+/// arrives twice, on the device for the body and on the host for the grid.
+const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
+    (
+        "gemma4_hd512_prefill_varlen",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, void*, int, int, int, int, int, int, int, int, int, float",
+    ),
+    // The split-KV decode: the plan's per-slot arrays and workspace, the
+    // decode rows' offset into the step's buffers, the run-time extents,
+    // pool geometry and row format, and the chunk the tile indices count in.
+    (
+        "gemma4_hd512_decode_split_kv",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, const unsigned char*, const int*, void*, float*, void*, int, int, \
+         int, int, int, int, int, int, int, int, int, int, float",
+    ),
+];
 
 const K3_TILELANG: TileLangFamily = TileLangFamily {
     label: "K3",

@@ -2,13 +2,19 @@
 // Differs from the hd256 sibling in three ways that are choices, not
 // oversights: plain w rather than the 1+w offset, no gate, and no separate
 // V input — V is the weightless RMS of the same raw row K reduces, so the
-// kernel reuses inv_rms and writes V = x * inv_rms into the pool's V block
-// alongside K.
+// kernel reuses inv_rms and writes V = x * inv_rms into the pool alongside K.
 //
-// rotary_dim is a runtime argument, checked at the launcher for positive,
-// even and <= HD512. Evenness is load-bearing: with half_rotary floored, an
-// odd value leaves index rotary_dim - 1 written by neither branch.
-
+// The rotation is the engine's proportional one: rotate_half pairs
+// (d, d + 256) over cos/sin tables 512 wide whose entries past the live
+// angles are the identity. `row_width` is the pool row's columns per
+// (token, kv head) and `fold_rotary` how many of K's columns rotate.
+//
+// fold_rotary == 0: K and V are two 512-wide blocks at k_offset_elems and
+// v_offset_elems. Otherwise one row of 512 + fold_rotary columns holds
+// [K_rot | V_identity | V_rot]: K only where it rotates, V everywhere, and
+// K's identity columns not at all, since there K is V times the norm weight
+// and that weight rides the query. The column order is `KvFormat::permute`
+// in paged_kv.rs, restated here as folded_col; the two must agree.
 //
 // Positions and page ids are trapped on device — checking either on the
 // host would require a D2H synchronization.
@@ -18,8 +24,19 @@
 #include "qk_prep.cuh"
 
 #define HD512 512
+#define HALF_HD512 (HD512 / 2)
 #define THREADS_HD512 512
 #define NUM_WARPS_HD512 (THREADS_HD512 / WARP_SIZE)
+
+// Where head column d lands in a folded row's first HD512 columns: the rh
+// live pairs' columns first, in order, then the rest. rh == 0 is the
+// identity, which is the split format's row.
+__device__ __forceinline__ int folded_col(int d, int rh) {
+    if (d < rh) return d;
+    if (d >= HALF_HD512 && d < HALF_HD512 + rh) return d - HALF_HD512 + rh;
+    if (d < HALF_HD512) return d + rh;
+    return d;
+}
 
 __device__ __forceinline__ __nv_bfloat16 rms_norm_elem_hd512(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
@@ -51,7 +68,8 @@ __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
     int num_kv_heads,
     int start_pos,                                  // host base position
     int cos_max_pos,                                // rows in cos/sin tables
-    int rotary_dim,
+    int row_width,                                  // pool columns per (token, kv head)
+    int fold_rotary,                                // K's rotated columns kept; 0 = split
     float rms_eps,
     int page_size,
     int num_pages,                                  // pool capacity in pages
@@ -103,6 +121,14 @@ __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
     int pos = PER_TOKEN_META ? positions[token] : start_pos + token;
     // Reject before reading the cos/sin tables.
     if (pos < 0 || pos >= cos_max_pos) __trap();
+    // The row's bands: with rh live pairs, head column d is rotated when it
+    // is in one. The split format has no live pair here and sends every
+    // pair through the table, whose identity beyond the live angles makes
+    // the whole head K.
+    const int rh = fold_rotary / 2;
+    const bool folded = fold_rotary > 0;
+    const bool rotated = d < rh || (d >= HALF_HD512 && d < HALF_HD512 + rh);
+    const int col = folded_col(d, rh);
     // Check the device-resident page id before the first pool write. Q
     // threads never touch the pool.
     int page_id = -1;
@@ -122,47 +148,44 @@ __global__ void qk_norm_partial_rope_paged_prefill_hd512_kernel(
         page_id = pages[row];
         if (page_id < 0 || page_id >= num_pages) __trap();
         // V is the K=V fork: the weightless norm of the same raw vector,
-        // sharing inv_rms. No RoPE, no weight.
-        int64_t v_dst = paged_kv_offset<HD512>(
-            page_id, v_offset_elems, stride_page, page_size,
-            num_kv_heads, pos, head_local, d);
+        // sharing inv_rms. No RoPE, no weight. A folded row keeps V's
+        // rotated columns past the head.
+        int64_t v_dst = paged_kv_row_offset(
+            page_id, v_offset_elems, stride_page, page_size, num_kv_heads,
+            row_width, pos, head_local, rotated ? HD512 + col : col);
         kv_data[v_dst] = __float2bfloat16(__bfloat162float(x) * inv_rms);
     }
-    int half_rotary = rotary_dim / 2;
 
-    if (d < half_rotary) {
+    const int pair_span = folded ? rh : HALF_HD512;
+    if (d < pair_span) {
         __nv_bfloat16 lo = smem[d];
-        __nv_bfloat16 hi = smem[d + half_rotary];
+        __nv_bfloat16 hi = smem[d + HALF_HD512];
         apply_rope_pair(
             lo,
             hi,
-            cos_cache[pos * rotary_dim + d],
-            sin_cache[pos * rotary_dim + d]
+            cos_cache[pos * HD512 + d],
+            sin_cache[pos * HD512 + d]
         );
+        const int col_hi = folded_col(d + HALF_HD512, rh);
 
         if (is_q) {
             int dst = token * q_dim + head_local * HD512;
-            q_batch_out[dst + d] = lo;
-            q_batch_out[dst + d + half_rotary] = hi;
+            q_batch_out[dst + col] = lo;
+            q_batch_out[dst + col_hi] = hi;
         } else {
-            int64_t dst = paged_kv_offset<HD512>(
-                page_id, k_offset_elems, stride_page, page_size,
-                num_kv_heads, pos, head_local, d);
-            kv_data[dst] = lo;
-            kv_data[dst + half_rotary] = hi;
+            int64_t dst = paged_kv_row_offset(
+                page_id, k_offset_elems, stride_page, page_size, num_kv_heads,
+                row_width, pos, head_local, 0);
+            kv_data[dst + col] = lo;
+            kv_data[dst + col_hi] = hi;
         }
-    }
-
-    if (d >= rotary_dim) {
-        if (is_q) {
-            int dst = token * q_dim + head_local * HD512;
-            q_batch_out[dst + d] = smem[d];
-        } else {
-            int64_t dst = paged_kv_offset<HD512>(
-                page_id, k_offset_elems, stride_page, page_size,
-                num_kv_heads, pos, head_local, d);
-            kv_data[dst] = smem[d];
-        }
+    } else if (folded && !rotated && is_q) {
+        // An identity column of the folded row: the pool holds V there and
+        // K's norm weight rides the query, so the query carries both.
+        int dst = token * q_dim + head_local * HD512;
+        q_batch_out[dst + col] = __float2bfloat16(
+            __bfloat162float(x) * inv_rms
+            * __bfloat162float(q_norm_weight[d]) * __bfloat162float(k_norm_weight[d]));
     }
 }
 
@@ -280,7 +303,8 @@ int qk_norm_partial_rope_paged_prefill_hd512_cuda(
     int seq_len,
     int start_pos,
     int cos_max_pos,
-    int rotary_dim,
+    int row_width,
+    int fold_rotary,
     float rms_eps,
     int page_size,
     int num_pages,
@@ -288,10 +312,17 @@ int qk_norm_partial_rope_paged_prefill_hd512_cuda(
     cudaStream_t stream
 ) {
     PEGAINFER_FFI_GUARD_BEGIN
-    if (rotary_dim <= 0 || (rotary_dim & 1) != 0 || rotary_dim > HD512) {
+    if (fold_rotary < 0 || (fold_rotary & 1) != 0 || fold_rotary > HD512 ||
+        row_width != HD512 + fold_rotary) {
         pegainfer_ffi_set_last_error(
-            "qk_norm_partial_rope_paged_prefill_hd512_cuda: rotary_dim must be "
-            "positive, even and <= 512");
+            "qk_norm_partial_rope_paged_prefill_hd512_cuda: row_width must be "
+            "512 + fold_rotary, with fold_rotary even and in [0, 512]");
+        return -1;
+    }
+    if (fold_rotary > 0 && k_offset_elems != v_offset_elems) {
+        pegainfer_ffi_set_last_error(
+            "qk_norm_partial_rope_paged_prefill_hd512_cuda: a folded row holds "
+            "K and V in one block");
         return -1;
     }
     if (q_batch == nullptr || k_batch == nullptr || q_norm_weight == nullptr ||
@@ -333,7 +364,8 @@ int qk_norm_partial_rope_paged_prefill_hd512_cuda(
         num_kv_heads,
         start_pos,
         cos_max_pos,
-        rotary_dim,
+        row_width,
+        fold_rotary,
         rms_eps,
         page_size,
         num_pages,
@@ -439,7 +471,8 @@ int qk_norm_partial_rope_paged_decode_hd512_cuda(
     int num_kv_heads,
     int batch,
     int cos_max_pos,
-    int rotary_dim,
+    int row_width,
+    int fold_rotary,
     float rms_eps,
     int page_size,
     int num_pages,
@@ -447,10 +480,17 @@ int qk_norm_partial_rope_paged_decode_hd512_cuda(
     cudaStream_t stream
 ) {
     PEGAINFER_FFI_GUARD_BEGIN
-    if (rotary_dim <= 0 || (rotary_dim & 1) != 0 || rotary_dim > HD512) {
+    if (fold_rotary < 0 || (fold_rotary & 1) != 0 || fold_rotary > HD512 ||
+        row_width != HD512 + fold_rotary) {
         pegainfer_ffi_set_last_error(
-            "qk_norm_partial_rope_paged_decode_hd512_cuda: rotary_dim must be "
-            "positive, even and <= 512");
+            "qk_norm_partial_rope_paged_decode_hd512_cuda: row_width must be "
+            "512 + fold_rotary, with fold_rotary even and in [0, 512]");
+        return -1;
+    }
+    if (fold_rotary > 0 && k_offset_elems != v_offset_elems) {
+        pegainfer_ffi_set_last_error(
+            "qk_norm_partial_rope_paged_decode_hd512_cuda: a folded row holds "
+            "K and V in one block");
         return -1;
     }
     if (q_batch == nullptr || k_batch == nullptr ||
@@ -490,7 +530,8 @@ int qk_norm_partial_rope_paged_decode_hd512_cuda(
         num_kv_heads,
         0,
         cos_max_pos,
-        rotary_dim,
+        row_width,
+        fold_rotary,
         rms_eps,
         page_size,
         num_pages,

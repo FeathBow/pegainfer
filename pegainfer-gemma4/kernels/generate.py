@@ -1,9 +1,15 @@
-"""AOT-compile the Gemma 4 hd512 prefill kernel into one CUDA file.
+"""AOT-compile the Gemma 4 hd512 global-attention kernels into one CUDA file.
 
 `pegainfer-kernels/build.rs` runs this under the `gemma4` feature and hands
 the result to nvcc. It prints the same `KEY=VALUE` manifest every TileLang
 family prints, and mirrors it into `manifest.txt` so a build host can consume
 a pre-generated directory without TileLang installed.
+
+Two launchers come out: the prefill over one lowered kernel, and the split-KV
+decode over two (a partial pass and a merge) behind one call. Each launcher is
+a spec -- its C parameters, its refusals, and for each kernel it launches how
+the lowered entry's parameters bind to those C arguments -- and the rendering
+is one routine over the specs, so a third kernel is a spec and not a copy.
 
 What makes this family different from the K3 one is the lowering: the key and
 query loads become bulk copies, so TileLang passes those two tensors as TMA
@@ -23,6 +29,7 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,15 +40,19 @@ from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 ENTRY_SYMBOL = "main_kernel"
 KERNEL_MARKER = 'extern "C" __global__ void'
 LAUNCHER = "gemma4_hd512_prefill_varlen"
+DECODE_LAUNCHER = "gemma4_hd512_decode_split_kv"
 CU_STEM = "gemma4_hd512_prefill"
 # TileLang names every entry point `main_kernel` with external C linkage, so
-# the emitted body is renamed before it can collide with another family's.
+# each emitted body is renamed before it can collide with another's.
 KERNEL_SYMBOL = f"{CU_STEM}_kernel"
+DECODE_PARTIAL_SYMBOL = "gemma4_hd512_decode_partial_kernel"
+DECODE_MERGE_GROUPS_SYMBOL = "gemma4_hd512_decode_merge_groups_kernel"
+DECODE_MERGE_SYMBOL = "gemma4_hd512_decode_merge_kernel"
 
-# The launcher's C parameters, without the trailing stream the consumer adds.
+# Each launcher's C parameters, without the trailing stream the consumer adds.
 # The emitted definition and the manifest line both come from here, so the
-# stub the build script writes when this kernel is absent cannot drift from
-# the real one: C has no mangling, and a drifted pair would link silently.
+# stub the build script writes when a kernel is absent cannot drift from the
+# real one: C has no mangling, and a drifted pair would link silently.
 LAUNCHER_PARAMS = [
     ("const void*", "q"),
     ("const void*", "kv"),
@@ -57,6 +68,39 @@ LAUNCHER_PARAMS = [
     ("int", "rows_per_page"),
     ("int", "layer_row"),
     ("int", "page_size"),
+    ("int", "fold_rotary"),
+    ("int", "num_qo_heads"),
+    ("int", "num_kv_heads"),
+    ("float", "sm_scale"),
+]
+
+# The decode's: the plan's per-slot arrays and workspace, the decode rows'
+# offset into the step's buffers, the extents, pool geometry and row format,
+# and the chunk the tile indices count in. The order is the stub tier's, in
+# build.rs.
+DECODE_LAUNCHER_PARAMS = [
+    ("const void*", "q"),
+    ("const void*", "kv"),
+    ("const int*", "page_indices"),
+    ("const int*", "page_indptr"),
+    ("const int*", "last_page_len"),
+    ("const int*", "request_indices"),
+    ("const int*", "kv_tile_indices"),
+    ("const unsigned char*", "valid_mask"),
+    ("const int*", "o_indptr"),
+    ("void*", "tmp_v"),
+    ("float*", "tmp_s"),
+    ("void*", "out"),
+    ("int", "batch"),
+    ("int", "padded_slots"),
+    ("int", "row_offset"),
+    ("int", "q_rows"),
+    ("int", "pool_rows"),
+    ("int", "rows_per_page"),
+    ("int", "layer_row"),
+    ("int", "page_size"),
+    ("int", "fold_rotary"),
+    ("int", "chunk_tokens"),
     ("int", "num_qo_heads"),
     ("int", "num_kv_heads"),
     ("float", "sm_scale"),
@@ -76,6 +120,11 @@ HEADS = 32
 GROUPS = 8
 HEAD_DIM = 512
 PAGE_SIZE = 64
+# The global family's proportional RoPE rotates this many columns of the
+# head, and the folded pool format keeps only these of K: a compile
+# dimension of the folded bodies, like the head itself. The split bodies
+# are lowered for a row format of zero.
+ROTARY = 128
 
 # The serving arena's maxima, in the units each tensor is indexed in. A step
 # is always smaller; see the module docstring.
@@ -89,10 +138,16 @@ PAGE_TABLE_LEN = SLOTS * (CEILING // PAGE_SIZE)
 # layer's K and V, and the deepest checkpoint this line serves sets the bound.
 MAX_LAYERS = 64
 POOL_ROWS = POOL_PAGES * MAX_LAYERS * 2 * PAGE_SIZE
-# The launcher takes both row counts as C ints; a configuration that outgrew
-# one would index past the guards rather than fail.
+# The decode's own maxima: its requests are the step's decode rows, which the
+# split factor may double, and its slots are those times the chunk bound.
+MAX_DECODE_ROWS = 2 * SLOTS
+DECODE_CHUNK_TOKENS = 256
+MAX_SLOTS = MAX_DECODE_ROWS * (CEILING // DECODE_CHUNK_TOKENS)
+# The launchers take every row and slot count as C ints; a configuration that
+# outgrew one would index past the guards rather than fail.
 assert Q_ROWS < 2**31, Q_ROWS
 assert POOL_ROWS < 2**31, POOL_ROWS
+assert MAX_SLOTS < 2**31, MAX_SLOTS
 
 # Past 48 KiB a kernel has to opt into its dynamic shared memory per symbol.
 MAX_STATIC_SMEM = 48 * 1024
@@ -151,7 +206,7 @@ class TensorMap:
     oob_fill: int
 
 
-def read_host_stub(kernel) -> tuple[list[TensorMap], int, int]:
+def read_host_stub(kernel, needs_descriptors: bool = True) -> tuple[list[TensorMap], int, int]:
     """Recover the descriptor builds, the block width and the dynamic smem.
 
     TileLang bakes the launch into the host stub as a packed-call argument
@@ -182,23 +237,32 @@ def read_host_stub(kernel) -> tuple[list[TensorMap], int, int]:
         elif callee == ENTRY_SYMBOL:
             launch = args
 
-    if not maps:
+    if needs_descriptors and not maps:
         raise RuntimeError(
-            "the lowering built no TMA descriptor; this launcher exists only "
-            "because it does, so the parameter list it binds is wrong now"
+            "the lowering built no TMA descriptor; this launcher binds the "
+            "kernel's loads as descriptors, so the parameter list is wrong now"
+        )
+    if not needs_descriptors and maps:
+        raise RuntimeError(
+            f"the lowering built {len(maps)} TMA descriptor(s) for a kernel the "
+            "launcher binds by pointer alone; its loads changed"
         )
     if launch is None:
         raise RuntimeError("could not recover the entry call from the host stub")
-    # Block x/y/z then the dynamic smem, which TileLang omits when it is zero;
-    # this kernel's four shared buffers make that impossible, so a tail without
-    # the block's unit y and z is a codegen change.
-    tail = list(launch[-4:])
-    if tail[1:3] != [1, 1]:
+    # The tail is block x/y/z then the dynamic smem, which TileLang omits when
+    # it is zero: (block, 1, 1, smem) for a kernel with shared buffers and
+    # (block, 1, 1) for one without. Anything else is a codegen change.
+    if list(launch[-3:-1]) == [1, 1] and isinstance(launch[-1], int) and launch[-1] > 1:
+        tail = list(launch[-4:])
+        block, smem = tail[0], tail[3]
+    elif list(launch[-2:]) == [1, 1]:
+        tail = list(launch[-3:])
+        block, smem = tail[0], 0
+    else:
         raise RuntimeError(
-            f"the launch tail {tail} is not (block, 1, 1, dynamic shared); the "
-            "lowering changed its geometry or dropped its shared memory"
+            f"the launch tail {launch[-4:]} is neither (block, 1, 1, dynamic "
+            "shared) nor (block, 1, 1); the lowering changed its geometry"
         )
-    block, smem = tail[0], tail[3]
     if not isinstance(block, int) or not isinstance(smem, int):
         raise TypeError(f"launch geometry has non-constant entries: {tail}")
     if smem > MAX_DYNAMIC_SMEM:
@@ -284,11 +348,17 @@ DESCRIPTOR_VAR = {"Q_desc": "q_desc", "KV_desc": "kv_desc"}
 TENSOR_ARG = {"Q": "q", "KV": "kv"}
 
 
-def render_descriptor(tmap: TensorMap, rows_expr: str, rows_at: int) -> str:
+def render_descriptor(
+    tmap: TensorMap,
+    rows_expr: str,
+    rows_at: int,
+    descriptor_var: dict[str, str] = DESCRIPTOR_VAR,
+    tensor_arg: dict[str, str] = TENSOR_ARG,
+) -> str:
     """The launcher body that encodes one descriptor."""
-    if tmap.name not in DESCRIPTOR_VAR:
+    if tmap.name not in descriptor_var:
         raise RuntimeError(f"no launcher variable for descriptor {tmap.name}")
-    if tmap.tensor not in TENSOR_ARG:
+    if tmap.tensor not in tensor_arg:
         raise RuntimeError(f"no launcher argument for tensor {tmap.tensor}")
     dims = [str(dim) for dim in tmap.dims]
     dims[rows_at] = rows_expr
@@ -302,9 +372,9 @@ def render_descriptor(tmap: TensorMap, rows_expr: str, rows_at: int) -> str:
         f"    const cuuint32_t element_strides[{tmap.rank}] = "
         f"{{{', '.join(str(e) for e in tmap.element_strides)}}};\n"
         f"    const CUresult encoded = encode(\n"
-        f"        &{DESCRIPTOR_VAR[tmap.name]}, "
+        f"        &{descriptor_var[tmap.name]}, "
         f"{enum_of(TENSORMAP_DTYPE, tmap.dtype, 'dtype')}, {tmap.rank},\n"
-        f"        const_cast<void*>({TENSOR_ARG[tmap.tensor]}), dims, strides, box, "
+        f"        const_cast<void*>({tensor_arg[tmap.tensor]}), dims, strides, box, "
         f"element_strides,\n"
         f"        {enum_of(TENSORMAP_INTERLEAVE, tmap.interleave, 'interleave')},\n"
         f"        {enum_of(TENSORMAP_SWIZZLE, tmap.swizzle, 'swizzle')},\n"
@@ -323,8 +393,6 @@ LAUNCHER_HEAD = """
 // Hand-written launcher. The key and query loads lower to bulk copies, so the
 // entry takes TMA descriptors for those two and plain pointers for the rest;
 // every descriptor parameter below is recovered from the lowered host stub.
-#include <cuda.h>
-#include <cuda_runtime.h>
 
 namespace {
 
@@ -361,100 +429,148 @@ CUresult encode(CUtensorMap* map, CUtensorMapDataType dtype, cuuint32_t rank,
 """
 
 
-def render_launcher(
-    maps: list[TensorMap], block: int, smem: int, order: list[str]
-) -> str:
+@dataclass(frozen=True)
+class Kernel:
+    """One lowered prim_func and how a launcher binds it.
+
+    `descriptor_var` names the C variable each lowered descriptor is encoded
+    into and `tensor_arg` the C argument it is built over; `runtime_rows`
+    says which declared extent of each descriptor the launcher replaces with
+    a per-call count. `bind` maps every other entry parameter to a C
+    expression. A parameter the lowering has that is bound nowhere fails
+    generation, so the binding cannot silently fall behind the kernel.
+    `when` is a C condition over the launcher's parameters under which this
+    kernel's descriptors are built and it is launched; empty runs it on
+    every call.
+    """
+
+    symbol: str
+    build: Callable[[str], object]
+    descriptor_var: dict[str, str]
+    tensor_arg: dict[str, str]
+    runtime_rows: dict[str, tuple[int, str]]
+    bind: dict[str, str]
+    grid: str
+    opt_in_var: str
+    when: str = ""
+
+
+@dataclass(frozen=True)
+class Launcher:
+    """One `extern "C"` entry: its C parameters, its refusals, and the
+    kernels it launches in order."""
+
+    name: str
+    params: list[tuple[str, str]]
+    bounds: str
+    prelude: str
+    kernels: list[Kernel]
+
+
+@dataclass(frozen=True)
+class Lowered:
+    kernel: Kernel
+    maps: list[TensorMap]
+    block: int
+    smem: int
+    order: list[str]
+    preamble: str
+    body: str
+
+
+def lower(kernel: Kernel, arch: str) -> Lowered:
+    """Compile one kernel and recover what its launcher needs from it."""
+    compiled = kernel.build(arch)
+    source = compiled.get_kernel_source()
+    maps, block, smem = read_host_stub(compiled, bool(kernel.descriptor_var))
+    check_strides(maps)
+    if "decode_merge_groups" in kernel.symbol:
+        check_in_place_merge_barrier(kernel.symbol, source)
+    order = entry_parameter_order(source)
+    preamble, body = split_source(source)
+    if body.count(ENTRY_SYMBOL) != 2:
+        raise RuntimeError(
+            f"{kernel.symbol}: expected exactly two {ENTRY_SYMBOL} occurrences"
+        )
+    return Lowered(
+        kernel=kernel,
+        maps=maps,
+        block=block,
+        smem=smem,
+        order=order,
+        preamble=preamble,
+        body=body.replace(ENTRY_SYMBOL, kernel.symbol),
+    )
+
+
+def render_launcher(launcher: Launcher, lowered: list[Lowered]) -> str:
     """The `extern "C"` entry `pegainfer-kernels` links against."""
-    by_name = {tmap.name: tmap for tmap in maps}
-    if set(by_name) != set(DESCRIPTOR_VAR):
-        raise RuntimeError(
-            f"expected descriptors {sorted(DESCRIPTOR_VAR)}, got {sorted(by_name)}"
+    declarations = []
+    stages = []
+    for low in lowered:
+        kernel = low.kernel
+        bodies = []
+        opt_ins = []
+        by_name = {tmap.name: tmap for tmap in low.maps}
+        if set(by_name) != set(kernel.descriptor_var):
+            raise RuntimeError(
+                f"{kernel.symbol}: expected descriptors "
+                f"{sorted(kernel.descriptor_var)}, got {sorted(by_name)}"
+            )
+        declarations.extend(
+            f"  alignas(64) CUtensorMap {var};\n"
+            for var in kernel.descriptor_var.values()
         )
-
-    bodies = [
-        render_descriptor(
-            by_name["Q_desc"],
-            "static_cast<cuuint64_t>(q_rows)",
-            runtime_dim(by_name["Q_desc"], Q_ROWS, "Q_desc"),
-        ),
-        render_descriptor(
-            by_name["KV_desc"],
-            "static_cast<cuuint64_t>(pool_rows)",
-            runtime_dim(by_name["KV_desc"], POOL_ROWS, "KV_desc"),
-        ),
-    ]
-
-    opt_in = ""
-    if smem > MAX_STATIC_SMEM:
-        opt_in = (
-            f"  // Past 48 KiB the kernel has to opt in; once per symbol.\n"
-            f"  static const cudaError_t opt_in = cudaFuncSetAttribute(\n"
-            f"      reinterpret_cast<const void*>({KERNEL_SYMBOL}),\n"
-            f"      cudaFuncAttributeMaxDynamicSharedMemorySize, {smem});\n"
-            f"  if (opt_in != cudaSuccess) {{\n"
-            f"    return static_cast<int>(opt_in);\n"
-            f"  }}\n"
+        for name, (declared, rows_expr) in kernel.runtime_rows.items():
+            bodies.append(
+                render_descriptor(
+                    by_name[name],
+                    rows_expr,
+                    runtime_dim(by_name[name], declared, name),
+                    kernel.descriptor_var,
+                    kernel.tensor_arg,
+                )
+            )
+        if low.smem > MAX_STATIC_SMEM:
+            opt_ins.append(
+                f"  // Past 48 KiB the kernel has to opt in; once per symbol.\n"
+                f"  static const cudaError_t {kernel.opt_in_var} = cudaFuncSetAttribute(\n"
+                f"      reinterpret_cast<const void*>({kernel.symbol}),\n"
+                f"      cudaFuncAttributeMaxDynamicSharedMemorySize, {low.smem});\n"
+                f"  if ({kernel.opt_in_var} != cudaSuccess) {{\n"
+                f"    return static_cast<int>({kernel.opt_in_var});\n"
+                f"  }}\n"
+            )
+        bound = {**kernel.descriptor_var, **kernel.bind}
+        missing = [name for name in low.order if name not in bound]
+        if missing:
+            raise RuntimeError(
+                f"{kernel.symbol}: the entry point grew parameters this launcher "
+                f"does not bind: {missing}"
+            )
+        args = ",\n      ".join(bound[name] for name in low.order)
+        launch = (
+            f"  {kernel.symbol}<<<{kernel.grid}, dim3({low.block}), {low.smem}, stream>>>(\n"
+            f"      {args});\n"
         )
+        stage = "".join(bodies) + "".join(opt_ins) + launch
+        if kernel.when:
+            # A body lowered for one row format runs only on a call that
+            # names it; the launcher's refusals hold the format to one of
+            # the bodies it has.
+            inner = "".join(f"  {line}\n" for line in stage.splitlines())
+            stage = f"  if ({kernel.when}) {{\n{inner}  }}\n"
+        stages.append(stage)
 
-    bound = {
-        **DESCRIPTOR_VAR,
-        "Output": "reinterpret_cast<bfloat16_t*>(out)",
-        "PageIndices": "page_indices",
-        "PageIndptr": "page_indptr",
-        "QIndptr": "q_indptr",
-        "LastPageLen": "last_page_len",
-        "sm_scale": "sm_scale",
-        "total_ctas": "total_ctas",
-        "rows_per_page": "rows_per_page",
-        "layer_row": "layer_row",
-    }
-    missing = [name for name in order if name not in bound]
-    if missing:
-        raise RuntimeError(
-            f"the entry point grew parameters this launcher does not bind: {missing}"
-        )
-    args = ",\n      ".join(bound[name] for name in order)
-
-    declarations = "".join(
-        f"  alignas(64) CUtensorMap {var};\n" for var in DESCRIPTOR_VAR.values()
-    )
-    # Past any of these the body drops a tail or reads the wrong rows and hands
-    # back plausible numbers, so the launcher refuses rather than truncates.
-    bounds = (
-        f"  if (q_rows > {Q_ROWS} || pool_rows > {POOL_ROWS} || batch > {MAX_BATCH}\n"
-        f"      || page_size != {PAGE_SIZE} || num_qo_heads != {HEADS}\n"
-        f"      || num_kv_heads != {HEADS // GROUPS}) {{\n"
-        f"    return static_cast<int>(cudaErrorInvalidValue);\n"
-        f"  }}\n"
-    )
-    # The grid is computed here, from the sum the body re-walks to find its
-    # owner: a caller's own copy disagreeing is silent both ways, too large and
-    # CTAs spin up to exit, too small and a request's tail never runs.
-    grid = (
-        f"  int total_ctas = 0;\n"
-        f"  for (int request = 0; request < batch; ++request) {{\n"
-        f"    const int rows = host_q_indptr[request + 1] - host_q_indptr[request];\n"
-        f"    const int tiles = (rows + {defs.BLOCK_M - 1}) / {defs.BLOCK_M};\n"
-        f"    total_ctas += ((tiles + {defs.QBLK - 1}) / {defs.QBLK})"
-        f" * {defs.QBLK} * {HEADS};\n"
-        f"  }}\n"
-        f"  if (total_ctas == 0) {{\n"
-        f"    // A step with no prompt rows is a real state, not an error.\n"
-        f"    return static_cast<int>(cudaSuccess);\n"
-        f"  }}\n"
-    )
-    signature = ", ".join(f"{kind} {name}" for kind, name in LAUNCHER_PARAMS)
+    signature = ", ".join(f"{kind} {name}" for kind, name in launcher.params)
     return (
-        f'extern "C" int {LAUNCHER}(\n'
+        f'extern "C" int {launcher.name}(\n'
         f"    {signature},\n"
         f"    cudaStream_t stream) {{\n"
-        f"{bounds}"
-        f"{grid}"
-        f"{declarations}"
-        f"{''.join(bodies)}"
-        f"{opt_in}"
-        f"  {KERNEL_SYMBOL}<<<dim3(total_ctas), dim3({block}), {smem}, stream>>>(\n"
-        f"      {args});\n"
+        f"{launcher.bounds}"
+        f"{launcher.prelude}"
+        f"{''.join(declarations)}"
+        f"{''.join(stages)}"
         f"  return static_cast<int>(cudaGetLastError());\n"
         f"}}\n"
     )
@@ -519,10 +635,10 @@ def required_nvcc_flags() -> list[str]:
     return flags
 
 
-def build_kernel(arch: str):
+def build_prefill(arch: str, fold_rotary: int = 0):
     """Lower for the arch the objects will be assembled for.
 
-    Generation must not depend on a GPU being visible to the build host —
+    Generation must not depend on a GPU being visible to the build host --
     containers routinely have none, and TileLang then lowers for its own
     default, which nvcc rejects outright. So the arch is always passed.
     """
@@ -536,10 +652,251 @@ def build_kernel(arch: str):
             Q_ROWS,
             POOL_ROWS,
             PAGE_TABLE_LEN,
+            fold_rotary=fold_rotary,
         ),
         target={"kind": "cuda", "arch": arch},
         pass_configs=defs.PASS_CONFIGS,
     )
+
+
+def build_prefill_folded(arch: str):
+    return build_prefill(arch, ROTARY)
+
+
+def build_decode_partial(arch: str, fold_rotary: int = 0):
+    return tilelang.compile(
+        defs.decode_partial(
+            HEADS,
+            GROUPS,
+            HEAD_DIM,
+            PAGE_SIZE,
+            Q_ROWS,
+            MAX_DECODE_ROWS,
+            MAX_SLOTS,
+            POOL_ROWS,
+            PAGE_TABLE_LEN,
+            stages=defs.decode_stages(fold_rotary),
+            fold_rotary=fold_rotary,
+        ),
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=defs.PASS_CONFIGS,
+    )
+
+
+def build_decode_merge_groups(arch: str):
+    return tilelang.compile(
+        defs.decode_merge_groups(HEADS, HEAD_DIM, MAX_DECODE_ROWS, MAX_SLOTS),
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=defs.PASS_CONFIGS,
+    )
+
+
+def build_decode_partial_folded(arch: str):
+    return build_decode_partial(arch, ROTARY)
+
+
+def build_decode_merge(arch: str):
+    return tilelang.compile(
+        defs.decode_merge(HEADS, HEAD_DIM, Q_ROWS, MAX_DECODE_ROWS, MAX_SLOTS),
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=defs.PASS_CONFIGS,
+    )
+
+
+# Past any of these the body drops a tail or reads the wrong rows and hands
+# back plausible numbers, so the launcher refuses rather than truncates.
+PREFILL_BOUNDS = (
+    f"  if (q_rows > {Q_ROWS} || pool_rows > {POOL_ROWS} || batch > {MAX_BATCH}\n"
+    f"      || page_size != {PAGE_SIZE} || num_qo_heads != {HEADS}\n"
+    f"      || num_kv_heads != {HEADS // GROUPS}\n"
+    f"      || (fold_rotary != 0 && fold_rotary != {ROTARY})) {{\n"
+    f"    return static_cast<int>(cudaErrorInvalidValue);\n"
+    f"  }}\n"
+)
+# The grid is computed here, from the sum the body re-walks to find its
+# owner: a caller's own copy disagreeing is silent both ways, too large and
+# CTAs spin up to exit, too small and a request's tail never runs.
+PREFILL_GRID = (
+    f"  int total_ctas = 0;\n"
+    f"  for (int request = 0; request < batch; ++request) {{\n"
+    f"    const int rows = host_q_indptr[request + 1] - host_q_indptr[request];\n"
+    f"    const int tiles = (rows + {defs.BLOCK_M - 1}) / {defs.BLOCK_M};\n"
+    f"    total_ctas += ((tiles + {defs.QBLK - 1}) / {defs.QBLK})"
+    f" * {defs.QBLK} * {HEADS};\n"
+    f"  }}\n"
+    f"  if (total_ctas == 0) {{\n"
+    f"    // A step with no prompt rows is a real state, not an error.\n"
+    f"    return static_cast<int>(cudaSuccess);\n"
+    f"  }}\n"
+)
+
+PREFILL_BIND = {
+    "Output": "reinterpret_cast<bfloat16_t*>(out)",
+    "PageIndices": "page_indices",
+    "PageIndptr": "page_indptr",
+    "QIndptr": "q_indptr",
+    "LastPageLen": "last_page_len",
+    "sm_scale": "sm_scale",
+    "total_ctas": "total_ctas",
+    "rows_per_page": "rows_per_page",
+    "layer_row": "layer_row",
+}
+PREFILL_RUNTIME_ROWS = {
+    "Q_desc": (Q_ROWS, "static_cast<cuuint64_t>(q_rows)"),
+    "KV_desc": (POOL_ROWS, "static_cast<cuuint64_t>(pool_rows)"),
+}
+
+# One entry, two bodies: the split rows' and the folded rows', each lowered
+# for its own row width and chosen by the format the call names. The
+# folded body's descriptors are its own, since their inner extents differ.
+PREFILL = Launcher(
+    name=LAUNCHER,
+    params=LAUNCHER_PARAMS,
+    bounds=PREFILL_BOUNDS,
+    prelude=PREFILL_GRID,
+    kernels=[
+        Kernel(
+            symbol=KERNEL_SYMBOL,
+            build=build_prefill,
+            descriptor_var=DESCRIPTOR_VAR,
+            tensor_arg=TENSOR_ARG,
+            runtime_rows=PREFILL_RUNTIME_ROWS,
+            bind=PREFILL_BIND,
+            grid="dim3(total_ctas)",
+            opt_in_var="opt_in",
+            when="fold_rotary == 0",
+        ),
+        Kernel(
+            symbol=f"{CU_STEM}_folded_kernel",
+            build=build_prefill_folded,
+            descriptor_var={"Q_desc": "q_desc_folded", "KV_desc": "kv_desc_folded"},
+            tensor_arg=TENSOR_ARG,
+            runtime_rows=PREFILL_RUNTIME_ROWS,
+            bind=PREFILL_BIND,
+            grid="dim3(total_ctas)",
+            opt_in_var="opt_in_folded",
+            when=f"fold_rotary == {ROTARY}",
+        ),
+    ],
+)
+
+# The decode's refusals: the same extents and shape as the prefill's, plus
+# the slot count the plan arrays are declared at and the chunk, which the
+# body walks as whole pages. The decode-row bound is the split factor times
+# the deepest bucket, the same product the arena sizes its tables by.
+DECODE_BOUNDS = (
+    f"  if (q_rows > {Q_ROWS} || pool_rows > {POOL_ROWS} || batch > {MAX_DECODE_ROWS}\n"
+    f"      || padded_slots > {MAX_SLOTS} || page_size != {PAGE_SIZE}\n"
+    f"      || chunk_tokens <= 0 || chunk_tokens % page_size != 0\n"
+    f"      || num_qo_heads != {HEADS} || num_kv_heads != {HEADS // GROUPS}\n"
+    f"      || (fold_rotary != 0 && fold_rotary != {ROTARY})) {{\n"
+    f"    return static_cast<int>(cudaErrorInvalidValue);\n"
+    f"  }}\n"
+)
+DECODE_PRELUDE = (
+    f"  const int chunk_pages = chunk_tokens / page_size;\n"
+    f"  if (batch == 0 || padded_slots == 0) {{\n"
+    f"    // A step with no decode rows is a real state, not an error.\n"
+    f"    return static_cast<int>(cudaSuccess);\n"
+    f"  }}\n"
+    f"  // The merge's first level is gridded over the widest request's slots;\n"
+    f"  // a group past a narrower request's does nothing.\n"
+    f"  const int slots_per_request = (padded_slots + batch - 1) / batch;\n"
+    f"  const int merge_groups = (slots_per_request + {defs.DECODE_MERGE_SPAN - 1})"
+    f" / {defs.DECODE_MERGE_SPAN};\n"
+)
+
+DECODE_PARTIAL_BIND = {
+    "Q": "reinterpret_cast<const bfloat16_t*>(q)",
+    "PageIndices": "page_indices",
+    "PageIndptr": "page_indptr",
+    "LastPageLen": "last_page_len",
+    "RequestIndices": "request_indices",
+    "KvTileIndices": "kv_tile_indices",
+    "ValidMask": "valid_mask",
+    "sm_scale": "sm_scale",
+    "rows_per_page": "rows_per_page",
+    "layer_row": "layer_row",
+    "row_offset": "row_offset",
+    "chunk_pages": "chunk_pages",
+    "padded_slots": "padded_slots",
+    "TmpV": "reinterpret_cast<bfloat16_t*>(tmp_v)",
+    "TmpS": "tmp_s",
+}
+DECODE_PARTIAL_RUNTIME_ROWS = {
+    "KV_desc": (POOL_ROWS, "static_cast<cuuint64_t>(pool_rows)"),
+}
+
+DECODE = Launcher(
+    name=DECODE_LAUNCHER,
+    params=DECODE_LAUNCHER_PARAMS,
+    bounds=DECODE_BOUNDS,
+    prelude=DECODE_PRELUDE,
+    kernels=[
+        # The query tile is filled elementwise, so only the pool's page loads
+        # lower to a descriptor here. The partial pass has a body per row
+        # format; both store in head order, so the merge levels are shared.
+        Kernel(
+            symbol=DECODE_PARTIAL_SYMBOL,
+            build=build_decode_partial,
+            descriptor_var={"KV_desc": "kv_desc"},
+            tensor_arg={"KV": "kv"},
+            runtime_rows=DECODE_PARTIAL_RUNTIME_ROWS,
+            bind=DECODE_PARTIAL_BIND,
+            grid="dim3(padded_slots, num_kv_heads)",
+            opt_in_var="opt_in_partial",
+            when="fold_rotary == 0",
+        ),
+        Kernel(
+            symbol=f"{DECODE_PARTIAL_SYMBOL[: -len('_kernel')]}_folded_kernel",
+            build=build_decode_partial_folded,
+            descriptor_var={"KV_desc": "kv_desc_folded"},
+            tensor_arg={"KV": "kv"},
+            runtime_rows=DECODE_PARTIAL_RUNTIME_ROWS,
+            bind=DECODE_PARTIAL_BIND,
+            grid="dim3(padded_slots, num_kv_heads)",
+            opt_in_var="opt_in_partial_folded",
+            when=f"fold_rotary == {ROTARY}",
+        ),
+        # The merge's two levels: groups of slots folded in place, then the
+        # group heads into the output.
+        Kernel(
+            symbol=DECODE_MERGE_GROUPS_SYMBOL,
+            build=build_decode_merge_groups,
+            descriptor_var={},
+            tensor_arg={},
+            runtime_rows={},
+            bind={
+                "TmpV": "reinterpret_cast<bfloat16_t*>(tmp_v)",
+                "TmpS": "tmp_s",
+                "OIndptr": "o_indptr",
+                "batch": "batch",
+                "groups": "merge_groups",
+            },
+            grid="dim3(batch, num_qo_heads, merge_groups)",
+            opt_in_var="opt_in_merge_groups",
+        ),
+        Kernel(
+            symbol=DECODE_MERGE_SYMBOL,
+            build=build_decode_merge,
+            descriptor_var={},
+            tensor_arg={},
+            runtime_rows={},
+            bind={
+                "TmpV": "reinterpret_cast<bfloat16_t*>(tmp_v)",
+                "TmpS": "tmp_s",
+                "OIndptr": "o_indptr",
+                "row_offset": "row_offset",
+                "batch": "batch",
+                "Output": "reinterpret_cast<bfloat16_t*>(out)",
+            },
+            grid="dim3(batch, num_qo_heads)",
+            opt_in_var="opt_in_merge",
+        ),
+    ],
+)
+
+LAUNCHERS = [PREFILL, DECODE]
 
 
 def check_strides(maps: list[TensorMap]) -> None:
@@ -554,6 +911,32 @@ def check_strides(maps: list[TensorMap]) -> None:
                 f"{tmap.name}: innermost stride {tmap.strides[0]} is not the "
                 f"{expected} B element of {dtype}"
             )
+
+
+def check_in_place_merge_barrier(symbol: str, body: str) -> None:
+    """A merge that folds a group into its own first slot has to read the
+    whole group before any thread overwrites it.
+
+    Every thread walks the group's `TmpS` and the store lands on the first
+    slot, one of the rows just read, so without a block barrier between them
+    a thread that finished the walk overwrites state another is still
+    reading. That is a schedule away from wrong rather than wrong on any one
+    run, which is why it is held on the emitted source: a comparison would
+    need the losing schedule to show it.
+    """
+    store = re.search(r"TmpS\[[^;]*?\]\s*=", body)
+    if store is None:
+        raise RuntimeError(f"{symbol}: no store to TmpS to hold a barrier against")
+    reads = [m.start() for m in re.finditer(r"TmpS\[", body) if m.start() < store.start()]
+    if not reads:
+        raise RuntimeError(f"{symbol}: no read of TmpS before the store")
+    barrier = body.find("__syncthreads()", reads[-1], store.start())
+    if barrier < 0:
+        raise RuntimeError(
+            f"{symbol}: the store to TmpS is not separated from the group's "
+            "reads by __syncthreads(); a thread that finished the walk would "
+            "overwrite what another is still reading"
+        )
 
 
 def main() -> None:
@@ -576,22 +959,40 @@ def main() -> None:
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    kernel = build_kernel(args.arch)
-    source = kernel.get_kernel_source()
-    maps, block, smem = read_host_stub(kernel)
-    check_strides(maps)
-    order = entry_parameter_order(source)
-    preamble, body = split_source(source)
-    if body.count(ENTRY_SYMBOL) != 2:
-        raise RuntimeError(f"expected exactly two {ENTRY_SYMBOL} occurrences")
+    lowered = {
+        kernel.symbol: lower(kernel, args.arch)
+        for launcher in LAUNCHERS
+        for kernel in launcher.kernels
+    }
+    # One preamble for the unit. The kernels share TileLang's headers; what
+    # one may add over another is an include, appended after the first
+    # preamble so its own conditional blocks stay balanced. Deduplicating
+    # by line does not work: a repeated `#endif` is not a duplicate.
+    first, *rest = lowered.values()
+    base_lines = set(first.preamble.splitlines())
+    extra: list[str] = []
+    for low in rest:
+        for line in low.preamble.splitlines():
+            if line in base_lines or line in extra:
+                continue
+            if not line.startswith("#include"):
+                raise RuntimeError(
+                    f"{low.kernel.symbol}: its preamble differs from "
+                    f"{first.kernel.symbol}'s beyond an include: {line!r}"
+                )
+            extra.append(line)
+    preamble = first.preamble + "".join(f"{line}\n" for line in extra)
 
     cu_path = out_dir / f"{CU_STEM}.cu"
     cu_path.write_text(
         "// Generated by pegainfer-gemma4/kernels/generate.py. Do not edit.\n"
         + isolate_debug_helpers(preamble)
-        + body.replace(ENTRY_SYMBOL, KERNEL_SYMBOL)
+        + "".join(low.body for low in lowered.values())
         + LAUNCHER_HEAD
-        + render_launcher(maps, block, smem, order)
+        + "".join(
+            render_launcher(launcher, [lowered[k.symbol] for k in launcher.kernels])
+            for launcher in LAUNCHERS
+        )
     )
 
     if args.vendor_includes:
@@ -603,7 +1004,7 @@ def main() -> None:
     # Relative where it can be, so a vendored directory survives being copied.
     def named(path: Path) -> str:
         try:
-            return str(path.relative_to(out_dir))
+            return str(Path(path).relative_to(out_dir))
         except ValueError:
             return str(path)
 
@@ -612,11 +1013,14 @@ def main() -> None:
     lines.append(f"CUTLASS_INCLUDE_DIR={named(cutlass_include)}")
     # Shapes are compile dimensions, so the consumer can refuse another.
     lines.append(f"GEOMETRY={HEADS},{HEADS // GROUPS},{HEAD_DIM},{PAGE_SIZE}")
-    # The opt-in a block needs: SM90 grants 227 KiB, SM120 only 99.
-    lines.append(f"SMEM={smem}")
+    # The largest opt-in any block here makes: SM90 grants 227 KiB, SM120 only 99.
+    lines.append(f"SMEM={max(low.smem for low in lowered.values())}")
     lines.extend(f"NVCC_FLAG={flag}" for flag in required_nvcc_flags())
-    lines.append(
-        f"LAUNCHER={LAUNCHER}|{', '.join(kind for kind, _ in LAUNCHER_PARAMS)}"
+    # One line per entry point, in the stub tier's order: build.rs checks
+    # both the names and the parameter lists against its own table.
+    lines.extend(
+        f"LAUNCHER={launcher.name}|{', '.join(kind for kind, _ in launcher.params)}"
+        for launcher in LAUNCHERS
     )
     # The body is lowered for exactly this arch and uses arch-conditional
     # instructions, so the consumer assembles it for that and not for the
@@ -628,7 +1032,11 @@ def main() -> None:
     (out_dir / "manifest.txt").write_text("\n".join(lines) + "\n")
     for line in lines:
         print(line)
-    print(f"# block {block} threads, {smem} B dynamic shared, {len(maps)} descriptors")
+    for symbol, low in lowered.items():
+        print(
+            f"# {symbol}: block {low.block} threads, {low.smem} B dynamic shared, "
+            f"{len(low.maps)} descriptors"
+        )
 
 
 if __name__ == "__main__":

@@ -48,3 +48,20 @@ pub(crate) fn fill(seed: u64, n: usize) -> Vec<half::bf16> {
         })
         .collect()
 }
+
+/// The largest absolute difference and where it is. A NaN compares false
+/// against everything, so it would leave the largest at zero: it fails here
+/// instead of passing a comparison silently.
+#[allow(dead_code)]
+pub(crate) fn worst_delta(a: &[f32], b: &[f32]) -> (f32, usize) {
+    assert_eq!(a.len(), b.len(), "compared runs differ in length");
+    let mut worst = (0.0f32, 0usize);
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let d = (x - y).abs();
+        assert!(d.is_finite(), "element {i}: {x} against {y}");
+        if d > worst.0 {
+            worst = (d, i);
+        }
+    }
+    worst
+}
