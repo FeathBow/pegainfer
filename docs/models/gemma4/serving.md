@@ -1,6 +1,6 @@
 # Gemma 4 serving
 
-**TL;DR:** Gemma 4 is a stepped engine: the frontend driver polls one scheduler, commits one `StepOutputs` batch per step, and the scheduler reports lifecycle changes through `RequestLedger`. Up to the configured decode slots (16 by default) hold requests, each prompt prefills whole at a step boundary by default, and every active request advances one token per batched step. Prompt plus output past the ceiling — 8192 by default, raised up to the checkpoint's 262144 by `PEGAINFER_MAX_CONTEXT` — is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B, at the defaults). **The default configuration needs a 48 GiB card**: it sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it — smaller envelopes are a matter of the slots and ceiling knobs below. A row's output moves with the bucket widths it decodes at, but not with what its companions contain. An opt-in conversation prefix cache (`PEGAINFER_PREFIX_CACHE=K`) resumes multi-turn prompts at the cost of a pre-allocated page budget, and an opt-in overlap lane (`PEGAINFER_ASYNC_PREFILL=green:NN`) trades prefill latency for decode-tail protection under long-prompt admissions. An opt-in chunked walk (`PEGAINFER_MIX_CHUNK_TOKENS=N`) bounds how many prompt rows a mixed admission computes per scheduler step, so live streams advance per committed segment instead of waiting out whole prompts, and a raised ceiling (`PEGAINFER_MAX_CONTEXT`, with `PEGAINFER_DECODE_SLOTS` trading concurrency for context) serves long-context workloads on the same card. Dense and routed checkpoints use the same startup-precaptured decode graphs.
+**TL;DR:** Gemma 4 is a stepped engine: the frontend driver polls one scheduler, commits one `StepOutputs` batch per step, and the scheduler reports lifecycle changes through `RequestLedger`. Up to the configured decode slots (16 by default) hold requests, each prompt prefills whole at a step boundary by default, and every active request advances one token per batched step. Prompt plus output past the ceiling — 8192 by default, raised up to the checkpoint's 262144 by `PEGAINFER_MAX_CONTEXT` — is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B, at the defaults). **The default configuration needs a 48 GiB card at 12B and a 96 GiB card at 31B**: 12B sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it, and 31B sits at 83.1 GiB on one GH200 with the folded global pool — smaller envelopes are a matter of the slots and ceiling knobs below, and the 31B recipe has its own section. A row's output moves with the bucket widths it decodes at, but not with what its companions contain. An opt-in conversation prefix cache (`PEGAINFER_PREFIX_CACHE=K`) resumes multi-turn prompts at the cost of a pre-allocated page budget, and an opt-in overlap lane (`PEGAINFER_ASYNC_PREFILL=green:NN`) trades prefill latency for decode-tail protection under long-prompt admissions. An opt-in chunked walk (`PEGAINFER_MIX_CHUNK_TOKENS=N`) bounds how many prompt rows a mixed admission computes per scheduler step, so live streams advance per committed segment instead of waiting out whole prompts, and a raised ceiling (`PEGAINFER_MAX_CONTEXT`, with `PEGAINFER_DECODE_SLOTS` trading concurrency for context) serves long-context workloads on the same card. Dense and routed checkpoints use the same startup-precaptured decode graphs.
 
 Last touched: 2026-09
 
@@ -175,6 +175,42 @@ Hold the trajectory fixed and replace what the other rows are — their content,
 Decode steps compute at power-of-two batch buckets — a batch pads to its bucket with rows that write the pools' reserved padding pages — and dense and routed checkpoints replay per-bucket CUDA graphs captured at startup (`--cuda-graph=false` is the eager escape hatch; padding applies either way, so the two modes are the same arithmetic). Bucketing also quantizes the width trajectory: batch sizes that share a bucket share their arithmetic.
 
 The consequence for callers: **greedy output is reproducible for a given workload on an otherwise idle device, not across workloads.** Replaying the same requests the same way returns the same tokens; sending them alongside different traffic changes the widths they decode at and can flip a near-tie. Another process on the same GPU does this too, by moving when each prompt's prefill lands relative to the decodes around it.
+
+## The 31B checkpoint on one GH200
+
+`google/gemma-4-31B-it` served bf16 at tensor parallel 1 is the line's largest dense configuration: 60 layers (50 sliding at head_dim 256 over 16 KV heads, 10 global at head_dim 512 over 4 KV heads), hidden 5376, the 262144-entry vocabulary. The recipe is the 12B one with the knob that picks the generated kernels, and every number below was measured on one GH200 (97,871 MiB), driver 565.57, with the snapshot in `docs/benchmarks/gemma4-31b-gh200.md` holding the vLLM comparison, the concurrency cells and the regression thresholds.
+
+```bash
+PEGAINFER_GEMMA4_TILELANG_PYTHON=<python-with-tilelang> \
+  cargo build --release --features gemma4 -p pegainfer-server
+PEGAINFER_GLOBAL_ATTN=tilelang640 target/release/pegainfer \
+  --model-path <gemma-4-31B-it> --served-model-name gemma-4-31b --port 18099
+```
+
+`PEGAINFER_GLOBAL_ATTN=tilelang640` is the recommended state at this size: the generated kernels on a folded 640-column global pool, which lead vLLM's FlashAttention path on every single-request cell from 10K to 163K tokens and hold 3.75 GiB less pool than the split one at the default point. Unset, the byte-identical incumbent path serves, 8 .. 35% behind vLLM at the same cells; it is the numerical reference, not the fast path. The generated states need the build above; without the TileLang Python the build carries a stub and a generated state refuses to start and says so.
+
+**The envelope, measured.** Idle is what the process holds after the boot settles with no request in flight; the request column is one prompt of the ceiling's length less 256, with 256 output tokens.
+
+| ceiling | slots | `PEGAINFER_MIX_CHUNK_TOKENS` | idle MiB | one request at the ceiling: TTFT / TPOT | peak MiB |
+| --- | ---: | ---: | ---: | --- | ---: |
+| 8192 (default) | 16 | off | 85,127 | 0.97 s / 19.6 ms | 87,431 |
+| 32768 | 8 | 2048 | 80,995 | 4.8 s / 20.1 ms | 81,571 |
+| 65536 | 4 | 2048 | 77,665 | 11.7 s / 20.7 ms | 78,273 |
+| 262144 | 1 | 2048 | 75,677 | 92.7 s / 24.2 ms | 76,285 |
+
+The weights are 57.19 GiB on the device; the global pool is slots × ceiling rows at 640 columns per head (6.25 GiB at the default point, 12.50 at each raised one), and the sliding pool is sized by the window and the chunk, which is why a raised ceiling with fewer slots holds less resident than the default point. A whole-prompt step at the default point costs 2.3 GiB of transient scratch above idle; under the chunked walk the transient is the chunk's and the peak sits 0.6 GiB above idle at every raised ceiling. The default state (`PEGAINFER_GLOBAL_ATTN` unset) at the default point idles at 88,967 MiB with a 10.00 GiB split pool.
+
+**Concurrency at the default point** (random 1024-token prompts, 256 output tokens, greedy; the full cells against vLLM are in the snapshot): every request completes with its full output at 1, 2, 4, 8 and 16 in flight and at 1, 2 and 4 requests per second; at four in flight 178 output tokens per second at 21.3 ms per token, at sixteen 496 at 29.4 ms, and a prompt is admitted in 0.58 s p50 with sixteen slots busy. The wide-batch decode step is the open item at this size: 4 .. 5% faster than vLLM's at one row, 8 .. 10% slower at eight and sixteen, with the same throughput and end-to-end latency either way.
+
+**What this line does not serve at 31B, and how it says so.** The quantised exports (`nvidia/Gemma-4-31B-IT-NVFP4`, whose dense MLPs are NVFP4, and the W4A16 QAT checkpoint) are not served: only the bf16 checkpoint's tensor set is in the manifest, and a checkpoint whose tensors do not match it stops at the loader's manifest check, which names every mismatching tensor (`a_disagreeing_config_names_every_faulty_tensor` in the gate suite, run against this checkpoint). Tensor parallelism is not offered for this line; the launch takes the device ordinal and the graph switch and nothing else from the shared arguments. A raised ceiling without the chunk knob, the async lane beside a raise, fp8 sliding KV beside the prefix cache, and a generated state on a build without the kernels all refuse at start-up with the message the 12B sections above describe. A prompt at or past the ceiling is refused by the frontend with HTTP 400 naming the ceiling and the prompt length (measured: 9001 and 8192 tokens at the default point both refused, the next request served); `max_tokens` past what the ceiling leaves is clamped to it, as vLLM's frontend does (a 3-token prompt asking for 8192 got 8189), and the engine's own admission check, prompt plus output within the ceiling, stands behind that.
+
+**Hardware matrix.**
+
+| card | 12B bf16 | 26B-A4B NVFP4 | 31B bf16 |
+| --- | --- | --- | --- |
+| 32 GiB | no (32.2 GiB idle at the default point) | no | no |
+| 48 GiB (sm_89) | yes, the default point and the raised ceilings above | yes | no (57 GiB of weights) |
+| 96 GiB GH200 (sm_90) | yes | yes | yes, this section; the 262144 ceiling at one slot |
 
 ## Limits today
 

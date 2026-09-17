@@ -243,16 +243,57 @@ fn waypoint_reference(
     }
 }
 
+fn waypoint_label(point: Waypoint<'_>) -> String {
+    match point.chunk {
+        0 => point.case.to_string(),
+        _ => format!("{}-chunked", point.case),
+    }
+}
+
+/// What one waypoint left behind: its failures, or nothing because the card
+/// could not hold the pass.
+enum WaypointOutcome {
+    Ran(Vec<String>),
+    Skipped,
+}
+
+#[derive(Default)]
+struct WaypointReport {
+    ran: Vec<String>,
+    failures: Vec<String>,
+    skipped: Vec<String>,
+}
+
 fn gate_waypoint(
     ctx: &DeviceContext,
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     point: Waypoint<'_>,
-) -> Vec<String> {
-    let label = match point.chunk {
-        0 => point.case.to_string(),
-        _ => format!("{}-chunked", point.case),
-    };
+) -> WaypointOutcome {
+    let label = waypoint_label(point);
+    // Chunk 0 is the whole-prompt pass.
+    if point.chunk == 0 {
+        let (_, prompt) = u32_tensor(fixture, &format!("{}_prompt", point.case));
+        // Before the probe: afterwards the allocator still holds what it
+        // touched, so the same call would report the probe's own state.
+        let (free, total) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo");
+        let fits = serve
+            .single_pass_scratch_fits(ctx, prompt.len())
+            .unwrap_or_else(|e| {
+                panic!("{label}: the scratch probe failed for its own reason: {e:#}")
+            });
+        if !fits {
+            let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "{label}: skipped -- a whole-prompt pass over {} rows cannot take its scratch \
+                 with {:.1} of {:.1} GiB free; the chunked pass carries this length",
+                prompt.len(),
+                gib(free),
+                gib(total),
+            );
+            return WaypointOutcome::Skipped;
+        }
+    }
     let (ids, lps, positions, top_k, tolerance, backend_top1) = waypoint_reference(fixture, point);
     let run = run_case(ctx, serve, fixture, point.case, point.chunk);
     assert_eq!(run.rows.len(), positions, "{label}: fixture positions");
@@ -280,7 +321,7 @@ fn gate_waypoint(
     if max_abs > tolerance {
         failures.push(format!("{label} ({max_abs} > {tolerance})"));
     }
-    failures
+    WaypointOutcome::Ran(failures)
 }
 
 fn gate_waypoints(
@@ -288,11 +329,18 @@ fn gate_waypoints(
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     points: &[Waypoint<'_>],
-) -> Vec<String> {
-    points
-        .iter()
-        .flat_map(|&point| gate_waypoint(ctx, serve, fixture, point))
-        .collect()
+    report: &mut WaypointReport,
+) {
+    for &point in points {
+        let label = waypoint_label(point);
+        match gate_waypoint(ctx, serve, fixture, point) {
+            WaypointOutcome::Ran(failures) => {
+                report.ran.push(label);
+                report.failures.extend(failures);
+            }
+            WaypointOutcome::Skipped => report.skipped.push(label),
+        }
+    }
 }
 
 fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8]) {
@@ -320,7 +368,14 @@ fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn context_waypoints_match_hf() {
-    let (ctx, serve, dir) = stack_with(32900, 2200);
+    // The deepest waypoint's prompt and its teacher tokens, whole in the
+    // pools: the pages a raised ceiling would hold, plus each pool's padding
+    // page and one more.
+    let max_context = 32900;
+    let (ctx, serve, dir) = stack_with(
+        max_context,
+        max_context.div_ceil(crate::kv::LOCAL_PAGE_SIZE) + 2,
+    );
     let window_bytes = std::fs::read(window_fixture()).expect("read window fixture");
     let long_bytes = std::fs::read(longctx_fixture()).expect("read longctx fixture");
     validate_waypoint_provenance(&dir, &window_bytes, &long_bytes);
@@ -359,6 +414,9 @@ fn context_waypoints_match_hf() {
             floor: None,
         },
     ];
+    // The chunked 32K pass runs before the whole-prompt one: the chunked
+    // walk is what a raised ceiling serves through, and it is the pass a
+    // card too small for the whole-prompt scratch still has to carry.
     let long_points = [
         Waypoint {
             case: "w16384",
@@ -367,20 +425,37 @@ fn context_waypoints_match_hf() {
         },
         Waypoint {
             case: "w32768",
-            chunk: 0,
+            chunk: 2048,
             floor: Some(floor),
         },
         Waypoint {
             case: "w32768",
-            chunk: 2048,
+            chunk: 0,
             floor: Some(floor),
         },
     ];
-    let mut failures = gate_waypoints(&ctx, &serve, &window, &window_points);
-    failures.extend(gate_waypoints(&ctx, &serve, &long, &long_points));
+    let mut report = WaypointReport::default();
+    gate_waypoints(&ctx, &serve, &window, &window_points, &mut report);
+    gate_waypoints(&ctx, &serve, &long, &long_points, &mut report);
+    // A skipped whole-prompt case is only evidence of memory, never of
+    // numerics: its length has to have passed through the chunked pass.
+    for skipped in &report.skipped {
+        let twin = format!("{skipped}-chunked");
+        assert!(
+            report.ran.contains(&twin) && !report.failures.iter().any(|f| f.starts_with(&twin)),
+            "{skipped} was skipped for memory and {twin} did not pass in its place"
+        );
+    }
     assert!(
-        failures.is_empty(),
-        "cases over their calibrated floor: {failures:?}"
+        report.failures.is_empty(),
+        "cases over their calibrated floor: {:?}",
+        report.failures
+    );
+    eprintln!(
+        "waypoints: {} ran, {} skipped for memory {:?}",
+        report.ran.len(),
+        report.skipped.len(),
+        report.skipped
     );
 }
 

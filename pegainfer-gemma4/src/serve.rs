@@ -832,6 +832,16 @@ impl StepArena {
 /// over one KV head halves into pseudo-requests — an exact memory identity
 /// only because MQA gives every query head the same KV head (the 12B
 /// global family's 16 over 1). Anything else fails loud.
+/// The allocators wrap the driver error in a message rather than keeping the
+/// code, so this reads the driver's own string. Deliberately narrow: anything
+/// it does not recognise stays an error, so a new failure mode surfaces as
+/// one rather than as a card that is merely too small.
+#[cfg(test)]
+fn is_out_of_memory(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("CUDA_ERROR_OUT_OF_MEMORY") || text.contains("out of memory")
+}
+
 impl GemmaServe {
     /// The generated windowed entries read two-byte rows, and
     /// `PEGAINFER_KV_FP8` stores this pool's K and V as e4m3, which they
@@ -846,6 +856,30 @@ impl GemmaServe {
     /// Whether the step projects through the stacked weights.
     fn fuses_projections(&self) -> bool {
         self.tilelang_global_attn
+    }
+
+    /// Whether a whole-prompt pass over `rows` can take its scratch here: the
+    /// allocation itself, released again, rather than a second copy of the
+    /// arithmetic that would drift from `TowerScratch::new`. Only
+    /// [`is_out_of_memory`] answers `false`; every other failure is handed
+    /// back.
+    #[cfg(test)]
+    pub(crate) fn single_pass_scratch_fits(
+        &self,
+        ctx: &DeviceContext,
+        rows: usize,
+    ) -> Result<bool> {
+        match TowerScratch::new(
+            ctx,
+            &self.local_geom,
+            &self.global_geom,
+            rows,
+            self.fuses_projections(),
+        ) {
+            Ok(_) => Ok(true),
+            Err(e) if is_out_of_memory(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The global family's decode read, chosen once by the same flag as its
@@ -2893,6 +2927,27 @@ pub(crate) struct PrefillPass {
     pub(crate) logits: HiddenStates,
     _pass: SinglePass,
     _normed: HiddenStates,
+}
+
+#[cfg(test)]
+mod oom_probe {
+    #[test]
+    fn only_a_device_out_of_memory_reads_as_one() {
+        let oom = anyhow::anyhow!(
+            "Alloc failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        );
+        assert!(super::is_out_of_memory(&oom));
+        for other in [
+            "Alloc failed: DriverError(CUDA_ERROR_INVALID_VALUE, \"invalid argument\")",
+            "Alloc failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")",
+            "cuBLAS handle is invalid",
+        ] {
+            assert!(
+                !super::is_out_of_memory(&anyhow::anyhow!("{other}")),
+                "{other} must stay an error rather than read as a card too small"
+            );
+        }
+    }
 }
 
 #[path = "serve_oracle.rs"]
