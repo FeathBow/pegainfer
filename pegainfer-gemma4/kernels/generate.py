@@ -48,6 +48,12 @@ KERNEL_SYMBOL = f"{CU_STEM}_kernel"
 DECODE_PARTIAL_SYMBOL = "gemma4_hd512_decode_partial_kernel"
 DECODE_MERGE_GROUPS_SYMBOL = "gemma4_hd512_decode_merge_groups_kernel"
 DECODE_MERGE_SYMBOL = "gemma4_hd512_decode_merge_kernel"
+LOCAL_DECODE_LAUNCHER = "gemma4_hd256_decode_window"
+LOCAL_PREFILL_LAUNCHER = "gemma4_hd256_prefill_window"
+LOCAL_PREFILL_SYMBOL = "gemma4_hd256_prefill_window_kernel"
+LOCAL_DECODE_PARTIAL_SYMBOL = "gemma4_hd256_decode_partial_kernel"
+LOCAL_DECODE_MERGE_GROUPS_SYMBOL = "gemma4_hd256_decode_merge_groups_kernel"
+LOCAL_DECODE_MERGE_SYMBOL = "gemma4_hd256_decode_merge_kernel"
 
 # Each launcher's C parameters, without the trailing stream the consumer adds.
 # The emitted definition and the manifest line both come from here, so the
@@ -106,6 +112,60 @@ DECODE_LAUNCHER_PARAMS = [
     ("float", "sm_scale"),
 ]
 
+# The sliding family's prefill: the global prefill's parameters without a
+# row format (its pool is split K|V) and with the window as a key distance.
+LOCAL_PREFILL_LAUNCHER_PARAMS = [
+    ("const void*", "q"),
+    ("const void*", "kv"),
+    ("const int*", "page_indices"),
+    ("const int*", "page_indptr"),
+    ("const int*", "q_indptr"),
+    ("const int*", "host_q_indptr"),
+    ("const int*", "last_page_len"),
+    ("void*", "out"),
+    ("int", "batch"),
+    ("int", "q_rows"),
+    ("int", "pool_rows"),
+    ("int", "rows_per_page"),
+    ("int", "layer_row"),
+    ("int", "page_size"),
+    ("int", "window_left"),
+    ("int", "num_qo_heads"),
+    ("int", "num_kv_heads"),
+    ("float", "sm_scale"),
+]
+
+# The sliding family's decode: the same plan arrays and workspace as the
+# global decode, no row format (its pool is split K|V), and the window as a
+# key distance.
+LOCAL_DECODE_LAUNCHER_PARAMS = [
+    ("const void*", "q"),
+    ("const void*", "kv"),
+    ("const int*", "page_indices"),
+    ("const int*", "page_indptr"),
+    ("const int*", "last_page_len"),
+    ("const int*", "request_indices"),
+    ("const int*", "kv_tile_indices"),
+    ("const unsigned char*", "valid_mask"),
+    ("const int*", "o_indptr"),
+    ("void*", "tmp_v"),
+    ("float*", "tmp_s"),
+    ("void*", "out"),
+    ("int", "batch"),
+    ("int", "padded_slots"),
+    ("int", "row_offset"),
+    ("int", "q_rows"),
+    ("int", "pool_rows"),
+    ("int", "rows_per_page"),
+    ("int", "layer_row"),
+    ("int", "page_size"),
+    ("int", "chunk_tokens"),
+    ("int", "window_left"),
+    ("int", "num_qo_heads"),
+    ("int", "num_kv_heads"),
+    ("float", "sm_scale"),
+]
+
 # TileLang's `debug.h` *defines* `debug_print_msg` and the `uint16_t`
 # specialization of `debug_print_buffer_value` with external linkage, so every
 # translation unit that includes it exports the same two symbols. This kernel
@@ -125,6 +185,17 @@ PAGE_SIZE = 64
 # dimension of the folded bodies, like the head itself. The split bodies
 # are lowered for a row format of zero.
 ROTARY = 128
+# The sliding family: 32 query heads over 16 key/value heads at head dim
+# 256, paged at 64 rows -- the prefill's key tile, so its load is one copy
+# -- and windowed at 1024 keys. Its decode reads 64-token chunks as one
+# page a tile.
+LOCAL_HEADS = 32
+LOCAL_GROUPS = 2
+LOCAL_HEAD_DIM = 256
+LOCAL_PAGE_SIZE = 64
+LOCAL_TILE_PAGES = 1
+LOCAL_DECODE_CHUNK_TOKENS = 64
+LOCAL_WINDOW = 1024
 
 # The serving arena's maxima, in the units each tensor is indexed in. A step
 # is always smaller; see the module docstring.
@@ -143,6 +214,11 @@ POOL_ROWS = POOL_PAGES * MAX_LAYERS * 2 * PAGE_SIZE
 MAX_DECODE_ROWS = 2 * SLOTS
 DECODE_CHUNK_TOKENS = 256
 MAX_SLOTS = MAX_DECODE_ROWS * (CEILING // DECODE_CHUNK_TOKENS)
+# The sliding family's slots: a resident window holds at most the window
+# plus a page, and every decode row has one.
+LOCAL_MAX_SLOTS = MAX_DECODE_ROWS * (
+    (LOCAL_WINDOW + LOCAL_PAGE_SIZE + LOCAL_DECODE_CHUNK_TOKENS - 1) // LOCAL_DECODE_CHUNK_TOKENS
+)
 # The launchers take every row and slot count as C ints; a configuration that
 # outgrew one would index past the guards rather than fail.
 assert Q_ROWS < 2**31, Q_ROWS
@@ -703,6 +779,58 @@ def build_decode_merge(arch: str):
     )
 
 
+def build_local_prefill(arch: str):
+    return tilelang.compile(
+        defs.prefill_window(
+            LOCAL_HEADS,
+            LOCAL_GROUPS,
+            LOCAL_HEAD_DIM,
+            LOCAL_PAGE_SIZE,
+            MAX_BATCH,
+            Q_ROWS,
+            POOL_ROWS,
+            PAGE_TABLE_LEN,
+        ),
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=defs.PASS_CONFIGS,
+    )
+
+
+def build_local_decode_partial(arch: str):
+    return tilelang.compile(
+        defs.decode_window_partial(
+            LOCAL_HEADS,
+            LOCAL_GROUPS,
+            LOCAL_HEAD_DIM,
+            LOCAL_PAGE_SIZE,
+            LOCAL_TILE_PAGES,
+            Q_ROWS,
+            MAX_DECODE_ROWS,
+            LOCAL_MAX_SLOTS,
+            POOL_ROWS,
+            PAGE_TABLE_LEN,
+        ),
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=defs.PASS_CONFIGS,
+    )
+
+
+def build_local_decode_merge_groups(arch: str):
+    return tilelang.compile(
+        defs.decode_merge_groups(LOCAL_HEADS, LOCAL_HEAD_DIM, MAX_DECODE_ROWS, LOCAL_MAX_SLOTS),
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=defs.PASS_CONFIGS,
+    )
+
+
+def build_local_decode_merge(arch: str):
+    return tilelang.compile(
+        defs.decode_merge(LOCAL_HEADS, LOCAL_HEAD_DIM, Q_ROWS, MAX_DECODE_ROWS, LOCAL_MAX_SLOTS),
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=defs.PASS_CONFIGS,
+    )
+
+
 # Past any of these the body drops a tail or reads the wrong rows and hands
 # back plausible numbers, so the launcher refuses rather than truncates.
 PREFILL_BOUNDS = (
@@ -896,7 +1024,126 @@ DECODE = Launcher(
     ],
 )
 
-LAUNCHERS = [PREFILL, DECODE]
+# The sliding family's decode refuses like the global one, plus a chunk
+# that is not whole tiles and a window that is not a distance.
+LOCAL_DECODE_BOUNDS = (
+    f"  if (q_rows > {Q_ROWS} || pool_rows > {POOL_ROWS} || batch > {MAX_DECODE_ROWS}\n"
+    f"      || padded_slots > {LOCAL_MAX_SLOTS} || page_size != {LOCAL_PAGE_SIZE}\n"
+    f"      || chunk_tokens <= 0 || chunk_tokens % {LOCAL_TILE_PAGES * LOCAL_PAGE_SIZE} != 0\n"
+    f"      || window_left < 0\n"
+    f"      || num_qo_heads != {LOCAL_HEADS} || num_kv_heads != {LOCAL_HEADS // LOCAL_GROUPS}) {{\n"
+    f"    return static_cast<int>(cudaErrorInvalidValue);\n"
+    f"  }}\n"
+)
+LOCAL_DECODE_PRELUDE = (
+    f"  const int chunk_pages = chunk_tokens / page_size;\n"
+    f"  if (batch == 0 || padded_slots == 0) {{\n"
+    f"    return static_cast<int>(cudaSuccess);\n"
+    f"  }}\n"
+    f"  const int slots_per_request = (padded_slots + batch - 1) / batch;\n"
+    f"  const int merge_groups = (slots_per_request + {defs.DECODE_MERGE_SPAN - 1})"
+    f" / {defs.DECODE_MERGE_SPAN};\n"
+)
+
+LOCAL_DECODE = Launcher(
+    name=LOCAL_DECODE_LAUNCHER,
+    params=LOCAL_DECODE_LAUNCHER_PARAMS,
+    bounds=LOCAL_DECODE_BOUNDS,
+    prelude=LOCAL_DECODE_PRELUDE,
+    kernels=[
+        # The page copies land in row slices of one shared tile, which the
+        # lowering carries as plain copies rather than bulk ones, so the
+        # pool is a plain pointer here and its declared rows are a guard.
+        Kernel(
+            symbol=LOCAL_DECODE_PARTIAL_SYMBOL,
+            build=build_local_decode_partial,
+            descriptor_var={},
+            tensor_arg={},
+            runtime_rows={},
+            bind={
+                **DECODE_PARTIAL_BIND,
+                "KV": "reinterpret_cast<const bfloat16_t*>(kv)",
+                "window_left": "window_left",
+            },
+            grid="dim3(padded_slots, num_kv_heads)",
+            opt_in_var="opt_in_partial",
+        ),
+        Kernel(
+            symbol=LOCAL_DECODE_MERGE_GROUPS_SYMBOL,
+            build=build_local_decode_merge_groups,
+            descriptor_var={},
+            tensor_arg={},
+            runtime_rows={},
+            bind={
+                "TmpV": "reinterpret_cast<bfloat16_t*>(tmp_v)",
+                "TmpS": "tmp_s",
+                "OIndptr": "o_indptr",
+                "batch": "batch",
+                "groups": "merge_groups",
+            },
+            grid="dim3(batch, num_qo_heads, merge_groups)",
+            opt_in_var="opt_in_merge_groups",
+        ),
+        Kernel(
+            symbol=LOCAL_DECODE_MERGE_SYMBOL,
+            build=build_local_decode_merge,
+            descriptor_var={},
+            tensor_arg={},
+            runtime_rows={},
+            bind={
+                "TmpV": "reinterpret_cast<bfloat16_t*>(tmp_v)",
+                "TmpS": "tmp_s",
+                "OIndptr": "o_indptr",
+                "row_offset": "row_offset",
+                "batch": "batch",
+                "Output": "reinterpret_cast<bfloat16_t*>(out)",
+            },
+            grid="dim3(batch, num_qo_heads)",
+            opt_in_var="opt_in_merge",
+        ),
+    ],
+)
+
+# The sliding family's prefill refuses like the global one, with the window
+# as a distance in place of the row format; its grid is one CTA per (query
+# tile, head) of every request, the sum the body re-walks.
+LOCAL_PREFILL_BOUNDS = (
+    f"  if (q_rows > {Q_ROWS} || pool_rows > {POOL_ROWS} || batch < 0 || batch > {MAX_BATCH}\n"
+    f"      || page_size != {LOCAL_PAGE_SIZE} || window_left < 0\n"
+    f"      || num_qo_heads != {LOCAL_HEADS} || num_kv_heads != {LOCAL_HEADS // LOCAL_GROUPS}) {{\n"
+    f"    return static_cast<int>(cudaErrorInvalidValue);\n"
+    f"  }}\n"
+)
+LOCAL_PREFILL_GRID = (
+    f"  int total_ctas = 0;\n"
+    f"  for (int request = 0; request < batch; ++request) {{\n"
+    f"    const int rows = host_q_indptr[request + 1] - host_q_indptr[request];\n"
+    f"    total_ctas += ((rows + {defs.LOCAL_BLOCK_M - 1}) / {defs.LOCAL_BLOCK_M}) * {LOCAL_HEADS};\n"
+    f"  }}\n"
+    f"  if (total_ctas == 0) {{\n"
+    f"    return static_cast<int>(cudaSuccess);\n"
+    f"  }}\n"
+)
+LOCAL_PREFILL = Launcher(
+    name=LOCAL_PREFILL_LAUNCHER,
+    params=LOCAL_PREFILL_LAUNCHER_PARAMS,
+    bounds=LOCAL_PREFILL_BOUNDS,
+    prelude=LOCAL_PREFILL_GRID,
+    kernels=[
+        Kernel(
+            symbol=LOCAL_PREFILL_SYMBOL,
+            build=build_local_prefill,
+            descriptor_var=DESCRIPTOR_VAR,
+            tensor_arg=TENSOR_ARG,
+            runtime_rows=PREFILL_RUNTIME_ROWS,
+            bind={**PREFILL_BIND, "batch": "batch", "window_left": "window_left"},
+            grid="dim3(total_ctas)",
+            opt_in_var="opt_in_local_prefill",
+        ),
+    ],
+)
+
+LAUNCHERS = [PREFILL, DECODE, LOCAL_DECODE, LOCAL_PREFILL]
 
 
 def check_strides(maps: list[TensorMap]) -> None:

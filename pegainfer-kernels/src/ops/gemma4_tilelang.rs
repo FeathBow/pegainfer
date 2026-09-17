@@ -65,6 +65,11 @@ pub fn gemma4_hd512_prefill_varlen_into(
         sm_scale.is_finite(),
         "gemma4 hd512 prefill sm_scale {sm_scale} must be finite"
     );
+    anyhow::ensure!(
+        layout.storage == crate::paged_kv::KvStorage::Bf16,
+        "gemma4 hd512 prefill loads two-byte rows; the pool stores {:?}",
+        layout.storage
+    );
     let head_dim = layout.head_dim;
     anyhow::ensure!(
         q.hidden_dim == num_qo_heads * head_dim,
@@ -144,7 +149,106 @@ pub fn gemma4_hd512_prefill_varlen_into(
             crate::tensor::active_cu_stream(ctx),
         )
     };
-    checked_launch(rc)
+    checked_launch(rc, "gemma4 hd512 prefill")
+}
+
+/// The sliding family's prefill through the generated windowed kernel: the
+/// same plan and pool the incumbent windowed read takes, `window_left` the
+/// inclusive key distance a query attends to. The kernel is lowered for the
+/// pool's page as its key tile, and refuses another.
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4_hd256_prefill_window_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    sm_scale: f32,
+    window_left: usize,
+) -> Result<()> {
+    const WHAT: &str = "gemma4 hd256 window prefill";
+    anyhow::ensure!(
+        layout.format == crate::paged_kv::KvFormat::Split,
+        "{WHAT} reads split K|V rows; the layout is {:?}",
+        layout.format
+    );
+    anyhow::ensure!(
+        layout.storage == crate::paged_kv::KvStorage::Bf16,
+        "{WHAT} loads two-byte rows; the pool stores {:?}",
+        layout.storage
+    );
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "{WHAT} sm_scale {sm_scale} must be finite"
+    );
+    let head_dim = layout.head_dim;
+    anyhow::ensure!(
+        q.hidden_dim == num_qo_heads * head_dim,
+        "{WHAT} q.hidden_dim {} != num_qo_heads {num_qo_heads} * {head_dim}",
+        q.hidden_dim,
+    );
+    anyhow::ensure!(
+        output.hidden_dim == q.hidden_dim,
+        "{WHAT} output.hidden_dim {} != q.hidden_dim {}",
+        output.hidden_dim,
+        q.hidden_dim,
+    );
+    let host_q_indptr = plan.q_indptr_host();
+    let packed_rows = *host_q_indptr.last().unwrap_or(&0) as usize;
+    anyhow::ensure!(
+        q.seq_len >= packed_rows && output.seq_len >= packed_rows,
+        "{WHAT} rows (q {}, out {}) below the plan's {packed_rows}",
+        q.seq_len,
+        output.seq_len,
+    );
+    q.checked_extent(WHAT)?;
+    output.checked_extent(WHAT)?;
+    let rows = layout.row_geometry(kv_buffer.len(), layer, WHAT)?;
+    let rows_per_page = crate::ops::checked_i32(rows.rows_per_page, WHAT)?;
+    let layer_row = crate::ops::checked_i32(rows.layer_row, WHAT)?;
+    let pool_rows = crate::ops::checked_i32(rows.pool_rows, WHAT)?;
+    let q_rows = crate::ops::checked_i32(q.seq_len, WHAT)?;
+    let page_size = crate::ops::checked_i32(layout.page_size, WHAT)?;
+    let window_left = crate::ops::checked_i32(window_left, WHAT)?;
+    let num_qo_heads_i32 = crate::ops::checked_i32(num_qo_heads, WHAT)?;
+    let num_kv_heads_i32 = crate::ops::checked_i32(layout.num_kv_heads, WHAT)?;
+    let batch = plan.batch_size();
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (kv_ptr, _gkv) = kv_buffer.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = plan.page_indices_d().device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = plan.page_indptr_d().device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = plan.q_indptr_d().device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = plan.last_page_len_d().device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    let rc = unsafe {
+        ffi::gemma4_hd256_prefill_window(
+            q_ptr as *const core::ffi::c_void,
+            kv_ptr as *const core::ffi::c_void,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            qi_ptr as *const i32,
+            host_q_indptr.as_ptr(),
+            lpl_ptr as *const i32,
+            out_ptr as *mut core::ffi::c_void,
+            batch,
+            q_rows,
+            pool_rows,
+            rows_per_page,
+            layer_row,
+            page_size,
+            window_left,
+            num_qo_heads_i32,
+            num_kv_heads_i32,
+            sm_scale,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    checked_launch(rc, WHAT)
 }
 
 /// The fn type both global decode reads share, so a caller holds one and the
@@ -166,6 +270,120 @@ pub type GlobalDecodeAttend = fn(
     usize,
     f32,
 ) -> Result<()>;
+
+/// What a split-KV decode launch takes as C ints, checked once for both
+/// families' reads: the rows and slots against the buffers they index, the
+/// chunk against the page, and the pool's row view from the layout.
+struct SplitDecodeArgs {
+    batch: i32,
+    padded_slots: i32,
+    row_offset: i32,
+    q_rows: i32,
+    pool_rows: i32,
+    rows_per_page: i32,
+    layer_row: i32,
+    page_size: i32,
+    chunk_tokens: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_decode_args(
+    what: &str,
+    q: &HiddenStates,
+    row_offset: usize,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    meta: &Hd512DecodeMetadata,
+    split_o_indptr_d: &CudaSlice<i32>,
+    split_valid_mask_d: &CudaSlice<u8>,
+    split_tmp_v: &CudaSlice<bf16>,
+    split_tmp_s: &CudaSlice<f32>,
+    split_padded_slots: usize,
+    output: &HiddenStates,
+    num_qo_heads: usize,
+    sm_scale: f32,
+) -> Result<SplitDecodeArgs> {
+    anyhow::ensure!(
+        layout.storage == crate::paged_kv::KvStorage::Bf16,
+        "{what} loads two-byte rows; the pool stores {:?}",
+        layout.storage
+    );
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "{what} sm_scale {sm_scale} must be finite"
+    );
+    let head_dim = layout.head_dim;
+    anyhow::ensure!(
+        row_offset < q.seq_len,
+        "{what} row_offset {row_offset} leaves no rows of {}",
+        q.seq_len
+    );
+    let batch = q.seq_len - row_offset;
+    meta.validate(batch)?;
+    anyhow::ensure!(
+        output.seq_len == q.seq_len,
+        "{what} output.seq_len {} != q.seq_len {}",
+        output.seq_len,
+        q.seq_len
+    );
+    anyhow::ensure!(
+        q.hidden_dim == num_qo_heads * head_dim && output.hidden_dim == q.hidden_dim,
+        "{what} q/out hidden_dim ({}, {}) != num_qo_heads {num_qo_heads} * {head_dim}",
+        q.hidden_dim,
+        output.hidden_dim,
+    );
+    anyhow::ensure!(
+        split_padded_slots >= batch,
+        "{what} padded_slots {split_padded_slots} < batch {batch}"
+    );
+    anyhow::ensure!(
+        meta.request_indices().len() >= split_padded_slots
+            && meta.kv_tile_indices().len() >= split_padded_slots
+            && split_valid_mask_d.len() >= split_padded_slots,
+        "{what} plan arrays shorter than padded_slots {split_padded_slots}"
+    );
+    anyhow::ensure!(
+        split_o_indptr_d.len() > batch,
+        "{what} o_indptr len {} < batch {batch} + 1",
+        split_o_indptr_d.len()
+    );
+    anyhow::ensure!(
+        split_tmp_v.len() >= split_padded_slots * q.hidden_dim
+            && split_tmp_s.len() >= split_padded_slots * num_qo_heads,
+        "{what} workspace shorter than padded_slots {split_padded_slots}"
+    );
+    // The tile indices count chunks; the body walks pages, so a chunk has
+    // to be whole pages or the two would name different keys.
+    anyhow::ensure!(
+        meta.chunk_tokens().is_multiple_of(layout.page_size),
+        "{what} chunk {} is not whole pages of {}",
+        meta.chunk_tokens(),
+        layout.page_size
+    );
+    let rows = layout.row_geometry(kv_buffer.len(), layer, what)?;
+    // The rows are addressed from the buffer's start on the device: the
+    // launcher takes the offset rather than an advanced pointer, so the
+    // descriptor it builds over the query rows sees the whole buffer.
+    checked_row_offset(q, row_offset, batch, &format!("{what} q"))?;
+    checked_row_offset(output, row_offset, batch, &format!("{what} output"))?;
+    let int = |value: usize, name: &str| crate::ops::checked_i32(value, &format!("{what} {name}"));
+    Ok(SplitDecodeArgs {
+        batch: int(batch, "batch")?,
+        padded_slots: int(split_padded_slots, "padded slots")?,
+        row_offset: int(row_offset, "row_offset")?,
+        q_rows: int(q.seq_len, "q_rows")?,
+        pool_rows: int(rows.pool_rows, "pool_rows")?,
+        rows_per_page: int(rows.rows_per_page, "rows_per_page")?,
+        layer_row: int(rows.layer_row, "layer_row")?,
+        page_size: int(layout.page_size, "page_size")?,
+        chunk_tokens: int(meta.chunk_tokens(), "chunk")?,
+        num_qo_heads: int(num_qo_heads, "num_qo_heads")?,
+        num_kv_heads: int(layout.num_kv_heads, "num_kv_heads")?,
+    })
+}
 
 /// Split-KV decode over the global family's paged pool, for the step's
 /// decode rows.
@@ -193,83 +411,32 @@ pub fn gemma4_hd512_decode_split_kv_into(
     num_qo_heads: usize,
     sm_scale: f32,
 ) -> Result<()> {
-    anyhow::ensure!(
-        sm_scale.is_finite(),
-        "gemma4 hd512 decode sm_scale {sm_scale} must be finite"
-    );
-    let head_dim = layout.head_dim;
-    anyhow::ensure!(
-        row_offset < q.seq_len,
-        "gemma4 hd512 decode row_offset {row_offset} leaves no rows of {}",
-        q.seq_len
-    );
-    let batch = q.seq_len - row_offset;
-    meta.validate(batch)?;
-    anyhow::ensure!(
-        output.seq_len == q.seq_len,
-        "gemma4 hd512 decode output.seq_len {} != q.seq_len {}",
-        output.seq_len,
-        q.seq_len
-    );
-    anyhow::ensure!(
-        q.hidden_dim == num_qo_heads * head_dim && output.hidden_dim == q.hidden_dim,
-        "gemma4 hd512 decode q/out hidden_dim ({}, {}) != num_qo_heads {num_qo_heads} * {head_dim}",
-        q.hidden_dim,
-        output.hidden_dim,
-    );
-    anyhow::ensure!(
-        split_padded_slots >= batch,
-        "gemma4 hd512 decode padded_slots {split_padded_slots} < batch {batch}"
-    );
-    anyhow::ensure!(
-        meta.request_indices().len() >= split_padded_slots
-            && meta.kv_tile_indices().len() >= split_padded_slots
-            && split_valid_mask_d.len() >= split_padded_slots,
-        "gemma4 hd512 decode plan arrays shorter than padded_slots {split_padded_slots}"
-    );
-    anyhow::ensure!(
-        split_o_indptr_d.len() > batch,
-        "gemma4 hd512 decode o_indptr len {} < batch {batch} + 1",
-        split_o_indptr_d.len()
-    );
-    anyhow::ensure!(
-        split_tmp_v.len() >= split_padded_slots * q.hidden_dim
-            && split_tmp_s.len() >= split_padded_slots * num_qo_heads,
-        "gemma4 hd512 decode workspace shorter than padded_slots {split_padded_slots}"
-    );
-    // The tile indices count chunks; the body walks pages, so a chunk has
-    // to be whole pages or the two would name different keys.
-    anyhow::ensure!(
-        meta.chunk_tokens().is_multiple_of(layout.page_size),
-        "gemma4 hd512 decode chunk {} is not whole pages of {}",
-        meta.chunk_tokens(),
-        layout.page_size
-    );
-    let rows = layout.row_geometry(kv_buffer.len(), layer, "gemma4 hd512 decode")?;
+    const WHAT: &str = "gemma4 hd512 decode";
+    let args = split_decode_args(
+        WHAT,
+        q,
+        row_offset,
+        kv_buffer,
+        layout,
+        layer,
+        meta,
+        split_o_indptr_d,
+        split_valid_mask_d,
+        split_tmp_v,
+        split_tmp_s,
+        split_padded_slots,
+        output,
+        num_qo_heads,
+        sm_scale,
+    )?;
+    // The row's format goes as the count the bodies tell it by: zero for
+    // the split rows, whose V is one page of rows after K, and the rotated
+    // columns a folded row keeps otherwise. The launcher refuses a count its
+    // bodies were not lowered for.
     let fold_rotary = crate::ops::checked_i32(
         layout.format.fold_rotary(),
         "gemma4 hd512 decode fold_rotary",
     )?;
-    let rows_per_page =
-        crate::ops::checked_i32(rows.rows_per_page, "gemma4 hd512 decode rows_per_page")?;
-    let layer_row = crate::ops::checked_i32(rows.layer_row, "gemma4 hd512 decode layer_row")?;
-    let pool_rows = crate::ops::checked_i32(rows.pool_rows, "gemma4 hd512 decode pool_rows")?;
-    let q_rows = crate::ops::checked_i32(q.seq_len, "gemma4 hd512 decode q_rows")?;
-    let batch_i32 = crate::ops::checked_i32(batch, "gemma4 hd512 decode batch")?;
-    let padded_i32 =
-        crate::ops::checked_i32(split_padded_slots, "gemma4 hd512 decode padded slots")?;
-    let row_offset_i32 = crate::ops::checked_i32(row_offset, "gemma4 hd512 decode row_offset")?;
-    let page_size = crate::ops::checked_i32(layout.page_size, "gemma4 hd512 decode page_size")?;
-    let chunk_tokens = crate::ops::checked_i32(meta.chunk_tokens(), "gemma4 hd512 decode chunk")?;
-    let num_qo_heads_i32 =
-        crate::ops::checked_i32(num_qo_heads, "gemma4 hd512 decode num_qo_heads")?;
-    let num_kv_heads_i32 =
-        crate::ops::checked_i32(layout.num_kv_heads, "gemma4 hd512 decode num_kv_heads")?;
-    // The rows are addressed from the buffer's start on the device: the
-    // launcher takes the offset rather than an advanced pointer, so the
-    // descriptor it builds over the query rows sees the whole buffer.
-    checked_row_offset(q, row_offset, batch, "gemma4 hd512 decode q")?;
-    checked_row_offset(output, row_offset, batch, "gemma4 hd512 decode output")?;
 
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (kv_ptr, _gkv) = kv_buffer.device_ptr(&ctx.stream);
@@ -298,40 +465,144 @@ pub fn gemma4_hd512_decode_split_kv_into(
             stv_ptr as *mut core::ffi::c_void,
             sts_ptr as *mut f32,
             out_ptr as *mut core::ffi::c_void,
-            batch_i32,
-            padded_i32,
-            row_offset_i32,
-            q_rows,
-            pool_rows,
-            rows_per_page,
-            layer_row,
-            page_size,
+            args.batch,
+            args.padded_slots,
+            args.row_offset,
+            args.q_rows,
+            args.pool_rows,
+            args.rows_per_page,
+            args.layer_row,
+            args.page_size,
             fold_rotary,
-            chunk_tokens,
-            num_qo_heads_i32,
-            num_kv_heads_i32,
+            args.chunk_tokens,
+            args.num_qo_heads,
+            args.num_kv_heads,
             sm_scale,
             crate::tensor::active_cu_stream(ctx),
         )
     };
-    checked_launch(rc)
+    checked_launch(rc, WHAT)
+}
+
+/// Windowed split-KV decode over the sliding family's paged pool, for the
+/// step's decode rows.
+///
+/// The plan is the same shape the global decode takes, built over the local
+/// pool's resident pages, and `window_left` is the inclusive key distance a
+/// query attends to: the resident pages hold up to a page more than the
+/// window, since pages release whole, and the kernel masks those keys where
+/// the windowed prefill read did. The pool's rows are the split K|V format;
+/// the layout says so and a folded one is refused.
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4_hd256_decode_window_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    row_offset: usize,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    meta: &Hd512DecodeMetadata,
+    split_o_indptr_d: &CudaSlice<i32>,
+    split_valid_mask_d: &CudaSlice<u8>,
+    split_tmp_v: &mut CudaSlice<bf16>,
+    split_tmp_s: &mut CudaSlice<f32>,
+    split_padded_slots: usize,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    sm_scale: f32,
+    window_left: usize,
+) -> Result<()> {
+    const WHAT: &str = "gemma4 hd256 window decode";
+    anyhow::ensure!(
+        layout.format == crate::paged_kv::KvFormat::Split,
+        "{WHAT} reads split K|V rows; the layout is {:?}",
+        layout.format
+    );
+    anyhow::ensure!(
+        layout.storage == crate::paged_kv::KvStorage::Bf16,
+        "{WHAT} loads two-byte rows; the pool stores {:?}",
+        layout.storage
+    );
+    let args = split_decode_args(
+        WHAT,
+        q,
+        row_offset,
+        kv_buffer,
+        layout,
+        layer,
+        meta,
+        split_o_indptr_d,
+        split_valid_mask_d,
+        split_tmp_v,
+        split_tmp_s,
+        split_padded_slots,
+        output,
+        num_qo_heads,
+        sm_scale,
+    )?;
+    let window_left = crate::ops::checked_i32(window_left, "gemma4 hd256 window decode window")?;
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (kv_ptr, _gkv) = kv_buffer.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = meta.page_indices().device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = meta.page_indptr().device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = meta.last_page_len().device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = meta.request_indices().device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = meta.kv_tile_indices().device_ptr(&ctx.stream);
+    let (svm_ptr, _gsvm) = split_valid_mask_d.device_ptr(&ctx.stream);
+    let (soi_ptr, _gsoi) = split_o_indptr_d.device_ptr(&ctx.stream);
+    let (stv_ptr, _gstv) = split_tmp_v.device_ptr_mut(&ctx.stream);
+    let (sts_ptr, _gsts) = split_tmp_s.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    let rc = unsafe {
+        ffi::gemma4_hd256_decode_window(
+            q_ptr as *const core::ffi::c_void,
+            kv_ptr as *const core::ffi::c_void,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            ri_ptr as *const i32,
+            kti_ptr as *const i32,
+            svm_ptr as *const u8,
+            soi_ptr as *const i32,
+            stv_ptr as *mut core::ffi::c_void,
+            sts_ptr as *mut f32,
+            out_ptr as *mut core::ffi::c_void,
+            args.batch,
+            args.padded_slots,
+            args.row_offset,
+            args.q_rows,
+            args.pool_rows,
+            args.rows_per_page,
+            args.layer_row,
+            args.page_size,
+            args.chunk_tokens,
+            window_left,
+            args.num_qo_heads,
+            args.num_kv_heads,
+            sm_scale,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    checked_launch(rc, WHAT)
 }
 
 /// `cudaErrorNotSupported` is the stub tier saying this build has no kernel;
 /// anything else is a call the bodies refused or a launch that failed. Naming
 /// the first is the difference between a build question and a bug hunt.
-fn checked_launch(rc: i32) -> Result<()> {
+fn checked_launch(rc: i32, what: &str) -> Result<()> {
     const NOT_SUPPORTED: i32 = 801;
     match rc {
         0 => Ok(()),
         NOT_SUPPORTED => anyhow::bail!(
-            "gemma4 hd512 prefill is not in this build: it fell back to the \
-             stub tier, so no TileLang and no pre-generated directory were \
-             available when pegainfer-kernels was compiled"
+            "{what} is not in this build: it fell back to the stub tier, so no TileLang \
+             and no pre-generated directory were available when pegainfer-kernels was \
+             compiled"
         ),
         other => anyhow::bail!(
-            "gemma4 hd512 prefill failed: cudaError={other} (1 = the call is \
-             outside the extents, batch or page size the bodies were built for)"
+            "{what} failed: cudaError={other} (1 = the call is outside the extents, batch, \
+             page size or shape the bodies were built for)"
         ),
     }
 }

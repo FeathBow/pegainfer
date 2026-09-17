@@ -270,10 +270,13 @@ pub(crate) fn admit_tokens(
     }
 }
 
-/// The sliding family's page. Small pages keep the window's footprint tight,
-/// and its reservations are per page because the front is released page by
-/// page.
-pub(crate) const LOCAL_PAGE_SIZE: usize = 16;
+/// The sliding family's page, the generated prefill's key tile: a tile load
+/// has to be one copy spanning the whole tile, and a tile assembled from
+/// four 16-row pages costs more than the generic kernel it replaces. The
+/// front is released page by page, so the resident window carries at most
+/// 63 tokens past the window -- 6% of it, and a few dozen megabytes a
+/// request across the family.
+pub(crate) const LOCAL_PAGE_SIZE: usize = 64;
 
 /// The global family's page, sized so one key block is one tile load: at this
 /// head dim a 64-row page keeps 0.93-0.96x of a contiguous tensor's throughput

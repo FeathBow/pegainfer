@@ -2,6 +2,11 @@
 
 #include "common.cuh"
 
+// The order every prep in this family finishes a token in: the warp partials
+// in launch order, then the position and page checks, which reject before
+// anything reads the cos/sin tables or writes the pool. Q blocks never touch
+// the pool. Each prep says only what is its own at the site.
+
 __device__ __forceinline__ void apply_rope_pair(
     __nv_bfloat16& x0,
     __nv_bfloat16& x1,

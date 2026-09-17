@@ -24,7 +24,9 @@ use pegainfer_core::kv_pool::KvStorage;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::tensor::Columns;
 use pegainfer_core::tensor::DeviceContext;
+use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
@@ -190,6 +192,7 @@ struct HostPlanningScratch {
     pseudo_indptr: Vec<i32>,
     pseudo_last: Vec<i32>,
     pseudo_kv_lens: Vec<usize>,
+    local_kv_lens: Vec<usize>,
     ones: Vec<usize>,
     prefill_global_rows: Vec<Vec<i32>>,
     prefill_global_last: Vec<usize>,
@@ -217,6 +220,7 @@ impl HostPlanningScratch {
             pseudo_indptr: Vec::new(),
             pseudo_last: Vec::new(),
             pseudo_kv_lens: Vec::new(),
+            local_kv_lens: Vec::new(),
             ones: Vec::new(),
             prefill_global_rows: Vec::new(),
             prefill_global_last: Vec::new(),
@@ -240,6 +244,7 @@ impl HostPlanningScratch {
         self.pseudo_pages.clear();
         self.pseudo_last.clear();
         self.pseudo_kv_lens.clear();
+        self.local_kv_lens.clear();
         self.ids.clear();
         self.ones.clear();
         self.ones.resize(rows, 1);
@@ -353,9 +358,7 @@ fn copy_pool_pages(
 /// wider family's width and reshaped per layer.
 struct AttnScratch {
     normed_x: HiddenStates,
-    q_states: HiddenStates,
-    k_states: HiddenStates,
-    v_states: HiddenStates,
+    proj: Projections,
     q_prep: HiddenStates,
     attn: HiddenStates,
 }
@@ -366,16 +369,13 @@ impl AttnScratch {
         local: &LayerGeometry,
         global: &LayerGeometry,
         max_rows: usize,
+        fused: bool,
     ) -> Result<Self> {
         let q_dim = |geom: &LayerGeometry| geom.num_q_heads * geom.head_dim;
-        let kv_dim = |geom: &LayerGeometry| geom.num_kv_heads * geom.head_dim;
         let q_max = q_dim(local).max(q_dim(global));
-        let kv_max = kv_dim(local).max(kv_dim(global));
         Ok(Self {
             normed_x: HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
-            q_states: HiddenStates::zeros(ctx, q_max, max_rows)?,
-            k_states: HiddenStates::zeros(ctx, kv_max, max_rows)?,
-            v_states: HiddenStates::zeros(ctx, kv_max, max_rows)?,
+            proj: Projections::new(ctx, local, global, max_rows, fused)?,
             q_prep: HiddenStates::zeros(ctx, q_max, max_rows)?,
             attn: HiddenStates::zeros(ctx, q_max, max_rows)?,
         })
@@ -383,17 +383,119 @@ impl AttnScratch {
 
     fn set(&mut self, geom: &LayerGeometry, seq_len: usize) {
         let q_dim = geom.num_q_heads * geom.head_dim;
-        let kv_dim = geom.num_kv_heads * geom.head_dim;
         for (buf, hidden_dim) in [
             (&mut self.normed_x, geom.hidden_size),
-            (&mut self.q_states, q_dim),
-            (&mut self.k_states, kv_dim),
-            (&mut self.v_states, kv_dim),
             (&mut self.q_prep, q_dim),
             (&mut self.attn, q_dim),
         ] {
             buf.hidden_dim = hidden_dim;
             buf.seq_len = seq_len;
+        }
+        self.proj.set_rows(seq_len);
+    }
+}
+
+/// Where the attention projections land: three buffers of their own, or one
+/// row per token holding Q, K and V side by side so a single GEMM fills it.
+/// The fused GEMM is a different cuBLAS shape and need not round as the
+/// three do, so the byte-identical serving state keeps its own.
+enum Projections {
+    Separate {
+        q: HiddenStates,
+        k: HiddenStates,
+        v: HiddenStates,
+    },
+    Fused(HiddenStates),
+}
+
+/// The bands the projections landed in; `v` only where the family projects
+/// one.
+struct Projected<'a> {
+    q: Columns<'a>,
+    k: Columns<'a>,
+    v: Option<Columns<'a>>,
+}
+
+impl Projections {
+    fn new(
+        ctx: &DeviceContext,
+        local: &LayerGeometry,
+        global: &LayerGeometry,
+        max_rows: usize,
+        fused: bool,
+    ) -> Result<Self> {
+        let q_dim = |geom: &LayerGeometry| geom.num_q_heads * geom.head_dim;
+        let kv_dim = |geom: &LayerGeometry| geom.num_kv_heads * geom.head_dim;
+        if !fused {
+            let kv_max = kv_dim(local).max(kv_dim(global));
+            return Ok(Self::Separate {
+                q: HiddenStates::zeros(ctx, q_dim(local).max(q_dim(global)), max_rows)?,
+                k: HiddenStates::zeros(ctx, kv_max, max_rows)?,
+                v: HiddenStates::zeros(ctx, kv_max, max_rows)?,
+            });
+        }
+        // The sliding family projects V; the global family forks it from K,
+        // so its row is a projection narrower.
+        let widest = (q_dim(local) + 2 * kv_dim(local)).max(q_dim(global) + kv_dim(global));
+        Ok(Self::Fused(HiddenStates::zeros(ctx, widest, max_rows)?))
+    }
+
+    fn set_rows(&mut self, seq_len: usize) {
+        match self {
+            Self::Separate { q, k, v } => {
+                for buf in [q, k, v] {
+                    buf.seq_len = seq_len;
+                }
+            }
+            Self::Fused(all) => all.seq_len = seq_len,
+        }
+    }
+
+    fn project(
+        &mut self,
+        ctx: &DeviceContext,
+        qkv: &DeviceMatrix,
+        x: &HiddenStates,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> Result<Projected<'_>> {
+        let has_v = match qkv.rows.checked_sub(q_dim) {
+            Some(rest) if rest == kv_dim => false,
+            Some(rest) if rest == 2 * kv_dim => true,
+            _ => anyhow::bail!(
+                "Q|K|V holds {} rows, neither {q_dim} + {kv_dim} nor {q_dim} + 2 x {kv_dim}",
+                qkv.rows
+            ),
+        };
+        match self {
+            Self::Separate { q, k, v } => {
+                q.hidden_dim = q_dim;
+                k.hidden_dim = kv_dim;
+                v.hidden_dim = kv_dim;
+                ops::gemm_rows_into_checked(ctx, qkv, 0, q_dim, x, q)?;
+                ops::gemm_rows_into_checked(ctx, qkv, q_dim, kv_dim, x, k)?;
+                if has_v {
+                    ops::gemm_rows_into_checked(ctx, qkv, q_dim + kv_dim, kv_dim, x, v)?;
+                }
+                Ok(Projected {
+                    q: (&*q).into(),
+                    k: (&*k).into(),
+                    v: if has_v { Some((&*v).into()) } else { None },
+                })
+            }
+            Self::Fused(all) => {
+                all.hidden_dim = qkv.rows;
+                ops::gemm_rows_into_checked(ctx, qkv, 0, qkv.rows, x, all)?;
+                Ok(Projected {
+                    q: all.columns(0, q_dim),
+                    k: all.columns(q_dim, kv_dim),
+                    v: if has_v {
+                        Some(all.columns(q_dim + kv_dim, kv_dim))
+                    } else {
+                        None
+                    },
+                })
+            }
         }
     }
 }
@@ -456,10 +558,11 @@ impl TowerScratch {
         local: &LayerGeometry,
         global: &LayerGeometry,
         max_rows: usize,
+        fused: bool,
     ) -> Result<Self> {
         Ok(Self {
-            attn: AttnScratch::new(ctx, local, global, max_rows)?,
-            epilogue: EpilogueScratch::new(ctx, local, max_rows)?,
+            attn: AttnScratch::new(ctx, local, global, max_rows, fused)?,
+            epilogue: EpilogueScratch::new(ctx, local, max_rows, fused)?,
             hidden: [
                 HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
                 HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
@@ -490,6 +593,10 @@ fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &m
 }
 
 const GLOBAL_SPLIT_CHUNK_TOKENS: usize = 256;
+/// The sliding family's decode chunk: a resident window of a thousand keys
+/// over sixteen-row pages wants many small CTAs rather than the global
+/// family's long streams, and 64 tokens measured fastest.
+const LOCAL_SPLIT_CHUNK_TOKENS: usize = 64;
 
 struct SteadyDecode {
     padded: usize,
@@ -548,6 +655,9 @@ struct SplitKvState {
     /// Chunk-count bound per pseudo-request; a step's padded slot count is
     /// the split factor times its bucket times this.
     cap: usize,
+    /// The chunk the tile indices count in, the same number the device slot
+    /// holds.
+    chunk_tokens: usize,
 }
 
 struct SplitKvSpec {
@@ -558,6 +668,7 @@ struct SplitKvSpec {
     head_dim: usize,
     cap: usize,
     chunk_size_d: CudaSlice<i32>,
+    chunk_tokens: usize,
 }
 
 struct SplitKvLaunch<'a> {
@@ -602,6 +713,7 @@ impl SplitKvState {
                 .alloc_zeros(spec.slots * spec.heads)
                 .map_err(alloc("tmp_s"))?,
             cap: spec.cap,
+            chunk_tokens: spec.chunk_tokens,
         })
     }
 
@@ -626,7 +738,7 @@ impl SplitKvState {
                 &self.request_indices_d,
                 &self.kv_tile_indices_d,
                 &self.chunk_size_d,
-                GLOBAL_SPLIT_CHUNK_TOKENS,
+                self.chunk_tokens,
             ),
             o_indptr_d: &self.o_indptr_d,
             valid_mask_d: &self.valid_mask_d,
@@ -652,6 +764,10 @@ pub(crate) struct StepArena {
     local_plan: PrefillPagedPlan,
     global_tables: GlobalTables,
     global_split: SplitKvState,
+    /// The sliding family's split plan over its resident window, for the
+    /// generated windowed decode read; the windowed prefill read has no use
+    /// for it.
+    local_split: SplitKvState,
     steady: Option<SteadyDecode>,
     local_origins: CudaSlice<i32>,
     ids: CudaSlice<u32>,
@@ -717,6 +833,21 @@ impl StepArena {
 /// only because MQA gives every query head the same KV head (the 12B
 /// global family's 16 over 1). Anything else fails loud.
 impl GemmaServe {
+    /// The generated windowed entries read two-byte rows, and
+    /// `PEGAINFER_KV_FP8` stores this pool's K and V as e4m3, which they
+    /// would read as bf16 at half the stride and hand back numbers that look
+    /// like logits. The knob is the global family's, whose pool is always
+    /// bf16, so an fp8 sliding pool keeps the incumbent read rather than
+    /// costing the global family its kernels.
+    fn tilelang_local_attn(&self) -> bool {
+        self.tilelang_global_attn && self.local_pool.layout().storage == KvStorage::Bf16
+    }
+
+    /// Whether the step projects through the stacked weights.
+    fn fuses_projections(&self) -> bool {
+        self.tilelang_global_attn
+    }
+
     /// The global family's decode read, chosen once by the same flag as its
     /// prefill: the incumbent through core's door, or this line's own kernel
     /// straight from the crate that generates it. Same arguments, same
@@ -730,12 +861,14 @@ impl GemmaServe {
     }
 }
 
-/// Which kernel serves the global family, and with it how its pool's rows
-/// are laid out. The incumbent and the generated kernel both read the split
-/// K|V rows; the folded rows -- K only where the rotation touches it, V in
-/// full, K's norm weight folded into the query -- are the generated kernel's
-/// alone, so asking for them is asking for it. The format is the pool's for
-/// its whole life, which is why this is one value rather than two flags that
+/// Which kernels serve the attention reads, and with it how the global
+/// pool's rows are laid out. The incumbent and the generated global kernel
+/// both read the split K|V rows; the folded rows -- K only where the
+/// rotation touches it, V in full, K's norm weight folded into the query --
+/// are the generated kernel's alone, so asking for them is asking for it.
+/// Either generated state also reads the sliding family's pure-decode rows
+/// through the generated windowed split-KV kernel. The format is the pool's
+/// for its whole life, which is why this is one value rather than flags that
 /// could disagree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GlobalAttn {
@@ -798,10 +931,10 @@ pub(crate) struct GemmaServe {
     global_cos: DeviceVec,
     global_sin: DeviceVec,
     cos_max_pos: usize,
-    /// Which kernel the global family's prefill goes through. The two are
-    /// adapters at one seam — same arguments, same meaning — so the choice is
-    /// a flag here rather than a shape the call sites have to know about. A
-    /// folded global pool needs this on: only the generated kernel reads it.
+    /// [`GlobalAttn`] reduced to what the step needs. Each kernel and the one
+    /// it stands in for are adapters at one seam -- same arguments, same
+    /// meaning -- so the choice is a flag here rather than a shape the call
+    /// sites have to know about.
     tilelang_global_attn: bool,
     /// Model layer index -> index within its family's pool layer axis.
     family_index: Vec<usize>,
@@ -999,6 +1132,17 @@ impl GemmaServe {
         ctx.stream
             .memcpy_htod(&[GLOBAL_SPLIT_CHUNK_TOKENS as i32], &mut global_chunk)
             .map_err(|e| anyhow::anyhow!("global chunk-size upload failed: {e}"))?;
+        // A resident window holds at most the window plus a page, since
+        // pages release whole.
+        let local_split_cap = (self.sliding_window + self.local_pool.layout().page_size)
+            .div_ceil(LOCAL_SPLIT_CHUNK_TOKENS);
+        let mut local_chunk = ctx
+            .stream
+            .alloc_zeros(1)
+            .map_err(alloc("local chunk size"))?;
+        ctx.stream
+            .memcpy_htod(&[LOCAL_SPLIT_CHUNK_TOKENS as i32], &mut local_chunk)
+            .map_err(|e| anyhow::anyhow!("local chunk-size upload failed: {e}"))?;
         // A mixed step's rows are bounded by the serving ceiling's prompt
         // rows plus a full decode bucket; the indptr ramp is written once.
         let mix_rows_cap = self.cos_max_pos + max_rows;
@@ -1012,7 +1156,13 @@ impl GemmaServe {
             .memcpy_htod(&ramp, &mut mix_indptr)
             .map_err(|e| anyhow::anyhow!("mix indptr ramp upload failed: {e}"))?;
         Ok(StepArena {
-            tower: TowerScratch::new(ctx, &self.local_geom, &self.global_geom, max_rows)?,
+            tower: TowerScratch::new(
+                ctx,
+                &self.local_geom,
+                &self.global_geom,
+                max_rows,
+                self.fuses_projections(),
+            )?,
             host: HostPlanningScratch::new(
                 self.local_pool.layout().page_size,
                 self.global_pool.layout().page_size,
@@ -1064,6 +1214,20 @@ impl GemmaServe {
                     head_dim: self.global_geom.head_dim,
                     cap: global_split_cap,
                     chunk_size_d: global_chunk,
+                    chunk_tokens: GLOBAL_SPLIT_CHUNK_TOKENS,
+                },
+            )?,
+            local_split: SplitKvState::new(
+                ctx,
+                SplitKvSpec {
+                    label: "local",
+                    slots: max_rows * local_split_cap,
+                    rows: max_rows,
+                    heads: self.local_geom.num_q_heads,
+                    head_dim: self.local_geom.head_dim,
+                    cap: local_split_cap,
+                    chunk_size_d: local_chunk,
+                    chunk_tokens: LOCAL_SPLIT_CHUNK_TOKENS,
                 },
             )?,
             steady: None,
@@ -1362,16 +1526,12 @@ impl GemmaServe {
         seq_len: usize,
         prep: PrepRef<'_>,
         local_plan: &PrefillPagedPlan,
+        local_split: Option<&mut SplitKvState>,
         src: usize,
     ) -> Result<()> {
         let geom = &self.local_geom;
         let q_dim = geom.num_q_heads * geom.head_dim;
         let kv_dim = geom.num_kv_heads * geom.head_dim;
-        let v_proj = layer
-            .attention
-            .v_proj
-            .as_ref()
-            .context("local layer requires v_proj")?;
         let TowerScratch {
             attn: scratch,
             epilogue,
@@ -1387,31 +1547,15 @@ impl GemmaServe {
             geom.rms_norm_eps,
             &mut scratch.normed_x,
         );
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.q_proj,
-            0,
-            q_dim,
-            &scratch.normed_x,
-            &mut scratch.q_states,
-        )?;
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.k_proj,
-            0,
-            kv_dim,
-            &scratch.normed_x,
-            &mut scratch.k_states,
-        )?;
-        ops::gemm_rows_into_checked(
-            ctx,
-            v_proj,
-            0,
-            kv_dim,
-            &scratch.normed_x,
-            &mut scratch.v_states,
-        )?;
+        let projected =
+            scratch
+                .proj
+                .project(ctx, &layer.attention.qkv, &scratch.normed_x, q_dim, kv_dim)?;
+        let v = projected
+            .v
+            .context("the sliding family projects V; this layer's rows hold none")?;
 
+        let mut attended = false;
         match prep {
             PrepRef::Single {
                 start_pos,
@@ -1420,9 +1564,9 @@ impl GemmaServe {
             } => {
                 ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
                     ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
-                    &scratch.v_states,
+                    projected.q,
+                    projected.k,
+                    v,
                     &mut scratch.q_prep,
                     0,
                     self.local_pool.buffer(),
@@ -1449,9 +1593,9 @@ impl GemmaServe {
             } => {
                 ops::qkv_norm_rope_paged_decode_hd256_plain_into(
                     ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
-                    &scratch.v_states,
+                    projected.q,
+                    projected.k,
+                    v,
                     &mut scratch.q_prep,
                     0,
                     self.local_pool.buffer(),
@@ -1471,6 +1615,37 @@ impl GemmaServe {
                     geom.head_dim,
                     geom.rms_norm_eps,
                 )?;
+                // The generated kernels read the window as a split plan over
+                // the resident pages, masking the keys a page-aligned window
+                // still holds past it; the plan is the step's own.
+                if self.tilelang_local_attn() {
+                    if let Some(split) = local_split {
+                        let launch = split.metadata(
+                            local_plan.page_indices_d(),
+                            local_plan.page_indptr_d(),
+                            local_plan.last_page_len_d(),
+                        );
+                        pegainfer_kernels::ops::gemma4_hd256_decode_window_into(
+                            ctx,
+                            &scratch.q_prep,
+                            0,
+                            self.local_pool.buffer(),
+                            &self.local_pool.layout().kernel_layout(),
+                            family_layer,
+                            &launch.metadata,
+                            launch.o_indptr_d,
+                            launch.valid_mask_d,
+                            launch.tmp_v,
+                            launch.tmp_s,
+                            seq_len * launch.cap,
+                            &mut scratch.attn,
+                            geom.num_q_heads,
+                            1.0,
+                            self.sliding_window - 1,
+                        )?;
+                        attended = true;
+                    }
+                }
             }
             PrepRef::Mixed {
                 mix_positions,
@@ -1483,9 +1658,9 @@ impl GemmaServe {
                 // its position's slot in its own one-page window.
                 ops::qkv_norm_rope_paged_decode_hd256_plain_into(
                     ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
-                    &scratch.v_states,
+                    projected.q,
+                    projected.k,
+                    v,
                     &mut scratch.q_prep,
                     0,
                     self.local_pool.buffer(),
@@ -1508,19 +1683,39 @@ impl GemmaServe {
             }
         }
 
-        let window_left = i32::try_from(self.sliding_window - 1).expect("window fits i32");
-        ops::batch_prefill_paged_window_hd256_into(
-            ctx,
-            &scratch.q_prep,
-            self.local_pool.buffer(),
-            &self.local_pool.layout().kernel_layout(),
-            family_layer,
-            local_plan,
-            &mut scratch.attn,
-            geom.num_q_heads,
-            1.0,
-            window_left,
-        )?;
+        if !attended {
+            // The prompt rows' windowed read: the incumbent through core's
+            // door, or the generated kernel over the same plan and pool,
+            // chosen by the same flag as the global family's.
+            let window_left = self.sliding_window - 1;
+            if self.tilelang_local_attn() {
+                pegainfer_kernels::ops::gemma4_hd256_prefill_window_into(
+                    ctx,
+                    &scratch.q_prep,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    family_layer,
+                    local_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                    1.0,
+                    window_left,
+                )?;
+            } else {
+                ops::batch_prefill_paged_window_hd256_into(
+                    ctx,
+                    &scratch.q_prep,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    family_layer,
+                    local_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                    1.0,
+                    i32::try_from(window_left).expect("window fits i32"),
+                )?;
+            }
+        }
         attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
     }
 
@@ -1539,10 +1734,6 @@ impl GemmaServe {
         let geom = &self.global_geom;
         let q_dim = geom.num_q_heads * geom.head_dim;
         let kv_dim = geom.num_kv_heads * geom.head_dim;
-        anyhow::ensure!(
-            layer.attention.v_proj.is_none(),
-            "global layer must not carry a v_proj; V is the k_proj fork"
-        );
         let TowerScratch {
             attn: scratch,
             epilogue,
@@ -1558,22 +1749,14 @@ impl GemmaServe {
             geom.rms_norm_eps,
             &mut scratch.normed_x,
         );
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.q_proj,
-            0,
-            q_dim,
-            &scratch.normed_x,
-            &mut scratch.q_states,
-        )?;
-        ops::gemm_rows_into_checked(
-            ctx,
-            &layer.attention.k_proj,
-            0,
-            kv_dim,
-            &scratch.normed_x,
-            &mut scratch.k_states,
-        )?;
+        let projected =
+            scratch
+                .proj
+                .project(ctx, &layer.attention.qkv, &scratch.normed_x, q_dim, kv_dim)?;
+        anyhow::ensure!(
+            projected.v.is_none(),
+            "global layer must not carry a v_proj; V is the k_proj fork"
+        );
 
         // The prep writes both K and the weightless-normed V fork from the
         // one raw K read — no D2D fork copy on the serving path.
@@ -1585,8 +1768,8 @@ impl GemmaServe {
             } => {
                 ops::qk_norm_partial_rope_paged_prefill_hd512_into(
                     ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
+                    projected.q,
+                    projected.k,
                     &mut scratch.q_prep,
                     0,
                     self.global_pool.buffer(),
@@ -1617,8 +1800,8 @@ impl GemmaServe {
                 let split = split.context("batched global decode needs the split-KV state")?;
                 ops::qk_norm_partial_rope_paged_decode_hd512_into(
                     ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
+                    projected.q,
+                    projected.k,
                     &mut scratch.q_prep,
                     0,
                     self.global_pool.buffer(),
@@ -1687,8 +1870,8 @@ impl GemmaServe {
                 // its position's slot in its own one-page window.
                 ops::qk_norm_partial_rope_paged_decode_hd512_into(
                     ctx,
-                    &scratch.q_states,
-                    &scratch.k_states,
+                    projected.q,
+                    projected.k,
                     &mut scratch.q_prep,
                     0,
                     self.global_pool.buffer(),
@@ -1861,6 +2044,7 @@ impl GemmaServe {
             local_plan,
             global_tables,
             global_split,
+            local_split,
             local_origins: origins_slot,
             ..
         } = arena;
@@ -1880,6 +2064,7 @@ impl GemmaServe {
             pseudo_indptr,
             pseudo_last,
             pseudo_kv_lens,
+            local_kv_lens,
             ones,
             ..
         } = host;
@@ -1915,6 +2100,19 @@ impl GemmaServe {
             self.local_geom.head_dim,
             0,
         )?;
+        // The local rows' resident lengths, chunked for the windowed decode
+        // read; a pad row is its one padding page.
+        let local_page = self.local_pool.layout().page_size;
+        for r in 0..padded {
+            local_kv_lens.push((local_rows[r].len() - 1) * local_page + local_last[r]);
+        }
+        let local_csr = ops::build_split_kv_csr(
+            LOCAL_SPLIT_CHUNK_TOKENS,
+            local_split.cap,
+            local_kv_lens,
+            padded,
+        )?;
+        local_split.upload_csr(ctx, &local_csr)?;
         for r in 0..padded {
             let row = &global_rows[r];
             let row_len = i32::try_from(row.len()).context("global pages fit i32")?;
@@ -1963,6 +2161,7 @@ impl GemmaServe {
         local_plan: &PrefillPagedPlan,
         prep: PrepRef<'_>,
         mut global_split: Option<&mut SplitKvState>,
+        mut local_split: Option<&mut SplitKvState>,
     ) -> Result<usize> {
         let weights = &self.weights;
         ops::embedding_batch(ctx, &weights.embed_tokens, ids, &mut tower.hidden[0])?;
@@ -1985,6 +2184,7 @@ impl GemmaServe {
                         seq_len,
                         prep,
                         local_plan,
+                        local_split.as_deref_mut(),
                         src,
                     )?;
                 }
@@ -2045,6 +2245,7 @@ impl GemmaServe {
             local_plan,
             global_tables,
             global_split,
+            local_split,
             local_origins,
             ids,
             head_normed,
@@ -2070,6 +2271,7 @@ impl GemmaServe {
                 local_plan,
                 global_tables,
                 global_split,
+                local_split,
                 local_origins,
                 head_normed,
                 logits,
@@ -2099,6 +2301,7 @@ impl GemmaServe {
         local_plan: &mut PrefillPagedPlan,
         global_tables: &mut GlobalTables,
         global_split: &mut SplitKvState,
+        local_split: &mut SplitKvState,
         local_origins: &CudaSlice<i32>,
         head_normed: &mut HiddenStates,
         logits: &mut HiddenStates,
@@ -2114,6 +2317,7 @@ impl GemmaServe {
                 global_tables,
             },
             Some(global_split),
+            Some(local_split),
         )?;
         logits_tail_into(
             ctx,
@@ -2337,7 +2541,13 @@ impl GemmaServe {
             .stream
             .clone_htod(ids_host)
             .map_err(|e| anyhow::anyhow!("mixed step ids H2D failed: {e}"))?;
-        let mut tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, rows)?;
+        let mut tower = TowerScratch::new(
+            ctx,
+            &self.local_geom,
+            &self.global_geom,
+            rows,
+            self.fuses_projections(),
+        )?;
         tower.open(rows)?;
         let src = self.run_tower(
             ctx,
@@ -2357,6 +2567,9 @@ impl GemmaServe {
                 global_prefill_plan: &global_prefill_plan,
             },
             Some(global_split),
+            // A mixed step's decode rows share the windowed prefill read
+            // with its prompt rows; only pure decode steps split.
+            None,
         )?;
         // Compact the sampled rows into the free ping-pong slot — each
         // segment's last row, then the decode suffix as one range — and run
@@ -2469,6 +2682,7 @@ impl GemmaServe {
                     local_plan,
                     global_tables,
                     global_split,
+                    local_split,
                     local_origins,
                     ids,
                     head_normed,
@@ -2484,6 +2698,7 @@ impl GemmaServe {
                     local_plan,
                     global_tables,
                     global_split,
+                    local_split,
                     local_origins,
                     head_normed,
                     logits,
@@ -2497,6 +2712,7 @@ impl GemmaServe {
                         local_plan,
                         global_tables,
                         global_split,
+                        local_split,
                         local_origins,
                         head_normed,
                         logits,
@@ -2527,7 +2743,13 @@ impl GemmaServe {
         let start_pos = kv.local.seq_len();
         self.check_step_bounds(kv, start_pos + seq_len)?;
         let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
-        let tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, seq_len)?;
+        let tower = TowerScratch::new(
+            ctx,
+            &self.local_geom,
+            &self.global_geom,
+            seq_len,
+            self.fuses_projections(),
+        )?;
         let ids = ctx
             .stream
             .clone_htod(tokens)
@@ -2560,6 +2782,7 @@ impl GemmaServe {
                 local_page_origin: pass.plan.local_page_origin,
                 global_plan: &pass.plan.global_plan,
             },
+            None,
             None,
         )?;
         ops::copy_hidden_token_range_into(

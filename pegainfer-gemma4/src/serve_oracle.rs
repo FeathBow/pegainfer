@@ -683,6 +683,12 @@ fn the_replacement_global_decode_matches_the_incumbent() {
 
         serve.tilelang_global_attn = false;
         let (incumbent, walked) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        for (i, row) in incumbent.iter().enumerate() {
+            eprintln!(
+                "prompt {prompt} at {len}: incumbent step {i} fingerprint {:016x}",
+                fingerprint(row)
+            );
+        }
         let (again, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
         for (i, (a, b)) in incumbent.iter().zip(&again).enumerate() {
             assert!(
@@ -844,6 +850,13 @@ fn the_folded_pool_matches_the_split_one() {
     );
 }
 
+/// FNV-1a over the row's bits.
+fn fingerprint(row: &[f32]) -> u64 {
+    row.iter().fold(0xcbf2_9ce4_8422_2325, |h, x| {
+        (h ^ u64::from(x.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// The replacement global-attention kernel against the one it stands in for,
 /// both through the production serving path. The incumbent is asked twice
 /// first, so the tolerance is a measured floor rather than a chosen number.
@@ -874,6 +887,8 @@ fn the_replacement_global_kernel_matches_the_incumbent() {
 
     assert!(!serve.tilelang_global_attn);
     let incumbent = serving_recompute(&ctx, &serve, &tokens);
+    // The incumbent's bits on this checkpoint, to compare across trees.
+    eprintln!("incumbent fingerprint {:016x}", fingerprint(&incumbent));
     let again = serving_recompute(&ctx, &serve, &tokens);
     let floor = compare_row(&incumbent, &again, "incumbent against itself");
     assert!(

@@ -129,6 +129,10 @@ pub use gemma4::*;
 #[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::GlobalDecodeAttend;
 #[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd256_decode_window_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::gemma4_hd256_prefill_window_into;
+#[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::gemma4_hd512_decode_split_kv_into;
 #[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::gemma4_hd512_prefill_arch;

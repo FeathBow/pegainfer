@@ -6,6 +6,7 @@ use anyhow::Result;
 use log::info;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::weight_loader::ByteWeightStager;
+use pegainfer_core::weight_loader::FusedPart;
 use pegainfer_core::weight_loader::SlotId;
 use pegainfer_core::weight_loader::StagedWeightLoader;
 use pegainfer_core::weight_loader::VecSlotId;
@@ -68,14 +69,12 @@ struct LayerSlots {
     pre_feedforward_layernorm: VecSlotId,
     post_feedforward_layernorm: VecSlotId,
     layer_scalar: f32,
-    q_proj: SlotId,
-    k_proj: SlotId,
-    v_proj: Option<SlotId>,
+    /// Q, K and, on sliding layers, V as one row-stacked slot.
+    qkv: SlotId,
     o_proj: SlotId,
     q_norm: VecSlotId,
     k_norm: VecSlotId,
-    gate: SlotId,
-    up: SlotId,
+    gate_up: SlotId,
     down: SlotId,
     /// The bf16 half of a routed layer.
     moe: Option<MoeSlots>,
@@ -98,6 +97,28 @@ struct RecordedPlan {
 
 fn record_matrix(loader: &mut StagedWeightLoader, tensor: &Matrix2d) -> Result<SlotId> {
     loader.matrix(&tensor.name, tensor.rows, tensor.cols)
+}
+
+/// The rows of `parts` stacked in order into one device matrix.
+fn record_stacked<'m>(
+    loader: &mut StagedWeightLoader,
+    parts: impl IntoIterator<Item = &'m Matrix2d>,
+) -> Result<SlotId> {
+    let parts: Vec<&Matrix2d> = parts.into_iter().collect();
+    let cols = parts
+        .first()
+        .map(|part| part.cols)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: a stacked load needs at least one part"))?;
+    let fused: Vec<FusedPart> = parts
+        .iter()
+        .map(|part| FusedPart {
+            name: part.name.as_str(),
+            src_rows: part.rows,
+            row_offset: 0,
+            rows: part.rows,
+        })
+        .collect();
+    loader.fused_rows(cols, &fused)
 }
 
 fn record_vector(loader: &mut StagedWeightLoader, tensor: &Vector1d) -> Result<VecSlotId> {
@@ -338,18 +359,16 @@ fn record_plan(
             pre_feedforward_layernorm: record_vector(loader, &layer.pre_feedforward_layernorm)?,
             post_feedforward_layernorm: record_vector(loader, &layer.post_feedforward_layernorm)?,
             layer_scalar: read_scalar_bf16(shards, &layer.layer_scalar.name)?,
-            q_proj: record_matrix(loader, &attention.q_proj)?,
-            k_proj: record_matrix(loader, &attention.k_proj)?,
-            v_proj: attention
-                .v_proj
-                .as_ref()
-                .map(|v_proj| record_matrix(loader, v_proj))
-                .transpose()?,
+            qkv: record_stacked(
+                loader,
+                [&attention.q_proj, &attention.k_proj]
+                    .into_iter()
+                    .chain(attention.v_proj.as_ref()),
+            )?,
             o_proj: record_matrix(loader, &attention.o_proj)?,
             q_norm: record_vector(loader, &attention.q_norm)?,
             k_norm: record_vector(loader, &attention.k_norm)?,
-            gate: record_matrix(loader, &layer.mlp.gate)?,
-            up: record_matrix(loader, &layer.mlp.up)?,
+            gate_up: record_stacked(loader, [&layer.mlp.gate, &layer.mlp.up])?,
             down: record_matrix(loader, &layer.mlp.down)?,
             moe: layer
                 .moe
@@ -414,16 +433,13 @@ fn materialize(
                     post_feedforward_layernorm: loader.take_vec(slots.post_feedforward_layernorm),
                     layer_scalar: slots.layer_scalar,
                     attention: Gemma4Attention {
-                        q_proj: loader.take(slots.q_proj),
-                        k_proj: loader.take(slots.k_proj),
-                        v_proj: slots.v_proj.map(|slot| loader.take(slot)),
+                        qkv: loader.take(slots.qkv),
                         o_proj: loader.take(slots.o_proj),
                         q_norm: loader.take_vec(slots.q_norm),
                         k_norm: loader.take_vec(slots.k_norm),
                     },
                     mlp: Gemma4Mlp {
-                        gate: loader.take(slots.gate),
-                        up: loader.take(slots.up),
+                        gate_up: loader.take(slots.gate_up),
                         down: loader.take(slots.down),
                     },
                     moe: match (slots.moe, experts) {

@@ -371,3 +371,37 @@ fn decode_wrapper_without_fp8_twin_refuses_e4m3() {
     .expect_err("unsupported fp8 wrapper must reject");
     assert!(err.to_string().contains("has no fp8 KV path"), "{err}");
 }
+
+#[test]
+fn the_generated_windowed_prefill_refuses_e4m3() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    if !pegainfer_kernels::ops::gemma4_hd512_prefill_is_built() {
+        eprintln!("skipping: this build carries the stub, which refuses everything");
+        return;
+    }
+    let layout = PagedKvLayout::with_storage(1, 1, HD, PAGE_SIZE, KvStorage::E4m3);
+    let pool: CudaSlice<bf16> = ctx
+        .stream
+        .alloc_zeros(layout.page_stride / 2)
+        .expect("pool");
+    let q = HiddenStates::zeros(&ctx, HD, 1).expect("q");
+    let mut output = HiddenStates::zeros(&ctx, HD, 1).expect("output");
+    let plan =
+        PrefillPagedPlan::new_with_cta_tile_q(&ctx, &[0i32], 1, 0, 1, 1, 1, HD, 0).expect("plan");
+    let err = pegainfer_kernels::ops::gemma4_hd256_prefill_window_into(
+        &ctx,
+        &q,
+        &pool,
+        &layout,
+        0,
+        &plan,
+        &mut output,
+        1,
+        1.0,
+        1023,
+    )
+    .expect_err("a two-byte reader must refuse an e4m3 pool");
+    assert!(err.to_string().contains("two-byte rows"), "{err}");
+}

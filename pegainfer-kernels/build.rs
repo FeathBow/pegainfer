@@ -1588,6 +1588,22 @@ const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
          const int*, const unsigned char*, const int*, void*, float*, void*, int, int, \
          int, int, int, int, int, int, int, int, int, int, float",
     ),
+    // The sliding family's windowed split-KV decode: the same plan arrays
+    // and workspace, no row format, and the window as a key distance in
+    // place of it.
+    (
+        "gemma4_hd256_decode_window",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, const unsigned char*, const int*, void*, float*, void*, int, int, \
+         int, int, int, int, int, int, int, int, int, int, float",
+    ),
+    // The sliding family's windowed prefill: the global prefill's arguments
+    // without a row format, with the window as a key distance in its place.
+    (
+        "gemma4_hd256_prefill_window",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, void*, int, int, int, int, int, int, int, int, int, float",
+    ),
 ];
 
 const K3_TILELANG: TileLangFamily = TileLangFamily {

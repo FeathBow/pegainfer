@@ -210,15 +210,17 @@ mod tests {
         assert_eq!(resume(&entry, 0, LOCAL_PAGE_SIZE, &entry), Some(95));
         assert_eq!(resume(&entry, 0, LOCAL_PAGE_SIZE, &[]), None);
 
-        let mut before_window = entry.clone();
-        before_window[47] = 777;
-        assert_eq!(resume(&entry, 2, LOCAL_PAGE_SIZE, &before_window), None);
-        let mut at_window = entry.clone();
-        at_window[48] = 777;
-        assert_eq!(resume(&entry, 2, LOCAL_PAGE_SIZE, &at_window), None);
-        let mut after_minimum = entry.clone();
-        after_minimum[64] = 777;
-        assert_eq!(resume(&entry, 2, LOCAL_PAGE_SIZE, &after_minimum), Some(64));
+        // With a released front the floor is the front's tokens plus the
+        // window, and never below the minimum.
+        let window = 16;
+        let floor = (2 * LOCAL_PAGE_SIZE + window).max(MIN_RESUME_TOKENS);
+        let long: Vec<u32> = (0..(floor as u32 + 32)).collect();
+        let mut before_floor = long.clone();
+        before_floor[floor - 1] = 777;
+        assert_eq!(resume(&long, 2, window, &before_floor), None);
+        let mut at_floor = long.clone();
+        at_floor[floor] = 777;
+        assert_eq!(resume(&long, 2, window, &at_floor), Some(floor));
     }
 
     #[test]

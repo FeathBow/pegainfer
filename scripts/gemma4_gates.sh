@@ -107,6 +107,7 @@ GATES_KERNELS_HD256_FP8_POOL=(
   "gpu fp8_finite_window_read_matches_bf16_and_changes_the_result"
   "gpu varied_fp8_window_read_is_geometry_invariant_for_the_probed_row"
   "gpu decode_wrapper_without_fp8_twin_refuses_e4m3"
+  "gpu the_generated_windowed_prefill_refuses_e4m3"
 )
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"

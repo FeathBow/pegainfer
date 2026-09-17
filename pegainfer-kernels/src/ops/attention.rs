@@ -9,6 +9,7 @@ use crate::paged_kv::KvFormat;
 use crate::paged_kv::KvStorage;
 use crate::paged_kv::PagedKvLayout;
 use crate::paged_kv::derive_strides;
+use crate::tensor::Columns;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
@@ -904,6 +905,27 @@ pub(crate) fn checked_row_offset(
         .and_then(|elems| elems.checked_mul(std::mem::size_of::<bf16>()))
         .ok_or_else(|| anyhow::anyhow!("{name} byte offset overflow"))?;
     Ok(bytes as u64)
+}
+
+/// Byte offset of row `offset`'s first column of the band `c`, after checking
+/// the row window and that the band lies within the row.
+pub(crate) fn checked_band_offset(
+    c: &Columns<'_>,
+    offset: usize,
+    span: usize,
+    name: &str,
+) -> Result<u64> {
+    anyhow::ensure!(
+        c.col
+            .checked_add(c.width)
+            .is_some_and(|end| end <= c.states.hidden_dim),
+        "{name} columns [{}..+{}) exceed the row's {}",
+        c.col,
+        c.width,
+        c.states.hidden_dim
+    );
+    let rows = checked_row_offset(c.states, offset, span, name)?;
+    Ok(rows + (c.col * std::mem::size_of::<bf16>()) as u64)
 }
 
 /// `DeviceVec` fields are public too: reject a logical `len` past the backing
@@ -3145,7 +3167,9 @@ fn hd512_prep_target(
 /// rotated straight into the paged KV pool at layer `layer`'s K block, and
 /// V — a separate v_proj head vector, unlike the hd512 K=V fork — is
 /// weightless-normalised (never rotated) into the layer's V block, all in
-/// one kernel with no intermediate scatter.
+/// one kernel with no intermediate scatter. `q`, `k` and `v` are column
+/// bands read at their own row strides, so they may share one fused Q|K|V
+/// projection row.
 ///
 /// The kernel `__trap()`s on any out-of-range pos or page id as the second
 /// layer of the host validation's defence. `page_indices` is the resident
@@ -3154,11 +3178,11 @@ fn hd512_prep_target(
 /// page-aligned, which keeps in-page offsets position-invariant and shifts
 /// only the row index. RoPE still runs on absolute positions.
 #[allow(clippy::too_many_arguments)]
-pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
+pub fn qkv_norm_rope_paged_prefill_hd256_plain_into<'a>(
     ctx: &DeviceContext,
-    q: &HiddenStates,
-    k: &HiddenStates,
-    v: &HiddenStates,
+    q: impl Into<Columns<'a>>,
+    k: impl Into<Columns<'a>>,
+    v: impl Into<Columns<'a>>,
     q_out: &mut HiddenStates,
     row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
@@ -3178,16 +3202,17 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
+    let (q, k, v) = (q.into(), k.into(), v.into());
     // The prompt segment is the row suffix `[row_offset..seq_len)` with its
     // page table `pages_offset` elements into the (possibly concatenated)
     // table — a multi-prompt mixed step parks earlier prompts and their
     // tables in the prefixes.
     anyhow::ensure!(
-        row_offset < q.seq_len,
+        row_offset < q.states.seq_len,
         "hd256 paged prep row_offset {row_offset} leaves no rows of {}",
-        q.seq_len
+        q.states.seq_len
     );
-    let seq_len = q.seq_len - row_offset;
+    let seq_len = q.states.seq_len - row_offset;
     anyhow::ensure!(
         pages_offset < page_indices.len(),
         "hd256 paged prep pages_offset {pages_offset} exceeds table len {}",
@@ -3200,44 +3225,44 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
         anyhow::anyhow!("hd256 paged prep num_kv_heads {num_kv_heads} * 256 overflows")
     })?;
     anyhow::ensure!(
-        q.hidden_dim == q_dim,
-        "hd256 paged prep q.hidden_dim {} != num_q_heads {num_q_heads} * 256",
-        q.hidden_dim
+        q.width == q_dim,
+        "hd256 paged prep q width {} != num_q_heads {num_q_heads} * 256",
+        q.width
     );
     anyhow::ensure!(
-        q_out.hidden_dim == q.hidden_dim,
-        "hd256 paged prep q_out.hidden_dim {} != q.hidden_dim {}",
+        q_out.hidden_dim == q.width,
+        "hd256 paged prep q_out.hidden_dim {} != q width {}",
         q_out.hidden_dim,
-        q.hidden_dim
+        q.width
     );
     anyhow::ensure!(
-        q_out.seq_len == q.seq_len,
-        "hd256 paged prep q_out.seq_len {} != q.seq_len {}",
+        q_out.seq_len == q.states.seq_len,
+        "hd256 paged prep q_out.seq_len {} != q rows {}",
         q_out.seq_len,
-        q.seq_len
+        q.states.seq_len
     );
     anyhow::ensure!(
-        k.hidden_dim == kv_dim,
-        "hd256 paged prep k.hidden_dim {} != num_kv_heads {num_kv_heads} * 256",
-        k.hidden_dim
+        k.width == kv_dim,
+        "hd256 paged prep k width {} != num_kv_heads {num_kv_heads} * 256",
+        k.width
     );
     anyhow::ensure!(
-        v.hidden_dim == k.hidden_dim,
-        "hd256 paged prep v.hidden_dim {} != k.hidden_dim {}",
-        v.hidden_dim,
-        k.hidden_dim
+        v.width == k.width,
+        "hd256 paged prep v width {} != k width {}",
+        v.width,
+        k.width
     );
     anyhow::ensure!(
-        k.seq_len == q.seq_len,
-        "hd256 paged prep k.seq_len {} != q.seq_len {}",
-        k.seq_len,
-        q.seq_len
+        k.states.seq_len == q.states.seq_len,
+        "hd256 paged prep k rows {} != q rows {}",
+        k.states.seq_len,
+        q.states.seq_len
     );
     anyhow::ensure!(
-        v.seq_len == q.seq_len,
-        "hd256 paged prep v.seq_len {} != q.seq_len {}",
-        v.seq_len,
-        q.seq_len
+        v.states.seq_len == q.states.seq_len,
+        "hd256 paged prep v rows {} != q rows {}",
+        v.states.seq_len,
+        q.states.seq_len
     );
     let geometry = checked_paged_geometry(
         "hd256 paged prep",
@@ -3311,10 +3336,10 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
         "hd256 paged prep sin_cache len {} < cos_max_pos {cos_max_pos} * rotary_dim {rotary_dim}",
         sin_cache.len
     );
-    let q_elems = q.checked_extent("hd256 paged prep q")?;
+    let q_elems = q.states.checked_extent("hd256 paged prep q")?;
     q_out.checked_extent("hd256 paged prep q_out")?;
-    let k_elems = k.checked_extent("hd256 paged prep k")?;
-    v.checked_extent("hd256 paged prep v")?;
+    let k_elems = k.states.checked_extent("hd256 paged prep k")?;
+    v.states.checked_extent("hd256 paged prep v")?;
     crate::ops::checked_i32(q_elems, "hd256 paged prep q extent")?;
     crate::ops::checked_i32(k_elems, "hd256 paged prep k extent")?;
     crate::ops::checked_i32(table_len, "hd256 paged prep rope table extent")?;
@@ -3331,15 +3356,15 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
         page_indices.len() - pages_offset,
         "hd256 paged prep page window len",
     )?;
-    let q_row_bytes = checked_row_offset(q, row_offset, seq_len, "hd256 paged prep q")?;
-    let k_row_bytes = checked_row_offset(k, row_offset, seq_len, "hd256 paged prep k")?;
-    let v_row_bytes = checked_row_offset(v, row_offset, seq_len, "hd256 paged prep v")?;
+    let q_row_bytes = checked_band_offset(&q, row_offset, seq_len, "hd256 paged prep q")?;
+    let k_row_bytes = checked_band_offset(&k, row_offset, seq_len, "hd256 paged prep k")?;
+    let v_row_bytes = checked_band_offset(&v, row_offset, seq_len, "hd256 paged prep v")?;
     let qo_row_bytes = checked_row_offset(q_out, row_offset, seq_len, "hd256 paged prep q_out")?;
-    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.states.data.device_ptr(&ctx.stream);
     let q_ptr = q_ptr + q_row_bytes;
-    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.states.data.device_ptr(&ctx.stream);
     let k_ptr = k_ptr + k_row_bytes;
-    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.states.data.device_ptr(&ctx.stream);
     let v_ptr = v_ptr + v_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
     let qo_ptr = qo_ptr + qo_row_bytes;
@@ -3365,11 +3390,17 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     } else {
         "qkv_norm_rope_paged_prefill_hd256_plain_cuda"
     };
+    let q_stride = crate::ops::checked_i32(q.states.hidden_dim, "hd256 paged prep q stride")?;
+    let k_stride = crate::ops::checked_i32(k.states.hidden_dim, "hd256 paged prep k stride")?;
+    let v_stride = crate::ops::checked_i32(v.states.hidden_dim, "hd256 paged prep v stride")?;
     let result = unsafe {
         launch(
             q_ptr as *const ffi::Half,
             k_ptr as *const ffi::Half,
             v_ptr as *const ffi::Half,
+            q_stride,
+            k_stride,
+            v_stride,
             qn_ptr as *const ffi::Half,
             kn_ptr as *const ffi::Half,
             cos_ptr as *const ffi::Half,
@@ -3408,11 +3439,11 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
 /// whole tensor, a mixed step parks its prefill segment in the prefix.
 /// Invalid device metadata traps before the first paged-pool access.
 #[allow(clippy::too_many_arguments)]
-pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
+pub fn qkv_norm_rope_paged_decode_hd256_plain_into<'a>(
     ctx: &DeviceContext,
-    q: &HiddenStates,
-    k: &HiddenStates,
-    v: &HiddenStates,
+    q: impl Into<Columns<'a>>,
+    k: impl Into<Columns<'a>>,
+    v: impl Into<Columns<'a>>,
     q_out: &mut HiddenStates,
     row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
@@ -3432,41 +3463,42 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     rotary_dim: usize,
     rms_eps: f32,
 ) -> Result<()> {
+    let (q, k, v) = (q.into(), k.into(), v.into());
     anyhow::ensure!(
-        row_offset < q.seq_len,
+        row_offset < q.states.seq_len,
         "hd256 paged decode prep row_offset {row_offset} leaves no rows of {}",
-        q.seq_len
+        q.states.seq_len
     );
-    let batch = q.seq_len - row_offset;
+    let batch = q.states.seq_len - row_offset;
     anyhow::ensure!(
-        Some(q.hidden_dim) == num_q_heads.checked_mul(256),
-        "hd256 paged decode prep q.hidden_dim {} != num_q_heads {} * 256",
-        q.hidden_dim,
+        Some(q.width) == num_q_heads.checked_mul(256),
+        "hd256 paged decode prep q width {} != num_q_heads {} * 256",
+        q.width,
         num_q_heads
     );
     anyhow::ensure!(
-        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == q.seq_len,
+        q_out.hidden_dim == q.width && q_out.seq_len == q.states.seq_len,
         "hd256 paged decode prep q_out [{} x {}] != q [{} x {}]",
         q_out.hidden_dim,
         q_out.seq_len,
-        q.hidden_dim,
-        q.seq_len
+        q.width,
+        q.states.seq_len
     );
     anyhow::ensure!(
-        Some(k.hidden_dim) == num_kv_heads.checked_mul(256) && k.seq_len == q.seq_len,
+        Some(k.width) == num_kv_heads.checked_mul(256) && k.states.seq_len == q.states.seq_len,
         "hd256 paged decode prep k [{} x {}] != [num_kv_heads {} * 256 x {}]",
-        k.hidden_dim,
-        k.seq_len,
+        k.width,
+        k.states.seq_len,
         num_kv_heads,
-        q.seq_len
+        q.states.seq_len
     );
     anyhow::ensure!(
-        v.hidden_dim == k.hidden_dim && v.seq_len == q.seq_len,
+        v.width == k.width && v.states.seq_len == q.states.seq_len,
         "hd256 paged decode prep v [{} x {}] != k [{} x {}]",
-        v.hidden_dim,
-        v.seq_len,
-        k.hidden_dim,
-        q.seq_len
+        v.width,
+        v.states.seq_len,
+        k.width,
+        q.states.seq_len
     );
     let geometry = checked_paged_geometry(
         "hd256 paged decode prep",
@@ -3512,10 +3544,10 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
         page_indices.len(),
         "hd256 paged decode prep page_indices len",
     )?;
-    let q_elems = q.checked_extent("hd256 paged decode prep q")?;
+    let q_elems = q.states.checked_extent("hd256 paged decode prep q")?;
     q_out.checked_extent("hd256 paged decode prep q_out")?;
-    let k_elems = k.checked_extent("hd256 paged decode prep k")?;
-    v.checked_extent("hd256 paged decode prep v")?;
+    let k_elems = k.states.checked_extent("hd256 paged decode prep k")?;
+    v.states.checked_extent("hd256 paged decode prep v")?;
     crate::ops::checked_i32(q_elems, "hd256 paged decode prep q extent")?;
     crate::ops::checked_i32(k_elems, "hd256 paged decode prep k extent")?;
     let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "hd256 paged decode prep q heads")?;
@@ -3526,16 +3558,16 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
         crate::ops::checked_i32(cos_max_pos, "hd256 paged decode prep cos_max_pos")?;
     let rotary_dim_i32 = crate::ops::checked_i32(rotary_dim, "hd256 paged decode prep rotary_dim")?;
 
-    let q_row_bytes = checked_row_offset(q, row_offset, batch, "hd256 paged decode prep q")?;
-    let k_row_bytes = checked_row_offset(k, row_offset, batch, "hd256 paged decode prep k")?;
-    let v_row_bytes = checked_row_offset(v, row_offset, batch, "hd256 paged decode prep v")?;
+    let q_row_bytes = checked_band_offset(&q, row_offset, batch, "hd256 paged decode prep q")?;
+    let k_row_bytes = checked_band_offset(&k, row_offset, batch, "hd256 paged decode prep k")?;
+    let v_row_bytes = checked_band_offset(&v, row_offset, batch, "hd256 paged decode prep v")?;
     let qo_row_bytes =
         checked_row_offset(q_out, row_offset, batch, "hd256 paged decode prep q_out")?;
-    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.states.data.device_ptr(&ctx.stream);
     let q_ptr = q_ptr + q_row_bytes;
-    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.states.data.device_ptr(&ctx.stream);
     let k_ptr = k_ptr + k_row_bytes;
-    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.states.data.device_ptr(&ctx.stream);
     let v_ptr = v_ptr + v_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
     let qo_ptr = qo_ptr + qo_row_bytes;
@@ -3563,11 +3595,20 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     } else {
         "qkv_norm_rope_paged_decode_hd256_plain_cuda"
     };
+    let q_stride =
+        crate::ops::checked_i32(q.states.hidden_dim, "hd256 paged decode prep q stride")?;
+    let k_stride =
+        crate::ops::checked_i32(k.states.hidden_dim, "hd256 paged decode prep k stride")?;
+    let v_stride =
+        crate::ops::checked_i32(v.states.hidden_dim, "hd256 paged decode prep v stride")?;
     let result = unsafe {
         launch(
             q_ptr as *const ffi::Half,
             k_ptr as *const ffi::Half,
             v_ptr as *const ffi::Half,
+            q_stride,
+            k_stride,
+            v_stride,
             qn_ptr as *const ffi::Half,
             kn_ptr as *const ffi::Half,
             cos_ptr as *const ffi::Half,
@@ -3742,15 +3783,17 @@ pub fn single_prefill_hd256_into(
 /// 512: pairs `(d, d + 256)` with the live angles first and the identity
 /// past them. How the row is laid out — K and V as two blocks, or the
 /// folded row of `KvFormat::Folded` — is the layout's format, and the
-/// kernel is told it as bands rather than asked to know the format.
+/// kernel is told it as bands rather than asked to know the format. `q` and
+/// `k` are column bands read at their own row strides, so they may share one
+/// fused Q|K projection row.
 ///
 /// The kernel `__trap()`s on any out-of-range pos or page id as the
 /// second layer of the host validation's defence.
 #[allow(clippy::too_many_arguments)]
-pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
+pub fn qk_norm_partial_rope_paged_prefill_hd512_into<'a>(
     ctx: &DeviceContext,
-    q: &HiddenStates,
-    k: &HiddenStates,
+    q: impl Into<Columns<'a>>,
+    k: impl Into<Columns<'a>>,
     q_out: &mut HiddenStates,
     row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
@@ -3768,14 +3811,15 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     num_kv_heads: usize,
     rms_eps: f32,
 ) -> Result<()> {
+    let (q, k) = (q.into(), k.into());
     // Same suffix-window contract as the hd256 prefill prep: the segment
     // is the rows `[row_offset..seq_len)` with its table at `pages_offset`.
     anyhow::ensure!(
-        row_offset < q.seq_len,
+        row_offset < q.states.seq_len,
         "hd512 prefill prep row_offset {row_offset} leaves no rows of {}",
-        q.seq_len
+        q.states.seq_len
     );
-    let seq_len = q.seq_len - row_offset;
+    let seq_len = q.states.seq_len - row_offset;
     anyhow::ensure!(
         pages_offset < page_indices.len(),
         "hd512 prefill prep pages_offset {pages_offset} exceeds table len {}",
@@ -3788,32 +3832,32 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         anyhow::anyhow!("hd512 prefill prep num_kv_heads {num_kv_heads} * 512 overflows")
     })?;
     anyhow::ensure!(
-        q.hidden_dim == q_dim,
-        "hd512 prefill prep q.hidden_dim {} != num_q_heads {num_q_heads} * 512",
-        q.hidden_dim
+        q.width == q_dim,
+        "hd512 prefill prep q width {} != num_q_heads {num_q_heads} * 512",
+        q.width
     );
     anyhow::ensure!(
-        q_out.hidden_dim == q.hidden_dim,
-        "hd512 prefill prep q_out.hidden_dim {} != q.hidden_dim {}",
+        q_out.hidden_dim == q.width,
+        "hd512 prefill prep q_out.hidden_dim {} != q width {}",
         q_out.hidden_dim,
-        q.hidden_dim
+        q.width
     );
     anyhow::ensure!(
-        q_out.seq_len == q.seq_len,
-        "hd512 prefill prep q_out.seq_len {} != q.seq_len {}",
+        q_out.seq_len == q.states.seq_len,
+        "hd512 prefill prep q_out.seq_len {} != q rows {}",
         q_out.seq_len,
-        q.seq_len
+        q.states.seq_len
     );
     anyhow::ensure!(
-        k.hidden_dim == kv_dim,
-        "hd512 prefill prep k.hidden_dim {} != num_kv_heads {num_kv_heads} * 512",
-        k.hidden_dim
+        k.width == kv_dim,
+        "hd512 prefill prep k width {} != num_kv_heads {num_kv_heads} * 512",
+        k.width
     );
     anyhow::ensure!(
-        k.seq_len == q.seq_len,
-        "hd512 prefill prep k.seq_len {} != q.seq_len {}",
-        k.seq_len,
-        q.seq_len
+        k.states.seq_len == q.states.seq_len,
+        "hd512 prefill prep k rows {} != q rows {}",
+        k.states.seq_len,
+        q.states.seq_len
     );
     let target = hd512_prep_target(
         "hd512 prefill prep",
@@ -3865,9 +3909,9 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         "hd512 prefill prep sin_cache len {} < cos_max_pos {cos_max_pos} * 512",
         sin_cache.len
     );
-    let q_elems = q.checked_extent("hd512 prefill prep q")?;
+    let q_elems = q.states.checked_extent("hd512 prefill prep q")?;
     q_out.checked_extent("hd512 prefill prep q_out")?;
-    let k_elems = k.checked_extent("hd512 prefill prep k")?;
+    let k_elems = k.states.checked_extent("hd512 prefill prep k")?;
     crate::ops::checked_i32(q_elems, "hd512 prefill prep q extent")?;
     crate::ops::checked_i32(k_elems, "hd512 prefill prep k extent")?;
     crate::ops::checked_i32(table_len, "hd512 prefill prep rope table extent")?;
@@ -3887,12 +3931,12 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         page_indices.len() - pages_offset,
         "hd512 paged prep page window len",
     )?;
-    let q_row_bytes = checked_row_offset(q, row_offset, seq_len, "hd512 prefill prep q")?;
-    let k_row_bytes = checked_row_offset(k, row_offset, seq_len, "hd512 prefill prep k")?;
+    let q_row_bytes = checked_band_offset(&q, row_offset, seq_len, "hd512 prefill prep q")?;
+    let k_row_bytes = checked_band_offset(&k, row_offset, seq_len, "hd512 prefill prep k")?;
     let qo_row_bytes = checked_row_offset(q_out, row_offset, seq_len, "hd512 prefill prep q_out")?;
-    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.states.data.device_ptr(&ctx.stream);
     let q_ptr = q_ptr + q_row_bytes;
-    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.states.data.device_ptr(&ctx.stream);
     let k_ptr = k_ptr + k_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
     let qo_ptr = qo_ptr + qo_row_bytes;
@@ -3905,10 +3949,14 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
     let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
     let pi_ptr = pi_ptr + (pages_offset * std::mem::size_of::<i32>()) as u64;
 
+    let q_stride = crate::ops::checked_i32(q.states.hidden_dim, "hd512 prefill prep q stride")?;
+    let k_stride = crate::ops::checked_i32(k.states.hidden_dim, "hd512 prefill prep k stride")?;
     let result = unsafe {
         ffi::qk_norm_partial_rope_paged_prefill_hd512_cuda(
             q_ptr as *const ffi::Half,
             k_ptr as *const ffi::Half,
+            q_stride,
+            k_stride,
             qn_ptr as *const ffi::Half,
             kn_ptr as *const ffi::Half,
             cos_ptr as *const ffi::Half,
@@ -3946,10 +3994,10 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
 /// Per-request hd512 prep for the non-evicting global cache; V is the K fork.
 /// Invalid device metadata traps before the first paged-pool access.
 #[allow(clippy::too_many_arguments)]
-pub fn qk_norm_partial_rope_paged_decode_hd512_into(
+pub fn qk_norm_partial_rope_paged_decode_hd512_into<'a>(
     ctx: &DeviceContext,
-    q: &HiddenStates,
-    k: &HiddenStates,
+    q: impl Into<Columns<'a>>,
+    k: impl Into<Columns<'a>>,
     q_out: &mut HiddenStates,
     row_offset: usize,
     kv_pool: &CudaSlice<bf16>,
@@ -3968,33 +4016,34 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     num_kv_heads: usize,
     rms_eps: f32,
 ) -> Result<()> {
+    let (q, k) = (q.into(), k.into());
     anyhow::ensure!(
-        row_offset < q.seq_len,
+        row_offset < q.states.seq_len,
         "hd512 paged decode prep row_offset {row_offset} leaves no rows of {}",
-        q.seq_len
+        q.states.seq_len
     );
-    let batch = q.seq_len - row_offset;
+    let batch = q.states.seq_len - row_offset;
     anyhow::ensure!(
-        Some(q.hidden_dim) == num_q_heads.checked_mul(512),
-        "hd512 paged decode prep q.hidden_dim {} != num_q_heads {} * 512",
-        q.hidden_dim,
+        Some(q.width) == num_q_heads.checked_mul(512),
+        "hd512 paged decode prep q width {} != num_q_heads {} * 512",
+        q.width,
         num_q_heads
     );
     anyhow::ensure!(
-        q_out.hidden_dim == q.hidden_dim && q_out.seq_len == q.seq_len,
+        q_out.hidden_dim == q.width && q_out.seq_len == q.states.seq_len,
         "hd512 paged decode prep q_out [{} x {}] != q [{} x {}]",
         q_out.hidden_dim,
         q_out.seq_len,
-        q.hidden_dim,
-        q.seq_len
+        q.width,
+        q.states.seq_len
     );
     anyhow::ensure!(
-        Some(k.hidden_dim) == num_kv_heads.checked_mul(512) && k.seq_len == q.seq_len,
+        Some(k.width) == num_kv_heads.checked_mul(512) && k.states.seq_len == q.states.seq_len,
         "hd512 paged decode prep k [{} x {}] != [num_kv_heads {} * 512 x {}]",
-        k.hidden_dim,
-        k.seq_len,
+        k.width,
+        k.states.seq_len,
         num_kv_heads,
-        q.seq_len
+        q.states.seq_len
     );
     let target = hd512_prep_target(
         "hd512 paged decode prep",
@@ -4035,9 +4084,9 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
         page_indices.len(),
         "hd512 paged decode prep page_indices len",
     )?;
-    let q_elems = q.checked_extent("hd512 paged decode prep q")?;
+    let q_elems = q.states.checked_extent("hd512 paged decode prep q")?;
     q_out.checked_extent("hd512 paged decode prep q_out")?;
-    let k_elems = k.checked_extent("hd512 paged decode prep k")?;
+    let k_elems = k.states.checked_extent("hd512 paged decode prep k")?;
     crate::ops::checked_i32(q_elems, "hd512 paged decode prep q extent")?;
     crate::ops::checked_i32(k_elems, "hd512 paged decode prep k extent")?;
     let num_q_heads_i32 = crate::ops::checked_i32(num_q_heads, "hd512 paged decode prep q heads")?;
@@ -4046,13 +4095,13 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     let batch_i32 = crate::ops::checked_i32(batch, "hd512 paged decode prep batch")?;
     let cos_max_pos_i32 =
         crate::ops::checked_i32(cos_max_pos, "hd512 paged decode prep cos_max_pos")?;
-    let q_row_bytes = checked_row_offset(q, row_offset, batch, "hd512 paged decode prep q")?;
-    let k_row_bytes = checked_row_offset(k, row_offset, batch, "hd512 paged decode prep k")?;
+    let q_row_bytes = checked_band_offset(&q, row_offset, batch, "hd512 paged decode prep q")?;
+    let k_row_bytes = checked_band_offset(&k, row_offset, batch, "hd512 paged decode prep k")?;
     let qo_row_bytes =
         checked_row_offset(q_out, row_offset, batch, "hd512 paged decode prep q_out")?;
-    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.states.data.device_ptr(&ctx.stream);
     let q_ptr = q_ptr + q_row_bytes;
-    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.states.data.device_ptr(&ctx.stream);
     let k_ptr = k_ptr + k_row_bytes;
     let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
     let qo_ptr = qo_ptr + qo_row_bytes;
@@ -4067,10 +4116,16 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
     let (po_ptr, _gpo) = page_origins.device_ptr(&ctx.stream);
     let (ps_ptr, _gps) = positions.device_ptr(&ctx.stream);
 
+    let q_stride =
+        crate::ops::checked_i32(q.states.hidden_dim, "hd512 paged decode prep q stride")?;
+    let k_stride =
+        crate::ops::checked_i32(k.states.hidden_dim, "hd512 paged decode prep k stride")?;
     let result = unsafe {
         ffi::qk_norm_partial_rope_paged_decode_hd512_cuda(
             q_ptr as *const ffi::Half,
             k_ptr as *const ffi::Half,
+            q_stride,
+            k_stride,
             qn_ptr as *const ffi::Half,
             kn_ptr as *const ffi::Half,
             cos_ptr as *const ffi::Half,

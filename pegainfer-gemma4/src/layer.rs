@@ -15,7 +15,9 @@ use anyhow::Context as _;
 use anyhow::Result;
 use half::bf16;
 use pegainfer_core::ops;
+use pegainfer_core::tensor::Columns;
 use pegainfer_core::tensor::DeviceContext;
+use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
@@ -130,15 +132,67 @@ pub(crate) struct EpilogueScratch {
     attn_proj: HiddenStates,
     residual: HiddenStates,
     mlp_in: HiddenStates,
-    gate: HiddenStates,
-    up: HiddenStates,
+    mlp: Activations,
     act: HiddenStates,
     down: HiddenStates,
     moe: Option<MoeScratch>,
 }
 
+/// Where gate and up land: buffers of their own, or one row per token
+/// holding both so a single GEMM fills it. Split for the same reason the
+/// attention projections are: the fused shape is a different cuBLAS shape.
+enum Activations {
+    Separate {
+        gate: HiddenStates,
+        up: HiddenStates,
+    },
+    Fused(HiddenStates),
+}
+
+impl Activations {
+    fn set_rows(&mut self, seq_len: usize) {
+        match self {
+            Self::Separate { gate, up } => {
+                gate.seq_len = seq_len;
+                up.seq_len = seq_len;
+            }
+            Self::Fused(both) => both.seq_len = seq_len,
+        }
+    }
+
+    fn project(
+        &mut self,
+        ctx: &DeviceContext,
+        gate_up: &DeviceMatrix,
+        x: &HiddenStates,
+        width: usize,
+    ) -> Result<(Columns<'_>, Columns<'_>)> {
+        anyhow::ensure!(
+            gate_up.rows == 2 * width,
+            "gate|up holds {} rows, not 2 x {width}",
+            gate_up.rows
+        );
+        match self {
+            Self::Separate { gate, up } => {
+                ops::gemm_rows_into_checked(ctx, gate_up, 0, width, x, gate)?;
+                ops::gemm_rows_into_checked(ctx, gate_up, width, width, x, up)?;
+                Ok(((&*gate).into(), (&*up).into()))
+            }
+            Self::Fused(both) => {
+                ops::gemm_rows_into_checked(ctx, gate_up, 0, 2 * width, x, both)?;
+                Ok((both.columns(0, width), both.columns(width, width)))
+            }
+        }
+    }
+}
+
 impl EpilogueScratch {
-    pub(crate) fn new(ctx: &DeviceContext, geom: &LayerGeometry, max_rows: usize) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        geom: &LayerGeometry,
+        max_rows: usize,
+        fused: bool,
+    ) -> Result<Self> {
         let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
         let wide = |rows| HiddenStates::zeros(ctx, geom.intermediate_size, rows);
         Ok(Self {
@@ -146,8 +200,18 @@ impl EpilogueScratch {
             attn_proj: hidden(max_rows)?,
             residual: hidden(max_rows)?,
             mlp_in: hidden(max_rows)?,
-            gate: wide(max_rows)?,
-            up: wide(max_rows)?,
+            mlp: if fused {
+                Activations::Fused(HiddenStates::zeros(
+                    ctx,
+                    2 * geom.intermediate_size,
+                    max_rows,
+                )?)
+            } else {
+                Activations::Separate {
+                    gate: wide(max_rows)?,
+                    up: wide(max_rows)?,
+                }
+            },
             act: wide(max_rows)?,
             down: hidden(max_rows)?,
             moe: match geom.moe {
@@ -170,13 +234,12 @@ impl EpilogueScratch {
             &mut self.attn_proj,
             &mut self.residual,
             &mut self.mlp_in,
-            &mut self.gate,
-            &mut self.up,
             &mut self.act,
             &mut self.down,
         ] {
             buf.seq_len = seq_len;
         }
+        self.mlp.set_rows(seq_len);
         Ok(())
     }
 }
@@ -231,23 +294,13 @@ pub(crate) fn attention_epilogue_into(
         &mut scratch.residual,
         &mut scratch.mlp_in,
     )?;
-    ops::gemm_rows_into_checked(
+    let (gate, up) = scratch.mlp.project(
         ctx,
-        &layer.mlp.gate,
-        0,
-        geom.intermediate_size,
+        &layer.mlp.gate_up,
         &scratch.mlp_in,
-        &mut scratch.gate,
-    )?;
-    ops::gemm_rows_into_checked(
-        ctx,
-        &layer.mlp.up,
-        0,
         geom.intermediate_size,
-        &scratch.mlp_in,
-        &mut scratch.up,
     )?;
-    ops::gelu_tanh_mul_batch_into(ctx, &scratch.gate, &scratch.up, &mut scratch.act)?;
+    ops::gelu_tanh_mul_batch_into(ctx, gate, up, &mut scratch.act)?;
     ops::gemm_rows_into_checked(
         ctx,
         &layer.mlp.down,

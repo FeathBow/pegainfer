@@ -68,17 +68,17 @@ pub(crate) struct Gemma4Moe {
 }
 
 pub(crate) struct Gemma4Attention {
-    pub(crate) q_proj: DeviceMatrix,
-    pub(crate) k_proj: DeviceMatrix,
-    /// Absent on global layers, which the checkpoint ships without one.
-    pub(crate) v_proj: Option<DeviceMatrix>,
+    /// Q, K and, on sliding layers, V stacked along rows in that order, so a
+    /// step projects them all with one GEMM or each through its row range.
+    /// Global layers ship no V: it is the K fork.
+    pub(crate) qkv: DeviceMatrix,
     pub(crate) o_proj: DeviceMatrix,
     pub(crate) q_norm: DeviceVec,
     pub(crate) k_norm: DeviceVec,
 }
 
 pub(crate) struct Gemma4Mlp {
-    pub(crate) gate: DeviceMatrix,
-    pub(crate) up: DeviceMatrix,
+    /// gate then up, stacked along rows.
+    pub(crate) gate_up: DeviceMatrix,
     pub(crate) down: DeviceMatrix,
 }

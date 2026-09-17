@@ -307,6 +307,188 @@ def prefill_varlen(
 
 
 # ---------------------------------------------------------------------------
+# The sliding family's prefill: causal within a window, ragged across
+# requests, over the local pool's split K|V rows at head dim 256.
+#
+# The shape of the global prefill with the walk narrowed to the window: a
+# query tile sees the keys from the oldest one in its first row's window to
+# its last row's own position, and the tile mask adds the window's lower
+# bound to the causal one. Measured on GH200 over an 8192-token chunk
+# against a 1024-key window, one page a tile: a 128-row query tile beats a
+# 64-row one (0.78 vs 0.85 ms), the row warp partition beats the column
+# one (0.63 vs 0.78), a second pipeline stage buys nothing, and a key tile
+# assembled from four 16-row pages costs more than the generic kernel it
+# replaces (1.1-1.4 ms against 1.06) -- so the pool pages at the tile.
+
+LOCAL_BLOCK_M = 128
+LOCAL_PREFILL_THREADS = 256
+
+
+def prefill_window(
+    heads,
+    groups,
+    dim,
+    page_size,
+    max_batch,
+    q_rows,
+    pool_rows,
+    page_table_len,
+    block_M=LOCAL_BLOCK_M,
+    num_stages=1,
+    threads=LOCAL_PREFILL_THREADS,
+):
+    """Windowed causal GQA prefill over the paged pool, ragged across requests.
+
+    One key tile is one page, as in the global prefill, so the load is one
+    copy. `window_left` is the inclusive key distance a query attends to.
+    The bounds are the serving arena's maxima and reach the code only as
+    guards; the TMA descriptors carry the step's own extents.
+    """
+    block_N = page_size
+    head_kv = heads // groups
+    q_shape = [q_rows, heads, dim]
+    kv_shape = [pool_rows, head_kv, dim]
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, DTYPE),
+        KV: T.Tensor(kv_shape, DTYPE),
+        PageIndices: T.Tensor([page_table_len], "int32"),
+        PageIndptr: T.Tensor([max_batch + 1], "int32"),
+        QIndptr: T.Tensor([max_batch + 1], "int32"),
+        LastPageLen: T.Tensor([max_batch], "int32"),
+        sm_scale: T.float32,
+        total_ctas: T.int32,
+        batch: T.int32,
+        rows_per_page: T.int32,
+        layer_row: T.int32,
+        window_left: T.int32,
+        Output: T.Tensor(q_shape, DTYPE),
+    ):
+        with T.Kernel(total_ctas, threads=threads) as pid:
+            scale = sm_scale * 1.44269504
+            Q_shared = T.alloc_shared([block_M, dim], DTYPE)
+            K_shared = T.alloc_shared([block_N, dim], DTYPE)
+            S_shared = T.alloc_shared([block_M, block_N], DTYPE)
+            V_shared = T.alloc_shared([block_N, dim], DTYPE)
+            acc_s = T.alloc_fragment([block_M, block_N], ACC)
+            acc_o = T.alloc_fragment([block_M, dim], ACC)
+            scores_max = T.alloc_fragment([block_M], ACC)
+            scores_max_prev = T.alloc_fragment([block_M], ACC)
+            scores_scale = T.alloc_fragment([block_M], ACC)
+            scores_sum = T.alloc_fragment([block_M], ACC)
+            logsum = T.alloc_fragment([block_M], ACC)
+            # Which request owns this CTA: a request owns one CTA per (query
+            # tile, head), requests sit back to back, and `total_ctas` is the
+            # host's same sum. The global prefill walks the boundaries in a
+            # rolled loop; here that loop cost the kernel a third of its time
+            # -- one CTA fits an SM, so nothing hides a serial walk -- so the
+            # boundaries are read at once into registers (each index clamped
+            # to the step's last real one, so the reads past `batch` stay in
+            # bounds and add nothing) and the owner is the last one at or
+            # before this CTA, all of it unrolled.
+            bounds = T.alloc_local([max_batch + 1], "int32")
+            owner = T.alloc_local([1], "int32")
+            first_cta = T.alloc_local([1], "int32")
+            bounds[0] = 0
+            for i in T.unroll(max_batch):
+                lo = QIndptr[T.min(i, batch)]
+                hi = QIndptr[T.min(i + 1, batch)]
+                bounds[i + 1] = bounds[i] + T.ceildiv(hi - lo, block_M) * heads
+            owner[0] = 0
+            first_cta[0] = 0
+            for i in T.unroll(max_batch - 1):
+                if pid >= bounds[i + 1]:
+                    owner[0] = i + 1
+                    first_cta[0] = bounds[i + 1]
+
+            if pid < total_ctas:
+                b = owner[0]
+                local = pid - first_cta[0]
+                # Adjacent CTAs are one query tile's heads, so a kv head's
+                # tiles are read once from HBM and again from L2.
+                q_tile = local // heads
+                head = local % heads
+                kv_head = head // groups
+                q_start = QIndptr[b]
+                q_len = QIndptr[b + 1] - q_start
+                pages = PageIndptr[b + 1] - PageIndptr[b]
+                kv_len = (pages - 1) * page_size + LastPageLen[b]
+                offset = kv_len - q_len
+                row = q_start + q_tile * block_M
+
+                if q_tile * block_M < q_len:
+                    T.copy(Q[row : row + block_M, head, :], Q_shared)
+                    T.fill(acc_o, 0)
+                    T.fill(logsum, 0)
+                    T.fill(scores_max, -T.infinity(ACC))
+
+                    # From the oldest key the tile's first row may see to the
+                    # newest its last row is.
+                    k_begin = T.max(q_tile * block_M + offset - window_left, 0) // block_N
+                    k_end = T.min(
+                        T.ceildiv(offset + (q_tile + 1) * block_M, block_N),
+                        T.ceildiv(kv_len, block_N),
+                    )
+                    for kk in T.Pipelined(k_end - k_begin, num_stages=num_stages):
+                        k = k_begin + kk
+                        kb = PageIndices[PageIndptr[b] + k] * rows_per_page + layer_row
+                        T.copy(KV[kb : kb + page_size, kv_head, :], K_shared)
+                        for i, j in T.Parallel(block_M, block_N):
+                            acc_s[i, j] = T.if_then_else(
+                                (q_tile * block_M + i + offset < k * block_N + j)
+                                | (k * block_N + j + window_left < q_tile * block_M + i + offset),
+                                -1e9,
+                                0,
+                            )
+                        T.gemm(
+                            Q_shared,
+                            K_shared,
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                        )
+
+                        T.copy(scores_max, scores_max_prev)
+                        T.fill(scores_max, -T.infinity(ACC))
+                        T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                        for i in T.Parallel(block_M):
+                            scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                        for i in T.Parallel(block_M):
+                            scores_scale[i] = T.exp2(
+                                scores_max_prev[i] * scale - scores_max[i] * scale
+                            )
+                        for i, j in T.Parallel(block_M, block_N):
+                            acc_s[i, j] = T.exp2(
+                                acc_s[i, j] * scale - scores_max[i] * scale
+                            )
+                        T.reduce_sum(acc_s, scores_sum, dim=1)
+                        for i in T.Parallel(block_M):
+                            logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                        T.copy(acc_s, S_shared)
+
+                        for i, j in T.Parallel(block_M, dim):
+                            acc_o[i, j] *= scores_scale[i]
+                        T.copy(
+                            KV[kb + page_size : kb + 2 * page_size, kv_head, :],
+                            V_shared,
+                        )
+                        T.gemm(
+                            S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow
+                        )
+
+                    for i, j in T.Parallel(block_M, dim):
+                        acc_o[i, j] = acc_o[i, j] / logsum[i]
+
+                    T.copy(acc_o, Q_shared)
+                    for i, d in T.Parallel(block_M, dim):
+                        if q_tile * block_M + i < q_len:
+                            Output[row + i, head, d] = Q_shared[i, d]
+
+    return main
+
+
+# ---------------------------------------------------------------------------
 # Decode: split-KV partial and merge. A CTA is one (slot, kv head), a slot one
 # chunk of one request, so every KV byte is read from HBM once and reused from
 # shared memory by the group's heads. Three shapes the lowering forces:
@@ -502,6 +684,161 @@ def decode_partial(
                     for i, d in T.Parallel(m_pad, d_len):
                         if i < groups:
                             TmpV[s, h * groups + i, d_dst + d] = Q_shared[i, d_src + d]
+                for i in T.Parallel(m_pad):
+                    if i < groups:
+                        TmpS[s, h * groups + i] = m_cur[i] * scale + T.log2(logsum[i])
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# The sliding family's decode: the same split-KV partial over the local
+# pool's 16-row pages, with the window as a mask on the resident keys.
+#
+# The serving path read a decode row's window through the windowed prefill
+# kernel: 27 us a launch for 16.8 MB, fifty launches a step. Two things
+# differ from the global family's partial. The gemm wants at least eight key
+# columns per warp, and a 16-row page gives a 128-thread block only four, so
+# a key tile is `tile_pages` pages copied side by side into one shared tile;
+# a page past the request's is read as its last page and masked by its
+# virtual position, so the copy never follows a page id the request does not
+# own. And the query is the last resident key while the pages hold up to a
+# page more than the window, so keys older than `window_left` are masked out
+# rather than released. Measured at 13.4 us a layer over the full window
+# against the 27 of the windowed prefill read, at 64-token chunks, 32-key
+# tiles, two stages and 128 threads.
+
+LOCAL_DECODE_THREADS = 128
+LOCAL_DECODE_STAGES = 2
+
+
+def decode_window_partial(
+    heads,
+    groups,
+    dim,
+    page_size,
+    tile_pages,
+    max_rows,
+    max_batch,
+    max_slots,
+    pool_rows,
+    page_table_len,
+    stages=LOCAL_DECODE_STAGES,
+    threads=LOCAL_DECODE_THREADS,
+):
+    """The windowed partial pass: one (slot, kv head) per CTA over that
+    slot's chunk of the resident window, `tile_pages` pages a tile.
+
+    Writes the same per-slot state as `decode_partial`, so the two merge
+    levels serve it unchanged. `chunk_pages` has to be whole tiles, which
+    the launcher refuses otherwise.
+    """
+    head_kv = heads // groups
+    m_pad = DECODE_M_PAD
+    tile = tile_pages * page_size
+    assert groups <= m_pad, "a group has to fit the padded query tile"
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor([max_rows, heads, dim], DTYPE),
+        KV: T.Tensor([pool_rows, head_kv, dim], DTYPE),
+        PageIndices: T.Tensor([page_table_len], "int32"),
+        PageIndptr: T.Tensor([max_batch + 1], "int32"),
+        LastPageLen: T.Tensor([max_batch], "int32"),
+        RequestIndices: T.Tensor([max_slots], "int32"),
+        KvTileIndices: T.Tensor([max_slots], "int32"),
+        ValidMask: T.Tensor([max_slots], "uint8"),
+        sm_scale: T.float32,
+        rows_per_page: T.int32,
+        layer_row: T.int32,
+        row_offset: T.int32,
+        chunk_pages: T.int32,
+        window_left: T.int32,
+        padded_slots: T.int32,
+        TmpV: T.Tensor([max_slots, heads, dim], DTYPE),
+        TmpS: T.Tensor([max_slots, heads], ACC),
+    ):
+        with T.Kernel(padded_slots, head_kv, threads=threads) as (s, h):
+            scale = sm_scale * 1.44269504
+            Q_shared = T.alloc_shared([m_pad, dim], DTYPE)
+            K_shared = T.alloc_shared([tile, dim], DTYPE)
+            V_shared = T.alloc_shared([tile, dim], DTYPE)
+            S_shared = T.alloc_shared([m_pad, tile], DTYPE)
+            acc_s = T.alloc_fragment([m_pad, tile], ACC)
+            acc_o = T.alloc_fragment([m_pad, dim], ACC)
+            m_cur = T.alloc_fragment([m_pad], ACC)
+            m_prev = T.alloc_fragment([m_pad], ACC)
+            m_scale = T.alloc_fragment([m_pad], ACC)
+            row_sum = T.alloc_fragment([m_pad], ACC)
+            logsum = T.alloc_fragment([m_pad], ACC)
+
+            if ValidMask[s] != 0:
+                r = RequestIndices[s]
+                t = KvTileIndices[s]
+                pages = PageIndptr[r + 1] - PageIndptr[r]
+                kv_len = (pages - 1) * page_size + LastPageLen[r]
+                first = t * chunk_pages
+                n_pages = T.min(chunk_pages, pages - first)
+                oldest = kv_len - 1 - window_left
+
+                for i, d in T.Parallel(m_pad, dim):
+                    Q_shared[i, d] = T.if_then_else(
+                        i < groups, Q[row_offset + r, h * groups + i, d], 0
+                    )
+                T.fill(acc_o, 0)
+                T.fill(logsum, 0)
+                T.fill(m_cur, -T.infinity(ACC))
+
+                n_tiles = T.ceildiv(n_pages, tile_pages)
+                for tt in T.Pipelined(n_tiles, num_stages=stages):
+                    for pp in T.serial(tile_pages):
+                        pidx = T.min(first + tt * tile_pages + pp, pages - 1)
+                        kb = PageIndices[PageIndptr[r] + pidx] * rows_per_page + layer_row
+                        T.copy(
+                            KV[kb : kb + page_size, h, :],
+                            K_shared[pp * page_size : (pp + 1) * page_size, :],
+                        )
+                    for i, j in T.Parallel(m_pad, tile):
+                        acc_s[i, j] = T.if_then_else(
+                            ((first + tt * tile_pages) * page_size + j < kv_len)
+                            & ((first + tt * tile_pages) * page_size + j >= oldest),
+                            0,
+                            -1e9,
+                        )
+                    T.gemm(
+                        Q_shared,
+                        K_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    T.copy(m_cur, m_prev)
+                    T.fill(m_cur, -T.infinity(ACC))
+                    T.reduce_max(acc_s, m_cur, dim=1, clear=False)
+                    for i in T.Parallel(m_pad):
+                        m_cur[i] = T.max(m_cur[i], m_prev[i])
+                    for i in T.Parallel(m_pad):
+                        m_scale[i] = T.exp2(m_prev[i] * scale - m_cur[i] * scale)
+                    for i, j in T.Parallel(m_pad, tile):
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - m_cur[i] * scale)
+                    T.reduce_sum(acc_s, row_sum, dim=1)
+                    for i in T.Parallel(m_pad):
+                        logsum[i] = logsum[i] * m_scale[i] + row_sum[i]
+                    T.copy(acc_s, S_shared)
+                    for i, d in T.Parallel(m_pad, dim):
+                        acc_o[i, d] *= m_scale[i]
+                    for pp in T.serial(tile_pages):
+                        pidx = T.min(first + tt * tile_pages + pp, pages - 1)
+                        kb = PageIndices[PageIndptr[r] + pidx] * rows_per_page + layer_row
+                        T.copy(
+                            KV[kb + page_size : kb + 2 * page_size, h, :],
+                            V_shared[pp * page_size : (pp + 1) * page_size, :],
+                        )
+                    T.gemm(S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+
+                for i, d in T.Parallel(m_pad, dim):
+                    if i < groups:
+                        TmpV[s, h * groups + i, d] = acc_o[i, d] / logsum[i]
                 for i in T.Parallel(m_pad):
                     if i < groups:
                         TmpS[s, h * groups + i] = m_cur[i] * scale + T.log2(logsum[i])
