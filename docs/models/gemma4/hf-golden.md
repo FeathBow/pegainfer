@@ -179,6 +179,38 @@ was dumped with. The margins it was chosen on:
 | `b` | Apache license header | 50 | 6.38 |
 | `c` | `2024-01-01` onwards, one per line | 50 | 3.50 |
 
+A checkpoint HF cannot load needs a second directory. The 26B routed one is NVFP4, so the reference
+tower is a bf16 copy of its weights, written by `tools/accuracy/dequantize_gemma4_nvfp4.py`
+(ModelOpt unpacks the experts, the only quantized tensors in this checkpoint). The base fixture is
+dumped from that copy with `--fingerprint-dir` pointing at the checkpoint the gates serve:
+`file_sha256` pins the served checkpoint, and a `reference_tower` block records `--tower` (how the
+copy was made) and the copy's own digests. The runner checks digests on the base fixture alone and
+holds the other three to its revision, so the window, long-context and generate fixtures are dumped
+from the same copy under the same `--source-repo` and `--revision`.
+
+```bash
+# transformers 5.16.1, torch 2.13.0, nvidia-modelopt 0.46.1
+python tools/accuracy/dequantize_gemma4_nvfp4.py <26b-nvfp4-checkpoint> <26b-bf16-copy> \
+    --device cuda:0
+
+REV=a19cfe00be84568a6867111c9a68c9c44fdcffe6   # nvidia/Gemma-4-26B-A4B-NVFP4
+python tools/accuracy/dump_gemma4_hf_golden.py <26b-bf16-copy> \
+    test_data/gemma4-26b-hf-golden.safetensors \
+    --source-repo nvidia/Gemma-4-26B-A4B-NVFP4 --revision $REV --device auto \
+    --fingerprint-dir <26b-nvfp4-checkpoint> \
+    --tower "dequantize_gemma4_nvfp4.py, nvidia-modelopt 0.46.1"
+python tools/accuracy/dump_gemma4_generate.py <26b-bf16-copy> \
+    test_data/gemma4-26b-generate.safetensors \
+    --source-repo nvidia/Gemma-4-26B-A4B-NVFP4 --revision $REV --device auto \
+    --prompts tools/accuracy/gemma4-26b-prompts.json
+# the window and long-context dumpers take the same arguments as the 31B ones above,
+# with the bf16 copy, this repo and this revision
+```
+
+The gates then compare our serving path in NVFP4 against HF in bf16 on the same weights. The
+measured gap includes the quantization; the bound, twice the tower's own sdpa and eager spread,
+does not.
+
 Two runs against the same checkpoint produce the same bytes, so regeneration is checked with
 `sha256sum` alone. The current fixtures are
 

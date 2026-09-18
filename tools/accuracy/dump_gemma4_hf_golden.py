@@ -56,6 +56,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-repo", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--fingerprint-dir",
+        type=Path,
+        help="the checkpoint the gates serve, when the tower here is a copy derived from it",
+    )
+    parser.add_argument(
+        "--tower",
+        help="how the tower was derived; given together with --fingerprint-dir",
+    )
     return parser.parse_args()
 
 
@@ -217,6 +226,8 @@ def run_case(model, text_model, cuts, tokens, device):
 def main() -> int:
     args = parse_args()
     model_dir = Path(args.model_dir)
+    if bool(args.fingerprint_dir) != bool(args.tower):
+        raise SystemExit("--fingerprint-dir and --tower go together")
 
     config = AutoConfig.from_pretrained(str(model_dir))
     text_config = config.get_text_config()
@@ -310,8 +321,13 @@ def main() -> int:
         "embed_scale_bf16": float(
             text_model.embed_tokens.embed_scale.to(torch.bfloat16)
         ),
-        "file_sha256": file_hashes(model_dir),
+        "file_sha256": file_hashes(args.fingerprint_dir or model_dir),
     }
+    if args.fingerprint_dir:
+        manifest["reference_tower"] = {
+            "derivation": args.tower,
+            "file_sha256": file_hashes(model_dir),
+        }
     # One key, sorted: safetensors serializes its metadata map in a randomized
     # order, so a multi-key block makes two runs of this script differ byte for
     # byte while carrying identical content. Collapsing it is what lets the
