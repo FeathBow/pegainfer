@@ -10,7 +10,7 @@ comparison to 16384 and 32768 tokens for the raised serving ceiling. The `12b` i
 the fixture tag: `PEGAINFER_GEMMA4_FIXTURE_TAG` selects another set under the same three names, and
 a reference whose tower does not fit on one card dumps with `--device auto`.
 
-Last touched: 2026-09.
+Last touched: 2026-10.
 
 ## What the base fixture contains
 
@@ -165,6 +165,19 @@ reference `docs/models/gemma4/tokenizer.md` describes. A sharded checkpoint is f
 index plus each shard's header rather than by a single `model.safetensors`, so the provenance check
 holds for both layouts. Only the 12B set is committed; another tag's files are local to the box that
 dumped them, which is why the runner takes paths from the environment.
+
+The generate fixture's three prompts do not carry over between sizes, because which continuations a
+checkpoint is sure of depends on the checkpoint: the committed set holds for 12B and 31B and gives
+1, 0 and 1 decisive tokens on the 26B routed one where the dumper needs twenty, while a counting
+prompt holds the 26B tower for all fifty tokens and stops after two on 31B. The 26B set is
+`tools/accuracy/gemma4-26b-prompts.json`, passed with `--prompts`; the fixture records the set it
+was dumped with. The margins it was chosen on:
+
+| case | prompt | decisive tokens | min margin |
+| --- | --- | --- | --- |
+| `a` | `1, 2, 3, ... 16,` | 50 | 9.94 |
+| `b` | Apache license header | 50 | 6.38 |
+| `c` | `2024-01-01` onwards, one per line | 50 | 3.50 |
 
 Two runs against the same checkpoint produce the same bytes, so regeneration is checked with
 `sha256sum` alone. The current fixtures are
