@@ -121,6 +121,25 @@ impl Linear {
         }
     }
 
+    /// `out = gelu(x @ gate^T) * (x @ up^T)` from this gate|up stack in one
+    /// GEMM, where its kernels fuse the two (W4A16, a step the TileLang GEMMs
+    /// run). False leaves `out` untouched for the caller's two-step path.
+    pub(crate) fn gelu_mul_into(
+        &self,
+        ctx: &DeviceContext,
+        x: &HiddenStates,
+        scratch: &mut LinearScratch,
+        out: &mut HiddenStates,
+    ) -> Result<bool> {
+        match (self, &mut scratch.0) {
+            (Self::W4a16(m), Some(w4)) if m.gelu_mul && W4a16Matrix::runs_tilelang(x.seq_len) => {
+                pegainfer_kernels::ops::gemma4_w4a16_gemm_into(ctx, m, x, w4, out)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// `out = x @ self^T` over every row.
     pub(crate) fn project_into(
         &self,

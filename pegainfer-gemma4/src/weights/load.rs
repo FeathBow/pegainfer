@@ -228,27 +228,31 @@ fn upload_w4a16(
                     [&attention.q_proj, &attention.k_proj]
                         .into_iter()
                         .chain(attention.v_proj.as_ref()),
+                    false,
                 )?,
-                o_proj: upload_w4a16_stacked(ctx, &mut stager, shards, [&attention.o_proj])?,
+                o_proj: upload_w4a16_stacked(ctx, &mut stager, shards, [&attention.o_proj], false)?,
                 gate_up: upload_w4a16_stacked(
                     ctx,
                     &mut stager,
                     shards,
                     [&layer.mlp.gate, &layer.mlp.up],
+                    true,
                 )?,
-                down: upload_w4a16_stacked(ctx, &mut stager, shards, [&layer.mlp.down])?,
+                down: upload_w4a16_stacked(ctx, &mut stager, shards, [&layer.mlp.down], false)?,
             }))
         })
         .collect()
 }
 
 /// The parts' rows stacked in order: the checkpoint stores both tensors row
-/// major, so stacking rows is concatenating bytes.
+/// major, so stacking rows is concatenating bytes. `gelu_mul` marks the
+/// gate|up stack, whose GEMMs then write the MLP activation.
 fn upload_w4a16_stacked<'m>(
     ctx: &DeviceContext,
     stager: &mut ByteWeightStager,
     shards: &[SafeTensors],
     parts: impl IntoIterator<Item = &'m Matrix2d>,
+    gelu_mul: bool,
 ) -> Result<W4a16Matrix> {
     let parts: Vec<&Matrix2d> = parts.into_iter().collect();
     let cols = parts
@@ -301,7 +305,7 @@ fn upload_w4a16_stacked<'m>(
     stager
         .upload(&scales, &mut scales_dev)
         .map_err(|e| anyhow::anyhow!("Gemma 4: W4A16 scales did not upload: {e}"))?;
-    W4a16Matrix::from_checkpoint(ctx, &packed_dev, &scales_dev, rows, cols)
+    W4a16Matrix::from_checkpoint(ctx, &packed_dev, &scales_dev, rows, cols, gelu_mul)
 }
 
 /// One layer's experts, already stacked and resident.

@@ -10,6 +10,11 @@
 // l = 0..7 -- row g + 8 * ((l % 4) / 2), column 2t + l % 2 + 8 * (l / 4) --
 // with nibble slot j holding local kSlotLocal[j]. `sq` [n / 16, k / 32, 8]
 // int32 holds rows g and g + 8 of a group's scales as one bf16x2 word.
+//
+// With `split` > 0 the checkpoint's rows are two stacked halves of `split`
+// rows (gate, then up), and the layout interleaves them 32 at a time: each 64
+// row tile holds 32 gate rows and the same 32 up rows, so the GEMM that owns
+// the tile can write gelu(gate) * up. Dequantization restores stored order.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -22,8 +27,16 @@ __constant__ int kSlotLocal[8] = {0, 2, 4, 6, 1, 3, 5, 7};
 // The inverse: the nibble slot holding local l.
 __constant__ int kLocalSlot[8] = {0, 4, 1, 5, 2, 6, 3, 7};
 
+// The stored row that layout row `row` holds.
+__device__ __forceinline__ size_t stored_row(size_t row, int split) {
+  if (split == 0) return row;
+  const size_t half = row % 64 / 32;
+  return half * split + row / 64 * 32 + row % 32;
+}
+
 __global__ void pack_kernel(const uint32_t* __restrict__ packed, const uint16_t* __restrict__ scales,
-                            uint32_t* __restrict__ wq, uint32_t* __restrict__ sq, int n, int k) {
+                            uint32_t* __restrict__ wq, uint32_t* __restrict__ sq, int n, int k,
+                            int split) {
   const size_t kq_count = k / 64;
   const size_t words = static_cast<size_t>(n / 16) * kq_count * 128;
   const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
@@ -37,7 +50,7 @@ __global__ void pack_kernel(const uint32_t* __restrict__ packed, const uint16_t*
 #pragma unroll
     for (int slot = 0; slot < 8; ++slot) {
       const int l = kSlotLocal[slot];
-      const size_t row = tile * 16 + g + 8 * ((l % 4) / 2);
+      const size_t row = stored_row(tile * 16 + g + 8 * ((l % 4) / 2), split);
       const size_t col = (kq * 4 + v) * 16 + 2 * t + l % 2 + 8 * (l / 4);
       const uint32_t q = (packed[row * (k / 8) + col / 8] >> (4 * (col % 8))) & 0xFu;
       word |= q << (4 * slot);
@@ -50,8 +63,8 @@ __global__ void pack_kernel(const uint32_t* __restrict__ packed, const uint16_t*
     const int g = idx % 8;
     const size_t group = (idx / 8) % groups;
     const size_t tile = idx / (8 * groups);
-    const uint32_t lo = scales[(tile * 16 + g) * groups + group];
-    const uint32_t hi = scales[(tile * 16 + g + 8) * groups + group];
+    const uint32_t lo = scales[stored_row(tile * 16 + g, split) * groups + group];
+    const uint32_t hi = scales[stored_row(tile * 16 + g + 8, split) * groups + group];
     sq[idx] = lo | (hi << 16);
   }
 }
@@ -60,7 +73,7 @@ __global__ void pack_kernel(const uint32_t* __restrict__ packed, const uint16_t*
 // one 16-byte write. Column kc of a 16-wide tile is lane (g, t) =
 // (row % 8, (kc % 8) / 2), local (kc % 2) + 2 * (row % 16 / 8) + 4 * (kc / 8).
 __global__ void dequant_kernel(const uint32_t* __restrict__ wq, const uint32_t* __restrict__ sq,
-                               __nv_bfloat16* __restrict__ out, int n, int k) {
+                               __nv_bfloat16* __restrict__ out, int n, int k, int split) {
   const size_t kq_count = k / 64;
   const size_t groups = k / kGroup;
   const size_t chunks = static_cast<size_t>(n) * (k / 8);
@@ -87,9 +100,12 @@ __global__ void dequant_kernel(const uint32_t* __restrict__ wq, const uint32_t* 
       const float q = static_cast<float>(static_cast<int>((word >> (4 * slot)) & 0xFu) - 8);
       vals[j] = __float2bfloat16_rn(q * scale);
     }
-    *reinterpret_cast<uint4*>(out + row * k + col0) = *reinterpret_cast<const uint4*>(vals);
+    *reinterpret_cast<uint4*>(out + stored_row(row, split) * k + col0) =
+        *reinterpret_cast<const uint4*>(vals);
   }
 }
+
+inline bool split_ok(int n, int split) { return split == 0 || (split % 32 == 0 && n == 2 * split); }
 
 }  // namespace pegainfer_gemma4_w4a16
 
@@ -98,20 +114,21 @@ using namespace pegainfer_gemma4_w4a16;
 extern "C" {
 
 CUresult gemma4_w4a16_pack_cuda(const uint32_t* packed, const uint16_t* scales, uint32_t* wq, uint32_t* sq,
-                                int n, int k, cudaStream_t stream) {
-  if (!packed || !scales || !wq || !sq || n <= 0 || n % 16 != 0 || k <= 0 || k % 64 != 0) {
+                                int n, int k, int split, cudaStream_t stream) {
+  if (!packed || !scales || !wq || !sq || n <= 0 || n % 16 != 0 || k <= 0 || k % 64 != 0 ||
+      !split_ok(n, split)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  pack_kernel<<<1024, 256, 0, stream>>>(packed, scales, wq, sq, n, k);
+  pack_kernel<<<1024, 256, 0, stream>>>(packed, scales, wq, sq, n, k, split);
   return cudaGetLastError() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
 CUresult gemma4_w4a16_dequant_cuda(const uint32_t* wq, const uint32_t* sq, __nv_bfloat16* out, int n, int k,
-                                   cudaStream_t stream) {
-  if (!wq || !sq || !out || n <= 0 || n % 16 != 0 || k <= 0 || k % 64 != 0) {
+                                   int split, cudaStream_t stream) {
+  if (!wq || !sq || !out || n <= 0 || n % 16 != 0 || k <= 0 || k % 64 != 0 || !split_ok(n, split)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  dequant_kernel<<<1024, 256, 0, stream>>>(wq, sq, out, n, k);
+  dequant_kernel<<<1024, 256, 0, stream>>>(wq, sq, out, n, k, split);
   return cudaGetLastError() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 

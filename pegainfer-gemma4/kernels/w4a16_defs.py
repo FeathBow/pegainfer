@@ -20,6 +20,12 @@ many rows ride with it, and every CTA must be resident at once.
 Up to eight rows run with the operands swapped (weights as the MMA A operand,
 x as the n8 B operand, one MMA per weight tile); sixteen rows take x as the
 m16 A operand through ldmatrix and the weights as B.
+
+For gate|up the loader interleaves the two halves 32 rows at a time, so a
+64-column tile holds 32 gate columns and their up columns, and the kernel
+finishing a tile writes gelu(gate) * up with the MLP activation kernel's
+arithmetic (`gelu_tanh_mul_kernel`), rounding gate and up to bf16 first as
+their stored values would be.
 """
 
 import tilelang.language as T
@@ -70,6 +76,16 @@ __device__ __forceinline__ void w4a16_flag_wait(int* f) {
   } while (v == 0);
 }
 __device__ __forceinline__ void w4a16_flag_clear(int* f) { *f = 0; }
+// gelu_pytorch_tanh(gate) * up as gelu_tanh_mul_kernel computes it from the
+// bf16 gate and up; the caller rounds the result to bf16.
+__device__ __forceinline__ float w4a16_gelu_mul(float gate, float up) {
+  const float kSqrt2OverPi = 0.7978845608028654f;
+  const float g = __bfloat162float(__float2bfloat16(gate));
+  const float u = __bfloat162float(__float2bfloat16(up));
+  float inner = kSqrt2OverPi * (g + 0.044715f * g * g * g);
+  float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
+  return __bfloat162float(__float2bfloat16(gelu_g)) * u;
+}
 """
 
 # A-fragment pairs in place; for the B fragment the middle two trade places.
@@ -96,9 +112,10 @@ def plan(nb, kb, P):
     return offsets, flat
 
 
-def gemm(N, K, rows, P):
+def gemm(N, K, rows, P, gelu_mul=False):
     """The prim_func for one (shape, bucket); `plan(N // BLOCK_N, K // BLOCK_K, P)`
-    gives its `fin_off` / `fin_list` arguments."""
+    gives its `fin_off` / `fin_list` arguments. With `gelu_mul` the weight is
+    an interleaved gate|up stack and `y` is `N // 2` wide."""
     assert rows in BUCKETS and N % BLOCK_N == 0 and K % BLOCK_K == 0
     swapped = rows <= 8
     xr = 8 if swapped else 16
@@ -124,13 +141,28 @@ def gemm(N, K, rows, P):
     lo_c = emitter.local_size_out
     acc_len = cols * 4 if swapped else cols * lo_c
     order = A_ORDER if swapped else B_ORDER
+    half = BLOCK_N // 2
+
+    @T.macro
+    def store(y, tot, t):
+        if gelu_mul:
+            for i, j in T.Parallel(rows, half):
+                y[i, t * half + j] = T.cast(
+                    T.call_extern(
+                        "float", "w4a16_gelu_mul", tot[i, j], tot[i, j + half]
+                    ),
+                    "bfloat16",
+                )
+        else:
+            for i, j in T.Parallel(rows, BLOCK_N):
+                y[i, t * BLOCK_N + j] = T.cast(tot[i, j], "bfloat16")
 
     @T.prim_func
     def main(
         x: T.Tensor((rows, K), "bfloat16"),
         wq: T.Tensor((N // 16, K // 64, 32, 4), "int32"),
         sq: T.Tensor((N // 16, K // GROUP, 8), "int32"),
-        y: T.Tensor((rows, N), "bfloat16"),
+        y: T.Tensor((rows, N // 2 if gelu_mul else N), "bfloat16"),
         part: T.Tensor((P, rows, BLOCK_N), "float"),
         flags: T.Tensor((P,), "int32"),
         fin_off: T.Tensor((P + 1,), "int32"),
@@ -257,8 +289,7 @@ def gemm(N, K, rows, P):
                                     "handle", "w4a16_flag_set", T.address_of(flags[c])
                                 )
                         elif kt == kb - 1:
-                            for i, j in T.Parallel(rows, BLOCK_N):
-                                y[i, t * BLOCK_N + j] = T.cast(tot[i, j], "bfloat16")
+                            store(y, tot, t)
                         else:
                             for r in T.serial(fin_off[c], fin_off[c + 1]):
                                 if tx == 0:
@@ -277,8 +308,7 @@ def gemm(N, K, rows, P):
                                         "w4a16_flag_clear",
                                         T.address_of(flags[fin_list[r]]),
                                     )
-                            for i, j in T.Parallel(rows, BLOCK_N):
-                                y[i, t * BLOCK_N + j] = T.cast(tot[i, j], "bfloat16")
+                            store(y, tot, t)
                         T.sync_threads()
                         T.clear(acc)
 

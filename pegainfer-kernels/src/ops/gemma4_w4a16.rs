@@ -1,7 +1,7 @@
 //! Gemma 4 QAT W4A16 linears: the checkpoint's compressed-tensors weights in
 //! the TileLang decode GEMMs' fragment layout, those GEMMs for up to sixteen
 //! rows, and a bf16 dequantization for wider steps, which then run the dense
-//! GEMM.
+//! GEMM. The gate|up linear's GEMMs write gelu(gate) * up directly.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -63,19 +63,24 @@ pub struct W4a16Matrix {
     fin_list: CudaSlice<i32>,
     pub rows: usize,
     pub cols: usize,
+    /// Gate then up, `rows / 2` each: the layout interleaves them so its
+    /// GEMMs write gelu(gate) * up, `rows / 2` wide.
+    pub gelu_mul: bool,
 }
 
 impl W4a16Matrix {
     /// From the checkpoint's `[rows, cols / 8]` packed int32 words and
-    /// `[rows, cols / 32]` bf16 scales, both as the bytes the file stores.
-    /// Refuses a build without the generated GEMMs or a device they were not
-    /// compiled for, before the weight is rewritten.
+    /// `[rows, cols / 32]` bf16 scales, both as the bytes the file stores;
+    /// `gelu_mul` marks a gate|up stack. Refuses a build without the
+    /// generated GEMMs or a device they were not compiled for, before the
+    /// weight is rewritten.
     pub fn from_checkpoint(
         ctx: &DeviceContext,
         packed: &CudaSlice<u8>,
         scales: &CudaSlice<u8>,
         rows: usize,
         cols: usize,
+        gelu_mul: bool,
     ) -> Result<Self> {
         let (ctas, block_n, block_k, _) = gemma4_w4a16_geometry().context(
             "this build carries no W4A16 GEMMs: build with the gemma4 feature where TileLang is \
@@ -109,6 +114,7 @@ impl W4a16Matrix {
                     sq_ptr as *mut u32,
                     i32::try_from(rows)?,
                     i32::try_from(cols)?,
+                    split(rows, gelu_mul)?,
                     crate::tensor::active_cu_stream(ctx),
                 )
             }
@@ -128,10 +134,12 @@ impl W4a16Matrix {
             fin_list,
             rows,
             cols,
+            gelu_mul,
         })
     }
 
-    /// The weight as a bf16 `[rows, cols]` matrix, into `out`'s storage.
+    /// The weight as a bf16 `[rows, cols]` matrix in checkpoint row order,
+    /// into `out`'s storage.
     pub fn dequant_into(&self, ctx: &DeviceContext, out: &mut DeviceMatrix) -> Result<()> {
         ensure!(
             out.data.len() >= self.rows * self.cols,
@@ -152,12 +160,28 @@ impl W4a16Matrix {
                 dst as *mut ffi::Half,
                 i32::try_from(self.rows)?,
                 i32::try_from(self.cols)?,
+                split(self.rows, self.gelu_mul)?,
                 crate::tensor::active_cu_stream(ctx),
             )
         }
         .result()?;
         Ok(())
     }
+
+    /// Whether a step of `rows` runs the TileLang GEMM, as opposed to the
+    /// dequantized dense one.
+    pub fn runs_tilelang(rows: usize) -> bool {
+        rows <= BUCKETS[BUCKETS.len() - 1]
+    }
+}
+
+/// The layout's gate|up interleave argument: the half height, zero for none.
+fn split(rows: usize, gelu_mul: bool) -> Result<i32> {
+    Ok(if gelu_mul {
+        i32::try_from(rows / 2)?
+    } else {
+        0
+    })
 }
 
 /// The in-kernel fix-up waits on other CTAs, so every CTA has to be resident
@@ -227,7 +251,8 @@ impl W4a16Scratch {
 /// `out = x @ weight^T`. Up to sixteen rows run the TileLang GEMM at the
 /// bucket that holds them, which reads and writes the bucket's padding rows,
 /// so both buffers must have room for it; wider steps dequantize the weight
-/// and run the dense GEMM.
+/// and run the dense GEMM. A gate|up weight's TileLang GEMM writes
+/// gelu(gate) * up, `rows / 2` wide; its dense GEMM writes both, stacked.
 pub fn gemma4_w4a16_gemm_into(
     ctx: &DeviceContext,
     weight: &W4a16Matrix,
@@ -235,8 +260,14 @@ pub fn gemma4_w4a16_gemm_into(
     scratch: &mut W4a16Scratch,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    let rows = x.seq_len;
+    let width = if weight.gelu_mul && W4a16Matrix::runs_tilelang(rows) {
+        weight.rows / 2
+    } else {
+        weight.rows
+    };
     ensure!(
-        x.hidden_dim == weight.cols && out.hidden_dim == weight.rows && out.seq_len == x.seq_len,
+        x.hidden_dim == weight.cols && out.hidden_dim == width && out.seq_len == x.seq_len,
         "W4A16 {} x {} cannot map {} x {} into {} x {}",
         weight.rows,
         weight.cols,
@@ -245,7 +276,6 @@ pub fn gemma4_w4a16_gemm_into(
         out.seq_len,
         out.hidden_dim
     );
-    let rows = x.seq_len;
     if rows == 0 {
         return Ok(());
     }
@@ -254,11 +284,11 @@ pub fn gemma4_w4a16_gemm_into(
         return crate::ops::gemm_rows_into_checked(ctx, &scratch.dense, 0, weight.rows, x, out);
     };
     ensure!(
-        x.data.len() >= bucket * weight.cols && out.data.len() >= bucket * weight.rows,
+        x.data.len() >= bucket * weight.cols && out.data.len() >= bucket * width,
         "W4A16 at {rows} rows runs the {bucket}-row GEMM, which needs {} input and {} output \
          values; the buffers hold {} and {}",
         bucket * weight.cols,
-        bucket * weight.rows,
+        bucket * width,
         x.data.len(),
         out.data.len()
     );

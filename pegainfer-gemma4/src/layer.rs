@@ -297,14 +297,21 @@ pub(crate) fn attention_epilogue_into(
         &mut scratch.residual,
         &mut scratch.mlp_in,
     )?;
-    let (gate, up) = scratch.mlp.project(
+    if !layer.mlp.gate_up.gelu_mul_into(
         ctx,
-        &layer.mlp.gate_up,
         &scratch.mlp_in,
-        geom.intermediate_size,
         &mut scratch.linear,
-    )?;
-    ops::gelu_tanh_mul_batch_into(ctx, gate, up, &mut scratch.act)?;
+        &mut scratch.act,
+    )? {
+        let (gate, up) = scratch.mlp.project(
+            ctx,
+            &layer.mlp.gate_up,
+            &scratch.mlp_in,
+            geom.intermediate_size,
+            &mut scratch.linear,
+        )?;
+        ops::gelu_tanh_mul_batch_into(ctx, gate, up, &mut scratch.act)?;
+    }
     layer
         .mlp
         .down

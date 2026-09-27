@@ -2,7 +2,9 @@
 //! 31B linear shape: the load-time rewrite and dequantization bit-exact, the
 //! TileLang GEMMs at each row bucket (and at a count that pads into one, and
 //! one past the largest, which dequantizes) against a host product, a row's
-//! bits the same in every bucket, and a relaunch reproducing its output.
+//! bits the same in every bucket, and a relaunch reproducing its output. The
+//! gate|up shape's TileLang GEMMs write gelu(gate) * up, checked against the
+//! same activation of the host product.
 //!
 //! Without a device it skips; `PEGAINFER_REQUIRE_GPU=1` turns that into a
 //! failure. A build without the generated GEMMs skips with a message.
@@ -21,6 +23,8 @@ use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::HiddenStates;
 
 const GROUP: usize = 32;
+/// gate|up: two stacked halves whose TileLang GEMMs write the MLP activation.
+const GELU_MUL: (usize, usize) = (43008, 5376);
 const SHAPES: [(usize, usize); 6] = [
     (16384, 5376),
     (18432, 5376),
@@ -66,7 +70,7 @@ impl Checkpoint {
         out
     }
 
-    fn upload(&self, ctx: &DeviceContext, rows: usize, cols: usize) -> W4a16Matrix {
+    fn upload(&self, ctx: &DeviceContext, rows: usize, cols: usize, gelu_mul: bool) -> W4a16Matrix {
         let packed: Vec<u8> = self.packed.iter().flat_map(|w| w.to_le_bytes()).collect();
         let scales: Vec<u8> = self
             .scales
@@ -75,7 +79,7 @@ impl Checkpoint {
             .collect();
         let packed = ctx.stream.clone_htod(&packed).expect("packed upload");
         let scales = ctx.stream.clone_htod(&scales).expect("scales upload");
-        W4a16Matrix::from_checkpoint(ctx, &packed, &scales, rows, cols).expect("rewrite")
+        W4a16Matrix::from_checkpoint(ctx, &packed, &scales, rows, cols, gelu_mul).expect("rewrite")
     }
 }
 
@@ -85,6 +89,25 @@ fn host(ctx: &DeviceContext, states: &HiddenStates, rows: usize) -> Vec<f32> {
         .iter()
         .map(|v| v.to_f32())
         .collect()
+}
+
+/// gelu_pytorch_tanh(gate) * up from the two products, rounded as the
+/// activation kernel rounds its bf16 inputs and output.
+fn gelu_mul(gate: f32, up: f32) -> f32 {
+    let g = bf16::from_f32(gate).to_f32();
+    let u = bf16::from_f32(up).to_f32();
+    let inner = 0.797_884_6_f32 * (g + 0.044_715 * g * g * g);
+    let gelu = bf16::from_f32(0.5 * g * (1.0 + inner.tanh())).to_f32();
+    bf16::from_f32(gelu * u).to_f32()
+}
+
+/// Output columns of a step: gate|up's TileLang GEMMs write half as many.
+fn width(weight: &W4a16Matrix, rows: usize) -> usize {
+    if weight.gelu_mul && W4a16Matrix::runs_tilelang(rows) {
+        weight.rows / 2
+    } else {
+        weight.rows
+    }
 }
 
 /// `rows` rows of `x` through the GEMM into a 16-row-capacity output.
@@ -103,7 +126,7 @@ fn run(
         hidden_dim: weight.cols,
         seq_len: rows,
     };
-    let mut out = HiddenStates::zeros(ctx, weight.rows, capacity).expect("out");
+    let mut out = HiddenStates::zeros(ctx, width(weight, rows), capacity).expect("out");
     out.seq_len = rows;
     gemma4_w4a16_gemm_into(ctx, weight, &input, scratch, &mut out).expect("gemm");
     host(ctx, &out, rows)
@@ -122,7 +145,7 @@ fn w4a16_gemm_matches_its_definition_on_every_31b_shape() {
     let mut scratch = W4a16Scratch::new(&ctx, largest).expect("scratch");
     for (shape, &(n, k)) in SHAPES.iter().enumerate() {
         let checkpoint = Checkpoint::random(0x51A7 + shape as u64, n, k);
-        let weight = checkpoint.upload(&ctx, n, k);
+        let weight = checkpoint.upload(&ctx, n, k, (n, k) == GELU_MUL);
         let reference = checkpoint.weight(n, k);
 
         let mut dense = DeviceMatrix {
@@ -143,16 +166,24 @@ fn w4a16_gemm_matches_its_definition_on_every_31b_shape() {
 
         let x = common::fill(0xF00D + shape as u64, 20 * k);
         let mut first_rows: Vec<Vec<f32>> = Vec::new();
+        let product = |r: usize, c: usize| -> f32 {
+            (0..k)
+                .map(|i| x[r * k + i].to_f32() * reference[c * k + i].to_f32())
+                .sum()
+        };
         for rows in [1, 2, 3, 4, 8, 16, 20] {
             let y = run(&ctx, &weight, &x, rows, &mut scratch);
+            let w = width(&weight, rows);
             for r in 0..rows {
                 let mut worst = 0.0f32;
                 let mut peak = 0.0f32;
-                for c in (0..n).step_by(COL_STRIDE) {
-                    let want: f32 = (0..k)
-                        .map(|i| x[r * k + i].to_f32() * reference[c * k + i].to_f32())
-                        .sum();
-                    worst = worst.max((y[r * n + c] - want).abs());
+                for c in (0..w).step_by(COL_STRIDE) {
+                    let want = if w < n {
+                        gelu_mul(product(r, c), product(r, c + w))
+                    } else {
+                        product(r, c)
+                    };
+                    worst = worst.max((y[r * w + c] - want).abs());
                     peak = peak.max(want.abs());
                 }
                 assert!(
@@ -161,7 +192,7 @@ fn w4a16_gemm_matches_its_definition_on_every_31b_shape() {
                 );
             }
             if rows <= 16 {
-                first_rows.push(y[..n].to_vec());
+                first_rows.push(y[..w].to_vec());
             }
             if rows == 16 {
                 let again = run(&ctx, &weight, &x, rows, &mut scratch);

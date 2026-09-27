@@ -35,7 +35,10 @@ from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 CU_STEM = "gemma4_w4a16"
 LAUNCHER = "gemma4_w4a16_gemm"
 OCCUPANCY = "gemma4_w4a16_occupancy"
-PASS_CONFIGS = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}
+# No fast math: gate|up's epilogue computes the MLP activation, which has to
+# round as `gelu_tanh_mul_kernel` (compiled without it) does. The GEMMs'
+# bits and time are the same either way.
+PASS_CONFIGS = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False}
 
 # (n, k) of every text linear in the 31B tower: Q|K|V for the sliding and
 # global families, o_proj for each, gate|up and down.
@@ -48,6 +51,8 @@ SHAPES = [
     (43008, HIDDEN),
     (HIDDEN, 21504),
 ]
+# gate|up, whose GEMMs write gelu(gate) * up.
+GELU_MUL = (43008, HIDDEN)
 
 LAUNCHER_PARAMS = [
     ("void*", "x"),
@@ -104,7 +109,7 @@ def kernels(ctas: int) -> list[Kernel]:
 
         def build(arch: str, n=n, k=k, rows=rows):
             return tilelang.compile(
-                defs.gemm(n, k, rows, ctas),
+                defs.gemm(n, k, rows, ctas, gelu_mul=(n, k) == GELU_MUL),
                 target={"kind": "cuda", "arch": arch},
                 pass_configs=PASS_CONFIGS,
             )
