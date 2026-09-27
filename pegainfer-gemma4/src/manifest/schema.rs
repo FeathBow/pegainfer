@@ -17,10 +17,25 @@ use crate::nvfp4::PER_BYTE as FP4_PER_BYTE;
 /// from shadowing a required one.
 const TEXT_PREFIX: &str = "model.language_model.";
 
+pub(crate) const W4A16_GROUP: usize = 32;
+const W4A16_PER_I32: usize = 8;
+
 pub(crate) struct Matrix2d {
     pub(crate) name: String,
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    /// Where the checkpoint stores this matrix as W4A16 instead of as bf16
+    /// under `name`.
+    pub(crate) w4a16: Option<W4a16Tensors>,
+}
+
+/// compressed-tensors' pack-quantized form of one linear: eight four-bit
+/// values to an int32 along the input axis, a bf16 scale per 32 of them, and
+/// the logical `[rows, cols]`.
+pub(crate) struct W4a16Tensors {
+    pub(crate) packed: TypedTensor,
+    pub(crate) scale: TypedTensor,
+    pub(crate) shape: TypedTensor,
 }
 
 pub(crate) struct Vector1d {
@@ -99,6 +114,10 @@ pub(crate) struct LayerTensors {
 
 pub(crate) struct Manifest {
     pub(crate) embed_tokens: Matrix2d,
+    /// The W4A16 checkpoints also ship the tied head as a tensor of its own.
+    /// It is checked, not loaded: the config ties it, so the logits read the
+    /// embedding as the reference does.
+    pub(crate) lm_head: Option<Matrix2d>,
     pub(crate) norm: Vector1d,
     pub(crate) layers: Vec<LayerTensors>,
 }
@@ -147,7 +166,54 @@ impl fmt::Display for ExpectedShape {
 
 impl Matrix2d {
     fn new(name: String, rows: usize, cols: usize) -> Self {
-        Self { name, rows, cols }
+        Self {
+            name,
+            rows,
+            cols,
+            w4a16: None,
+        }
+    }
+
+    /// A text-tower linear at `prefix`, stored as the config says.
+    fn linear(config: &Gemma4Config, prefix: &str, rows: usize, cols: usize) -> Result<Self> {
+        let w4a16 = if config.w4a16 {
+            anyhow::ensure!(
+                cols.is_multiple_of(W4A16_GROUP),
+                "Gemma 4: '{prefix}' reduces over {cols} values, not a whole number of \
+                 {W4A16_GROUP}-value groups"
+            );
+            Some(W4a16Tensors {
+                packed: TypedTensor {
+                    name: format!("{prefix}.weight_packed"),
+                    shape: ExpectedShape::Matrix {
+                        rows,
+                        cols: cols / W4A16_PER_I32,
+                    },
+                    dtype: Dtype::I32,
+                },
+                scale: TypedTensor {
+                    name: format!("{prefix}.weight_scale"),
+                    shape: ExpectedShape::Matrix {
+                        rows,
+                        cols: cols / W4A16_GROUP,
+                    },
+                    dtype: Dtype::BF16,
+                },
+                shape: TypedTensor {
+                    name: format!("{prefix}.weight_shape"),
+                    shape: ExpectedShape::Vector { len: 2 },
+                    dtype: Dtype::I64,
+                },
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            name: format!("{prefix}.weight"),
+            rows,
+            cols,
+            w4a16,
+        })
     }
 
     fn expected(&self) -> ExpectedShape {
@@ -188,14 +254,23 @@ impl Manifest {
                 config.vocab_size,
                 hidden,
             ),
+            lm_head: config
+                .w4a16
+                .then(|| Matrix2d::new("lm_head.weight".to_string(), config.vocab_size, hidden)),
             norm: Vector1d::new(format!("{TEXT_PREFIX}norm.weight"), hidden),
             layers,
         })
     }
 
     pub(super) fn expected_tensors(&self) -> HashMap<&str, (ExpectedShape, Dtype)> {
-        fn matrix(m: &Matrix2d) -> (&str, (ExpectedShape, Dtype)) {
-            (m.name.as_str(), (m.expected(), EXPECTED_DTYPE))
+        fn matrix(m: &Matrix2d) -> Vec<(&str, (ExpectedShape, Dtype))> {
+            match &m.w4a16 {
+                None => vec![(m.name.as_str(), (m.expected(), EXPECTED_DTYPE))],
+                Some(q) => [&q.packed, &q.scale, &q.shape]
+                    .into_iter()
+                    .map(|t| (t.name.as_str(), (t.shape, t.dtype)))
+                    .collect(),
+            }
         }
         fn vector(v: &Vector1d) -> (&str, (ExpectedShape, Dtype)) {
             (v.name.as_str(), (v.expected(), EXPECTED_DTYPE))
@@ -204,7 +279,9 @@ impl Manifest {
             (t.name.as_str(), (t.shape, t.dtype))
         }
         let mut out = HashMap::new();
-        out.extend([matrix(&self.embed_tokens), vector(&self.norm)]);
+        out.extend(matrix(&self.embed_tokens));
+        out.extend(self.lm_head.iter().flat_map(matrix));
+        out.extend([vector(&self.norm)]);
         for layer in &self.layers {
             out.extend([
                 vector(&layer.input_layernorm),
@@ -214,24 +291,29 @@ impl Manifest {
                 vector(&layer.layer_scalar),
                 vector(&layer.attention.q_norm),
                 vector(&layer.attention.k_norm),
-                matrix(&layer.attention.q_proj),
-                matrix(&layer.attention.k_proj),
-                matrix(&layer.attention.o_proj),
-                matrix(&layer.mlp.gate),
-                matrix(&layer.mlp.up),
-                matrix(&layer.mlp.down),
             ]);
-            if let Some(v_proj) = &layer.attention.v_proj {
-                out.extend([matrix(v_proj)]);
+            for linear in [
+                Some(&layer.attention.q_proj),
+                Some(&layer.attention.k_proj),
+                layer.attention.v_proj.as_ref(),
+                Some(&layer.attention.o_proj),
+                Some(&layer.mlp.gate),
+                Some(&layer.mlp.up),
+                Some(&layer.mlp.down),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                out.extend(matrix(linear));
             }
             let Some(moe) = &layer.moe else {
                 continue;
             };
+            out.extend(matrix(&moe.router.proj));
             out.extend([
                 vector(&moe.pre_feedforward_layernorm_2),
                 vector(&moe.post_feedforward_layernorm_1),
                 vector(&moe.post_feedforward_layernorm_2),
-                matrix(&moe.router.proj),
                 vector(&moe.router.scale),
                 vector(&moe.router.per_expert_scale),
             ]);
@@ -379,6 +461,7 @@ impl LayerTensors {
         };
         let q_dim = projection_dim(config.num_attention_heads, "query")?;
         let kv_dim = projection_dim(kv_heads, "key/value")?;
+        let linear = |at: String, rows, cols| Matrix2d::linear(config, &at, rows, cols);
         Ok(Self {
             input_layernorm: Vector1d::new(format!("{prefix}input_layernorm.weight"), hidden),
             post_attention_layernorm: Vector1d::new(
@@ -395,36 +478,34 @@ impl LayerTensors {
             ),
             layer_scalar: Vector1d::new(format!("{prefix}layer_scalar"), 1),
             attention: AttentionTensors {
-                q_proj: Matrix2d::new(format!("{prefix}self_attn.q_proj.weight"), q_dim, hidden),
-                k_proj: Matrix2d::new(format!("{prefix}self_attn.k_proj.weight"), kv_dim, hidden),
+                q_proj: linear(format!("{prefix}self_attn.q_proj"), q_dim, hidden)?,
+                k_proj: linear(format!("{prefix}self_attn.k_proj"), kv_dim, hidden)?,
                 v_proj: match kind {
-                    LayerKind::Sliding => Some(Matrix2d::new(
-                        format!("{prefix}self_attn.v_proj.weight"),
-                        kv_dim,
-                        hidden,
-                    )),
+                    LayerKind::Sliding => {
+                        Some(linear(format!("{prefix}self_attn.v_proj"), kv_dim, hidden)?)
+                    }
                     LayerKind::Global => None,
                 },
-                o_proj: Matrix2d::new(format!("{prefix}self_attn.o_proj.weight"), hidden, q_dim),
+                o_proj: linear(format!("{prefix}self_attn.o_proj"), hidden, q_dim)?,
                 q_norm: Vector1d::new(format!("{prefix}self_attn.q_norm.weight"), head_dim),
                 k_norm: Vector1d::new(format!("{prefix}self_attn.k_norm.weight"), head_dim),
             },
             mlp: MlpTensors {
-                gate: Matrix2d::new(
-                    format!("{prefix}mlp.gate_proj.weight"),
+                gate: linear(
+                    format!("{prefix}mlp.gate_proj"),
                     config.intermediate_size,
                     hidden,
-                ),
-                up: Matrix2d::new(
-                    format!("{prefix}mlp.up_proj.weight"),
+                )?,
+                up: linear(
+                    format!("{prefix}mlp.up_proj"),
                     config.intermediate_size,
                     hidden,
-                ),
-                down: Matrix2d::new(
-                    format!("{prefix}mlp.down_proj.weight"),
+                )?,
+                down: linear(
+                    format!("{prefix}mlp.down_proj"),
                     hidden,
                     config.intermediate_size,
-                ),
+                )?,
             },
             moe: config
                 .moe
@@ -449,6 +530,7 @@ pub(crate) fn sample_config() -> Gemma4Config {
         layer_types: vec![LayerKind::Sliding, LayerKind::Sliding, LayerKind::Global],
         tie_word_embeddings: true,
         moe: None,
+        w4a16: false,
         rms_norm_eps: 1e-6,
         sliding_rope_theta: 10_000.0,
         sliding_window: 1024,

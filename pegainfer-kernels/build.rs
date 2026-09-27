@@ -1619,6 +1619,32 @@ const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     ),
 ];
 
+const GEMMA4_W4A16_TILELANG: TileLangFamily = TileLangFamily {
+    label: "GEMMA4_W4A16",
+    generator: "pegainfer-gemma4/kernels/w4a16_generate.py",
+    sources: &[
+        "pegainfer-gemma4/kernels/w4a16_defs.py",
+        "pegainfer-gemma4/kernels/generate.py",
+    ],
+    launchers: GEMMA4_W4A16_TILELANG_LAUNCHERS,
+    // Plain cp.async and mma.sync: Ampere and newer.
+    min_sm: 80,
+    // GEOMETRY is `ctas,block_n,block_k,warps`; the crate refuses a device
+    // whose SM count is not ctas / 2.
+    required_manifest: &["ARCH", "GEOMETRY", "SMEM"],
+};
+
+/// The decode GEMM over (x, packed weight, packed scales, output, stream-K
+/// partials, flags, fix-up table) dispatched on (n, k, rows), and the
+/// residency query the crate checks those kernels against.
+const GEMMA4_W4A16_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
+    (
+        "gemma4_w4a16_gemm",
+        "void*, int*, int*, void*, float*, int*, int*, int*, int, int, int",
+    ),
+    ("gemma4_w4a16_occupancy", "int, int, int, int*"),
+];
+
 const K3_TILELANG: TileLangFamily = TileLangFamily {
     label: "K3",
     generator: "pegainfer-k3/kernels/generate.py",
@@ -2663,6 +2689,15 @@ fn main() {
     if cfg!(feature = "gemma4") {
         nvcc_tasks.extend(tilelang_nvcc_tasks(
             &GEMMA4_TILELANG,
+            &out_dir,
+            &cuda_include,
+            &arch_args,
+            &sm_targets,
+            &nvcc,
+        ));
+        println!("cargo:rerun-if-env-changed=PEGAINFER_GEMMA4_W4A16_SMS");
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &GEMMA4_W4A16_TILELANG,
             &out_dir,
             &cuda_include,
             &arch_args,

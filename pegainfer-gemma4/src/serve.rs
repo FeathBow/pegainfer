@@ -26,7 +26,6 @@ use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::tensor::Columns;
 use pegainfer_core::tensor::DeviceContext;
-use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
@@ -47,6 +46,8 @@ use crate::layer::attention_epilogue_into;
 use crate::layer::build_proportional_rope_tables;
 use crate::weights::Gemma4Layer;
 use crate::weights::Gemma4Weights;
+use crate::weights::Linear;
+use crate::weights::LinearScratch;
 
 /// How a step feeds the preps. The tower above them is the same either way;
 /// only the metadata a prep reads changes.
@@ -454,21 +455,23 @@ impl Projections {
     fn project(
         &mut self,
         ctx: &DeviceContext,
-        qkv: &DeviceMatrix,
+        qkv: &Linear,
         x: &HiddenStates,
         q_dim: usize,
         kv_dim: usize,
+        linear: &mut LinearScratch,
     ) -> Result<Projected<'_>> {
-        let has_v = match qkv.rows.checked_sub(q_dim) {
+        let has_v = match qkv.rows().checked_sub(q_dim) {
             Some(rest) if rest == kv_dim => false,
             Some(rest) if rest == 2 * kv_dim => true,
             _ => anyhow::bail!(
                 "Q|K|V holds {} rows, neither {q_dim} + {kv_dim} nor {q_dim} + 2 x {kv_dim}",
-                qkv.rows
+                qkv.rows()
             ),
         };
         match self {
             Self::Separate { q, k, v } => {
+                let qkv = qkv.bf16()?;
                 q.hidden_dim = q_dim;
                 k.hidden_dim = kv_dim;
                 v.hidden_dim = kv_dim;
@@ -484,8 +487,8 @@ impl Projections {
                 })
             }
             Self::Fused(all) => {
-                all.hidden_dim = qkv.rows;
-                ops::gemm_rows_into_checked(ctx, qkv, 0, qkv.rows, x, all)?;
+                all.hidden_dim = qkv.rows();
+                qkv.project_into(ctx, x, linear, all)?;
                 Ok(Projected {
                     q: all.columns(0, q_dim),
                     k: all.columns(q_dim, kv_dim),
@@ -553,21 +556,32 @@ struct TowerScratch {
 }
 
 impl TowerScratch {
+    /// `w4a16_values` is the largest W4A16 linear's `rows * cols`, zero for
+    /// a bf16 checkpoint. The W4A16 GEMMs read and write whole row buckets,
+    /// so their buffers hold at least sixteen rows while carrying `max_rows`.
     fn new(
         ctx: &DeviceContext,
         local: &LayerGeometry,
         global: &LayerGeometry,
         max_rows: usize,
         fused: bool,
+        w4a16_values: usize,
     ) -> Result<Self> {
-        Ok(Self {
-            attn: AttnScratch::new(ctx, local, global, max_rows, fused)?,
-            epilogue: EpilogueScratch::new(ctx, local, max_rows, fused)?,
+        let capacity = if w4a16_values > 0 {
+            max_rows.max(16)
+        } else {
+            max_rows
+        };
+        let mut tower = Self {
+            attn: AttnScratch::new(ctx, local, global, capacity, fused)?,
+            epilogue: EpilogueScratch::new(ctx, local, capacity, fused, w4a16_values)?,
             hidden: [
-                HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
-                HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
+                HiddenStates::zeros(ctx, local.hidden_size, capacity)?,
+                HiddenStates::zeros(ctx, local.hidden_size, capacity)?,
             ],
-        })
+        };
+        tower.open(max_rows)?;
+        Ok(tower)
     }
 
     fn open(&mut self, seq_len: usize) -> Result<()> {
@@ -852,9 +866,10 @@ impl GemmaServe {
         self.tilelang_global_attn && self.local_pool.layout().storage == KvStorage::Bf16
     }
 
-    /// Whether the step projects through the stacked weights.
+    /// Whether the step projects through the stacked weights. A W4A16
+    /// linear only projects whole.
     fn fuses_projections(&self) -> bool {
-        self.tilelang_global_attn
+        self.tilelang_global_attn || self.weights.w4a16_values() > 0
     }
 
     /// Whether a whole-prompt pass over `rows` can take its scratch here: the
@@ -874,6 +889,7 @@ impl GemmaServe {
             &self.global_geom,
             rows,
             self.fuses_projections(),
+            self.weights.w4a16_values(),
         ) {
             Ok(_) => Ok(true),
             Err(e) if is_out_of_memory(&e) => Ok(false),
@@ -1185,6 +1201,7 @@ impl GemmaServe {
                 &self.global_geom,
                 max_rows,
                 self.fuses_projections(),
+                self.weights.w4a16_values(),
             )?,
             host: HostPlanningScratch::new(
                 self.local_pool.layout().page_size,
@@ -1548,10 +1565,14 @@ impl GemmaServe {
             geom.rms_norm_eps,
             &mut scratch.normed_x,
         );
-        let projected =
-            scratch
-                .proj
-                .project(ctx, &layer.attention.qkv, &scratch.normed_x, q_dim, kv_dim)?;
+        let projected = scratch.proj.project(
+            ctx,
+            &layer.attention.qkv,
+            &scratch.normed_x,
+            q_dim,
+            kv_dim,
+            &mut epilogue.linear,
+        )?;
         let v = projected
             .v
             .context("the sliding family projects V; this layer's rows hold none")?;
@@ -1750,10 +1771,14 @@ impl GemmaServe {
             geom.rms_norm_eps,
             &mut scratch.normed_x,
         );
-        let projected =
-            scratch
-                .proj
-                .project(ctx, &layer.attention.qkv, &scratch.normed_x, q_dim, kv_dim)?;
+        let projected = scratch.proj.project(
+            ctx,
+            &layer.attention.qkv,
+            &scratch.normed_x,
+            q_dim,
+            kv_dim,
+            &mut epilogue.linear,
+        )?;
         anyhow::ensure!(
             projected.v.is_none(),
             "global layer must not carry a v_proj; V is the k_proj fork"
@@ -2503,6 +2528,7 @@ impl GemmaServe {
             &self.global_geom,
             rows,
             self.fuses_projections(),
+            self.weights.w4a16_values(),
         )?;
         tower.open(rows)?;
         let src = self.run_tower(
@@ -2705,6 +2731,7 @@ impl GemmaServe {
             &self.global_geom,
             seq_len,
             self.fuses_projections(),
+            self.weights.w4a16_values(),
         )?;
         let ids = ctx
             .stream

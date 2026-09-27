@@ -17,7 +17,6 @@ use half::bf16;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::Columns;
 use pegainfer_core::tensor::DeviceContext;
-use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
@@ -25,6 +24,8 @@ use crate::config::Gemma4Config;
 use crate::config::MoeConfig;
 use crate::moe::MoeScratch;
 use crate::weights::Gemma4Layer;
+use crate::weights::Linear;
+use crate::weights::LinearScratch;
 
 /// The geometry a layer runs at, read off the validated config — the local
 /// and global kinds differ only in head width and KV head count.
@@ -136,6 +137,8 @@ pub(crate) struct EpilogueScratch {
     act: HiddenStates,
     down: HiddenStates,
     moe: Option<MoeScratch>,
+    /// Serves the attention projections too.
+    pub(crate) linear: LinearScratch,
 }
 
 /// Where gate and up land: buffers of their own, or one row per token
@@ -163,23 +166,25 @@ impl Activations {
     fn project(
         &mut self,
         ctx: &DeviceContext,
-        gate_up: &DeviceMatrix,
+        gate_up: &Linear,
         x: &HiddenStates,
         width: usize,
+        linear: &mut LinearScratch,
     ) -> Result<(Columns<'_>, Columns<'_>)> {
         anyhow::ensure!(
-            gate_up.rows == 2 * width,
+            gate_up.rows() == 2 * width,
             "gate|up holds {} rows, not 2 x {width}",
-            gate_up.rows
+            gate_up.rows()
         );
         match self {
             Self::Separate { gate, up } => {
+                let gate_up = gate_up.bf16()?;
                 ops::gemm_rows_into_checked(ctx, gate_up, 0, width, x, gate)?;
                 ops::gemm_rows_into_checked(ctx, gate_up, width, width, x, up)?;
                 Ok(((&*gate).into(), (&*up).into()))
             }
             Self::Fused(both) => {
-                ops::gemm_rows_into_checked(ctx, gate_up, 0, 2 * width, x, both)?;
+                gate_up.project_into(ctx, x, linear, both)?;
                 Ok((both.columns(0, width), both.columns(width, width)))
             }
         }
@@ -192,6 +197,7 @@ impl EpilogueScratch {
         geom: &LayerGeometry,
         max_rows: usize,
         fused: bool,
+        w4a16_values: usize,
     ) -> Result<Self> {
         let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
         let wide = |rows| HiddenStates::zeros(ctx, geom.intermediate_size, rows);
@@ -218,6 +224,7 @@ impl EpilogueScratch {
                 Some(_) => Some(MoeScratch::new(ctx, geom, max_rows)?),
                 None => None,
             },
+            linear: LinearScratch::new(ctx, w4a16_values)?,
         })
     }
 
@@ -274,14 +281,10 @@ pub(crate) fn attention_epilogue_into(
     );
     out.hidden_dim = geom.hidden_size;
     out.seq_len = seq_len;
-    ops::gemm_rows_into_checked(
-        ctx,
-        &layer.attention.o_proj,
-        0,
-        geom.hidden_size,
-        attn,
-        &mut scratch.attn_proj,
-    )?;
+    layer
+        .attention
+        .o_proj
+        .project_into(ctx, attn, &mut scratch.linear, &mut scratch.attn_proj)?;
     // The first normalized value and its residual sum still round to bf16
     // before the second reduction reads them.
     ops::rms_norm_add_rms_norm_round_batch_into(
@@ -299,16 +302,13 @@ pub(crate) fn attention_epilogue_into(
         &layer.mlp.gate_up,
         &scratch.mlp_in,
         geom.intermediate_size,
+        &mut scratch.linear,
     )?;
     ops::gelu_tanh_mul_batch_into(ctx, gate, up, &mut scratch.act)?;
-    ops::gemm_rows_into_checked(
-        ctx,
-        &layer.mlp.down,
-        0,
-        geom.hidden_size,
-        &scratch.act,
-        &mut scratch.down,
-    )?;
+    layer
+        .mlp
+        .down
+        .project_into(ctx, &scratch.act, &mut scratch.linear, &mut scratch.down)?;
     let feed_forward = match (&layer.moe, &mut scratch.moe) {
         (Some(moe), Some(moe_scratch)) => {
             crate::moe::moe_into(

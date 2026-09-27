@@ -137,4 +137,36 @@ unsafe extern "C" {
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;
+
+    /// The W4A16 decode GEMM `y[rows, n] = x[rows, k] @ W^T` for a weight
+    /// in the fragment layout of `gemma4_w4a16_pack_cuda`, from
+    /// `pegainfer-gemma4/kernels/w4a16_generate.py`. `rows` is a bucket (1, 2,
+    /// 4, 8 or 16): the kernels read and write that many rows. `part` holds
+    /// `ctas * rows * block_n` floats and `flags` `ctas` zeroed ints, which
+    /// the kernels leave zeroed; `fin_off` / `fin_list` are the stream-K
+    /// fix-up table for (n, k). Any (n, k, rows) the bodies were not built
+    /// for is refused.
+    pub fn gemma4_w4a16_gemm(
+        x: *mut c_void,
+        wq: *mut i32,
+        sq: *mut i32,
+        y: *mut c_void,
+        part: *mut f32,
+        flags: *mut i32,
+        fin_off: *mut i32,
+        fin_list: *mut i32,
+        n: i32,
+        k: i32,
+        rows: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// Blocks of the (n, k, rows) kernel one SM holds at once, into `blocks`.
+    pub fn gemma4_w4a16_occupancy(
+        n: i32,
+        k: i32,
+        rows: i32,
+        blocks: *mut i32,
+        stream: CUstream,
+    ) -> i32;
 }

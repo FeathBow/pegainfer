@@ -14,6 +14,7 @@ use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::mmap_shards;
+use pegainfer_kernels::ops::W4a16Matrix;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 
@@ -22,6 +23,7 @@ use super::Gemma4Layer;
 use super::Gemma4Mlp;
 use super::Gemma4Moe;
 use super::Gemma4Weights;
+use super::Linear;
 use super::StackedProjection;
 use crate::config::Gemma4Config;
 use crate::manifest::schema::ExpertTensors;
@@ -69,15 +71,28 @@ struct LayerSlots {
     pre_feedforward_layernorm: VecSlotId,
     post_feedforward_layernorm: VecSlotId,
     layer_scalar: f32,
+    /// Absent on a W4A16 checkpoint, whose linears load apart.
+    linears: Option<LinearSlots>,
+    q_norm: VecSlotId,
+    k_norm: VecSlotId,
+    /// The bf16 half of a routed layer.
+    moe: Option<MoeSlots>,
+}
+
+struct LinearSlots {
     /// Q, K and, on sliding layers, V as one row-stacked slot.
     qkv: SlotId,
     o_proj: SlotId,
-    q_norm: VecSlotId,
-    k_norm: VecSlotId,
     gate_up: SlotId,
     down: SlotId,
-    /// The bf16 half of a routed layer.
-    moe: Option<MoeSlots>,
+}
+
+/// One layer's W4A16 linears, resident in the GEMMs' layout.
+struct W4a16Linears {
+    qkv: W4a16Matrix,
+    o_proj: W4a16Matrix,
+    gate_up: W4a16Matrix,
+    down: W4a16Matrix,
 }
 
 struct MoeSlots {
@@ -175,6 +190,118 @@ fn read_scalar_bf16(shards: &[SafeTensors], name: &str) -> Result<f32> {
         }
     }
     anyhow::bail!("Gemma 4: tensor '{name}' missing from every shard")
+}
+
+fn tensor_bytes<'a>(shards: &'a [SafeTensors<'a>], name: &str) -> Result<&'a [u8]> {
+    shards
+        .iter()
+        .find_map(|shard| shard.tensor(name).ok())
+        .map(|view| view.data())
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: '{name}' is missing from every shard"))
+}
+
+/// Upload every layer's W4A16 linears in the GEMMs' layout: one entry per
+/// layer, empty on a bf16 checkpoint.
+fn upload_w4a16(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    manifest: &Manifest,
+) -> Result<Vec<Option<W4a16Linears>>> {
+    if manifest
+        .layers
+        .iter()
+        .all(|layer| layer.attention.q_proj.w4a16.is_none())
+    {
+        return Ok(manifest.layers.iter().map(|_| None).collect());
+    }
+    let mut stager = ByteWeightStager::new(ctx)?;
+    manifest
+        .layers
+        .iter()
+        .map(|layer| {
+            let attention = &layer.attention;
+            Ok(Some(W4a16Linears {
+                qkv: upload_w4a16_stacked(
+                    ctx,
+                    &mut stager,
+                    shards,
+                    [&attention.q_proj, &attention.k_proj]
+                        .into_iter()
+                        .chain(attention.v_proj.as_ref()),
+                )?,
+                o_proj: upload_w4a16_stacked(ctx, &mut stager, shards, [&attention.o_proj])?,
+                gate_up: upload_w4a16_stacked(
+                    ctx,
+                    &mut stager,
+                    shards,
+                    [&layer.mlp.gate, &layer.mlp.up],
+                )?,
+                down: upload_w4a16_stacked(ctx, &mut stager, shards, [&layer.mlp.down])?,
+            }))
+        })
+        .collect()
+}
+
+/// The parts' rows stacked in order: the checkpoint stores both tensors row
+/// major, so stacking rows is concatenating bytes.
+fn upload_w4a16_stacked<'m>(
+    ctx: &DeviceContext,
+    stager: &mut ByteWeightStager,
+    shards: &[SafeTensors],
+    parts: impl IntoIterator<Item = &'m Matrix2d>,
+) -> Result<W4a16Matrix> {
+    let parts: Vec<&Matrix2d> = parts.into_iter().collect();
+    let cols = parts
+        .first()
+        .map(|part| part.cols)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: a stacked W4A16 load needs at least one part"))?;
+    let mut packed = Vec::with_capacity(parts.len());
+    let mut scales = Vec::with_capacity(parts.len());
+    let mut rows = 0;
+    for part in &parts {
+        let tensors = part
+            .w4a16
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Gemma 4: '{}' is not W4A16", part.name))?;
+        anyhow::ensure!(
+            part.cols == cols,
+            "Gemma 4: '{}' reduces over {} values, the stack over {cols}",
+            part.name,
+            part.cols
+        );
+        let shape = tensor_bytes(shards, &tensors.shape.name)?;
+        let stated: Vec<i64> = shape
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
+            .collect();
+        anyhow::ensure!(
+            stated == [part.rows as i64, part.cols as i64],
+            "Gemma 4: '{}' states {stated:?}, the config implies [{}, {}]",
+            tensors.shape.name,
+            part.rows,
+            part.cols
+        );
+        packed.push(tensor_bytes(shards, &tensors.packed.name)?);
+        scales.push(tensor_bytes(shards, &tensors.scale.name)?);
+        rows += part.rows;
+    }
+    let mut packed_dev = ctx
+        .stream
+        .alloc_zeros::<u8>(packed.iter().map(|p| p.len()).sum())
+        .map_err(|e| anyhow::anyhow!("Gemma 4: cannot stage a W4A16 linear: {e}"))?;
+    stager
+        .upload(&packed, &mut packed_dev)
+        .map_err(|e| anyhow::anyhow!("Gemma 4: W4A16 weights did not upload: {e}"))?;
+    let mut scales_dev = ctx
+        .stream
+        .alloc_zeros::<u8>(scales.iter().map(|s| s.len()).sum())
+        .map_err(|e| anyhow::anyhow!("Gemma 4: cannot stage W4A16 scales: {e}"))?;
+    stager
+        .upload(&scales, &mut scales_dev)
+        .map_err(|e| anyhow::anyhow!("Gemma 4: W4A16 scales did not upload: {e}"))?;
+    W4a16Matrix::from_checkpoint(ctx, &packed_dev, &scales_dev, rows, cols)
 }
 
 /// One layer's experts, already stacked and resident.
@@ -359,17 +486,23 @@ fn record_plan(
             pre_feedforward_layernorm: record_vector(loader, &layer.pre_feedforward_layernorm)?,
             post_feedforward_layernorm: record_vector(loader, &layer.post_feedforward_layernorm)?,
             layer_scalar: read_scalar_bf16(shards, &layer.layer_scalar.name)?,
-            qkv: record_stacked(
-                loader,
-                [&attention.q_proj, &attention.k_proj]
-                    .into_iter()
-                    .chain(attention.v_proj.as_ref()),
-            )?,
-            o_proj: record_matrix(loader, &attention.o_proj)?,
+            linears: if attention.q_proj.w4a16.is_some() {
+                None
+            } else {
+                Some(LinearSlots {
+                    qkv: record_stacked(
+                        loader,
+                        [&attention.q_proj, &attention.k_proj]
+                            .into_iter()
+                            .chain(attention.v_proj.as_ref()),
+                    )?,
+                    o_proj: record_matrix(loader, &attention.o_proj)?,
+                    gate_up: record_stacked(loader, [&layer.mlp.gate, &layer.mlp.up])?,
+                    down: record_matrix(loader, &layer.mlp.down)?,
+                })
+            },
             q_norm: record_vector(loader, &attention.q_norm)?,
             k_norm: record_vector(loader, &attention.k_norm)?,
-            gate_up: record_stacked(loader, [&layer.mlp.gate, &layer.mlp.up])?,
-            down: record_matrix(loader, &layer.mlp.down)?,
             moe: layer
                 .moe
                 .as_ref()
@@ -411,11 +544,13 @@ fn materialize(
     plan: RecordedPlan,
     config: Gemma4Config,
     experts: Vec<Option<StackedExperts>>,
+    w4a16: Vec<Option<W4a16Linears>>,
 ) -> Result<Gemma4Weights> {
     anyhow::ensure!(
-        experts.len() == plan.layers.len(),
-        "Gemma 4: {} expert sets for {} layers",
+        experts.len() == plan.layers.len() && w4a16.len() == plan.layers.len(),
+        "Gemma 4: {} expert sets and {} W4A16 sets for {} layers",
         experts.len(),
+        w4a16.len(),
         plan.layers.len()
     );
     Ok(Gemma4Weights {
@@ -425,7 +560,26 @@ fn materialize(
             .layers
             .into_iter()
             .zip(experts)
-            .map(|(slots, experts)| -> Result<Gemma4Layer> {
+            .zip(w4a16)
+            .map(|((slots, experts), w4a16)| -> Result<Gemma4Layer> {
+                let (qkv, o_proj, gate_up, down) = match (slots.linears, w4a16) {
+                    (Some(linears), None) => (
+                        Linear::Bf16(loader.take(linears.qkv)),
+                        Linear::Bf16(loader.take(linears.o_proj)),
+                        Linear::Bf16(loader.take(linears.gate_up)),
+                        Linear::Bf16(loader.take(linears.down)),
+                    ),
+                    (None, Some(w)) => (
+                        Linear::W4a16(w.qkv),
+                        Linear::W4a16(w.o_proj),
+                        Linear::W4a16(w.gate_up),
+                        Linear::W4a16(w.down),
+                    ),
+                    // Both halves come from the same manifest.
+                    _ => anyhow::bail!(
+                        "Gemma 4: a layer has both or neither of bf16 and W4A16 linears"
+                    ),
+                };
                 Ok(Gemma4Layer {
                     input_layernorm: loader.take_vec(slots.input_layernorm),
                     post_attention_layernorm: loader.take_vec(slots.post_attention_layernorm),
@@ -433,15 +587,12 @@ fn materialize(
                     post_feedforward_layernorm: loader.take_vec(slots.post_feedforward_layernorm),
                     layer_scalar: slots.layer_scalar,
                     attention: Gemma4Attention {
-                        qkv: loader.take(slots.qkv),
-                        o_proj: loader.take(slots.o_proj),
+                        qkv,
+                        o_proj,
                         q_norm: loader.take_vec(slots.q_norm),
                         k_norm: loader.take_vec(slots.k_norm),
                     },
-                    mlp: Gemma4Mlp {
-                        gate_up: loader.take(slots.gate_up),
-                        down: loader.take(slots.down),
-                    },
+                    mlp: Gemma4Mlp { gate_up, down },
                     moe: match (slots.moe, experts) {
                         (Some(slots), Some(experts)) => Some(Gemma4Moe {
                             pre_feedforward_layernorm_2: loader
@@ -524,7 +675,8 @@ impl Gemma4Weights {
         let execute_and_drain_wall_ms = elapsed_ms(uploading);
 
         let experts = upload_experts(&ctx, &shards, &manifest)?;
-        let weights = materialize(&mut loader, plan, config, experts)?;
+        let w4a16 = upload_w4a16(&ctx, &shards, &manifest)?;
+        let weights = materialize(&mut loader, plan, config, experts, w4a16)?;
         drop(loader);
         drop(prefetch);
         let device_free_bytes = free_device_bytes()?;

@@ -11,6 +11,8 @@ mod embedding;
 mod gemma4;
 #[cfg(feature = "gemma4")]
 mod gemma4_tilelang;
+#[cfg(feature = "gemma4")]
+mod gemma4_w4a16;
 #[cfg(feature = "glm52")]
 mod glm52;
 #[cfg(feature = "k3")]
@@ -144,6 +146,14 @@ pub use gemma4_tilelang::gemma4_hd512_prefill_is_built;
 pub use gemma4_tilelang::gemma4_hd512_prefill_smem;
 #[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::gemma4_hd512_prefill_varlen_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::W4a16Matrix;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::W4a16Scratch;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::gemma4_w4a16_gemm_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::gemma4_w4a16_geometry;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "k3")]

@@ -128,4 +128,27 @@ unsafe extern "C" {
         window_left: i32,
         stream: CUstream,
     ) -> i32;
+
+    /// A compressed-tensors W4A16 linear (`packed` [n, k / 8] int32 words,
+    /// `scales` [n, k / 32] bf16) rewritten into the TileLang GEMMs' fragment
+    /// layout: `wq` [n / 16, k / 64, 32, 4] and `sq` [n / 16, k / 32, 8].
+    pub fn gemma4_w4a16_pack_cuda(
+        packed: *const u32,
+        scales: *const u16,
+        wq: *mut u32,
+        sq: *mut u32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// The fragment layout back to a bf16 `[n, k]` matrix.
+    pub fn gemma4_w4a16_dequant_cuda(
+        wq: *const u32,
+        sq: *const u32,
+        out: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
