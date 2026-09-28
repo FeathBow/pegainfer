@@ -169,7 +169,7 @@ impl Activations {
         gate_up: &Linear,
         x: &HiddenStates,
         width: usize,
-        linear: &mut LinearScratch,
+        linear: &LinearScratch,
     ) -> Result<(Columns<'_>, Columns<'_>)> {
         anyhow::ensure!(
             gate_up.rows() == 2 * width,
@@ -197,7 +197,7 @@ impl EpilogueScratch {
         geom: &LayerGeometry,
         max_rows: usize,
         fused: bool,
-        w4a16_values: usize,
+        linear: LinearScratch,
     ) -> Result<Self> {
         let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
         let wide = |rows| HiddenStates::zeros(ctx, geom.intermediate_size, rows);
@@ -224,7 +224,7 @@ impl EpilogueScratch {
                 Some(_) => Some(MoeScratch::new(ctx, geom, max_rows)?),
                 None => None,
             },
-            linear: LinearScratch::new(ctx, w4a16_values)?,
+            linear,
         })
     }
 
@@ -284,7 +284,7 @@ pub(crate) fn attention_epilogue_into(
     layer
         .attention
         .o_proj
-        .project_into(ctx, attn, &mut scratch.linear, &mut scratch.attn_proj)?;
+        .project_into(ctx, attn, &scratch.linear, &mut scratch.attn_proj)?;
     // The first normalized value and its residual sum still round to bf16
     // before the second reduction reads them.
     ops::rms_norm_add_rms_norm_round_batch_into(
@@ -297,25 +297,24 @@ pub(crate) fn attention_epilogue_into(
         &mut scratch.residual,
         &mut scratch.mlp_in,
     )?;
-    if !layer.mlp.gate_up.gelu_mul_into(
-        ctx,
-        &scratch.mlp_in,
-        &mut scratch.linear,
-        &mut scratch.act,
-    )? {
+    if !layer
+        .mlp
+        .gate_up
+        .gelu_mul_into(ctx, &scratch.mlp_in, &scratch.linear, &mut scratch.act)?
+    {
         let (gate, up) = scratch.mlp.project(
             ctx,
             &layer.mlp.gate_up,
             &scratch.mlp_in,
             geom.intermediate_size,
-            &mut scratch.linear,
+            &scratch.linear,
         )?;
         ops::gelu_tanh_mul_batch_into(ctx, gate, up, &mut scratch.act)?;
     }
     layer
         .mlp
         .down
-        .project_into(ctx, &scratch.act, &mut scratch.linear, &mut scratch.down)?;
+        .project_into(ctx, &scratch.act, &scratch.linear, &mut scratch.down)?;
     let feed_forward = match (&layer.moe, &mut scratch.moe) {
         (Some(moe), Some(moe_scratch)) => {
             crate::moe::moe_into(

@@ -1,5 +1,9 @@
 //! Resident Gemma 4 text-tower weights.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use pegainfer_core::ops;
@@ -128,12 +132,12 @@ impl Linear {
         &self,
         ctx: &DeviceContext,
         x: &HiddenStates,
-        scratch: &mut LinearScratch,
+        scratch: &LinearScratch,
         out: &mut HiddenStates,
     ) -> Result<bool> {
-        match (self, &mut scratch.0) {
+        match (self, &scratch.0) {
             (Self::W4a16(m), Some(w4)) if m.gelu_mul && W4a16Matrix::runs_tilelang(x.seq_len) => {
-                pegainfer_kernels::ops::gemma4_w4a16_gemm_into(ctx, m, x, w4, out)?;
+                pegainfer_kernels::ops::gemma4_w4a16_gemm_into(ctx, m, x, &mut *lock(w4)?, out)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -145,13 +149,13 @@ impl Linear {
         &self,
         ctx: &DeviceContext,
         x: &HiddenStates,
-        scratch: &mut LinearScratch,
+        scratch: &LinearScratch,
         out: &mut HiddenStates,
     ) -> Result<()> {
-        match (self, &mut scratch.0) {
+        match (self, &scratch.0) {
             (Self::Bf16(m), _) => ops::gemm_rows_into_checked(ctx, m, 0, m.rows, x, out),
             (Self::W4a16(m), Some(w4)) => {
-                pegainfer_kernels::ops::gemma4_w4a16_gemm_into(ctx, m, x, w4, out)
+                pegainfer_kernels::ops::gemma4_w4a16_gemm_into(ctx, m, x, &mut *lock(w4)?, out)
             }
             (Self::W4a16(_), None) => {
                 anyhow::bail!("a W4A16 linear needs the scratch built for W4A16 weights")
@@ -161,19 +165,33 @@ impl Linear {
 }
 
 /// The W4A16 GEMMs' stream-K scratch and dequantization matrix, held only
-/// when the weights are W4A16.
-pub(crate) struct LinearScratch(Option<W4a16Scratch>);
+/// when the weights are W4A16. One per engine, shared by every step's tower:
+/// the matrix is as large as the largest linear, and every W4A16 step runs on
+/// the stream that built the pools (the async lane, the one step on another
+/// stream, refuses W4A16 checkpoints), so the calls are in stream order.
+#[derive(Clone)]
+pub(crate) struct LinearScratch(Option<Arc<Mutex<W4a16Scratch>>>);
 
 impl LinearScratch {
     /// `w4a16_values` is the largest W4A16 linear's `rows * cols`, zero for a
     /// bf16 checkpoint.
     pub(crate) fn new(ctx: &DeviceContext, w4a16_values: usize) -> Result<Self> {
         Ok(Self(if w4a16_values > 0 {
-            Some(W4a16Scratch::new(ctx, w4a16_values)?)
+            Some(Arc::new(Mutex::new(W4a16Scratch::new(ctx, w4a16_values)?)))
         } else {
             None
         }))
     }
+
+    pub(crate) fn is_w4a16(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+fn lock(scratch: &Mutex<W4a16Scratch>) -> Result<MutexGuard<'_, W4a16Scratch>> {
+    scratch
+        .lock()
+        .map_err(|_| anyhow::anyhow!("a W4A16 GEMM panicked while holding the scratch"))
 }
 
 pub(crate) struct Gemma4Attention {
