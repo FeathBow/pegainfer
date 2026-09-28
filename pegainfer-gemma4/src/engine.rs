@@ -714,6 +714,12 @@ impl ServingKnobs {
             tilelang_geometry_refusal(config)?;
         }
         anyhow::ensure!(
+            !config.w4a16 || lane_mode.is_none(),
+            "{ASYNC_PREFILL_ENV} cannot serve a W4A16 checkpoint: its decode GEMMs finish split \
+             tiles in-kernel and need every CTA resident across the whole device, which a lane \
+             prefill beside the decode stream does not leave them"
+        );
+        anyhow::ensure!(
             admit_coalesce.is_none() || lane_mode.is_none(),
             "{ADMIT_COALESCE_ENV} and {ASYNC_PREFILL_ENV} cannot combine: the lane flies one \
              prefill at a time, so the door could only delay it"

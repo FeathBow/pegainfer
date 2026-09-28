@@ -6,8 +6,8 @@
 //! gate|up shape's TileLang GEMMs write gelu(gate) * up, checked against the
 //! same activation of the host product.
 //!
-//! Without a device it skips; `PEGAINFER_REQUIRE_GPU=1` turns that into a
-//! failure. A build without the generated GEMMs skips with a message.
+//! Without a device, or in a build without the generated GEMMs, it skips;
+//! `PEGAINFER_REQUIRE_GPU=1` turns either into a failure.
 
 #![cfg(feature = "gemma4")]
 
@@ -138,6 +138,10 @@ fn w4a16_gemm_matches_its_definition_on_every_31b_shape() {
         return;
     };
     if gemma4_w4a16_geometry().is_none() {
+        assert!(
+            std::env::var("PEGAINFER_REQUIRE_GPU").as_deref() != Ok("1"),
+            "PEGAINFER_REQUIRE_GPU=1 but this build carries no W4A16 GEMMs"
+        );
         eprintln!("skipping: this build carries no W4A16 GEMMs");
         return;
     }

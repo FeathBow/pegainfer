@@ -140,7 +140,8 @@ unsafe extern "C" {
 
     /// The W4A16 decode GEMM `y[rows, n] = x[rows, k] @ W^T` for a weight
     /// in the fragment layout of `gemma4_w4a16_pack_cuda`, from
-    /// `pegainfer-gemma4/kernels/w4a16_generate.py`. `rows` is a bucket (1, 2,
+    /// `pegainfer-gemma4/kernels/w4a16_generate.py`; for the interleaved
+    /// gate|up shape `y` is `[rows, n / 2]`, gelu(gate) * up. `rows` is a bucket (1, 2,
     /// 4, 8 or 16): the kernels read and write that many rows. `part` holds
     /// `ctas * rows * block_n` floats and `flags` `ctas` zeroed ints, which
     /// the kernels leave zeroed; `fin_off` / `fin_list` are the stream-K

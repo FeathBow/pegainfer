@@ -1797,7 +1797,9 @@ fn tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
 }
 
 /// Parse the `KEY=VALUE` contract the generator prints on stdout and mirrors
-/// into `manifest.txt`: one `CU_PATH` per emitted translation unit, the two
+/// into `manifest.txt` (a generator that cannot lower for this build prints
+/// one `UNAVAILABLE=<reason>` line instead, and the family takes the stub
+/// tier): one `CU_PATH` per emitted translation unit, the two
 /// header roots the generated CUDA includes, and the arch the bodies were
 /// lowered for. Paths resolve against `base`, the directory the manifest
 /// describes, so a vendored directory answers for its own files wherever it
@@ -2004,8 +2006,18 @@ fn generate_tilelang_artifacts(
         String::from_utf8_lossy(&output.stderr).trim(),
     );
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(reason) = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("UNAVAILABLE="))
+    {
+        println!(
+            "cargo:warning={label} TileLang generation unavailable: {reason}; its launchers are NOT_SUPPORTED stubs"
+        );
+        return None;
+    }
     let mut artifacts = parse_tilelang_manifest(
-        &String::from_utf8_lossy(&output.stdout),
+        &stdout,
         &format!("the {label} TileLang generator"),
         &artifact_dir,
     );

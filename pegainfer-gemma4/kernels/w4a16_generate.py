@@ -82,17 +82,16 @@ def isolate_debug_helpers(preamble: str) -> str:
     )
 
 
-def sm_count() -> int:
+def sm_count() -> int | None:
+    """The serving device's SM count, `None` when neither the variable nor a
+    visible device says it."""
     stated = os.environ.get("PEGAINFER_GEMMA4_W4A16_SMS")
     if stated:
         return int(stated)
     import torch
 
     if not torch.cuda.is_available():
-        raise SystemExit(
-            "the W4A16 kernels are compiled for one CTA count: set PEGAINFER_GEMMA4_W4A16_SMS to the "
-            "serving device's SM count, or build where the device is visible"
-        )
+        return None
     return torch.cuda.get_device_properties(0).multi_processor_count
 
 
@@ -175,7 +174,18 @@ def main() -> None:
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ctas = 2 * sm_count()
+    sms = sm_count()
+    if sms is None:
+        # The CTA count is part of the kernels, so without it there is
+        # nothing to lower; build.rs links the stub tier and a W4A16
+        # checkpoint is refused at load.
+        print(
+            "UNAVAILABLE=the kernels are compiled for one CTA count: set "
+            "PEGAINFER_GEMMA4_W4A16_SMS to the serving device's SM count, or build where "
+            "the device is visible"
+        )
+        return
+    ctas = 2 * sms
     specs = kernels(ctas)
     launcher = Launcher(
         name=LAUNCHER,

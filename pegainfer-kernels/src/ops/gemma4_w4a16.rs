@@ -84,7 +84,8 @@ impl W4a16Matrix {
     ) -> Result<Self> {
         let (ctas, block_n, block_k, _) = gemma4_w4a16_geometry().context(
             "this build carries no W4A16 GEMMs: build with the gemma4 feature where TileLang is \
-             installed",
+             installed, and with the serving device visible or PEGAINFER_GEMMA4_W4A16_SMS set to \
+             its SM count",
         )?;
         check_device(ctx, ctas, rows, cols)?;
         ensure!(
