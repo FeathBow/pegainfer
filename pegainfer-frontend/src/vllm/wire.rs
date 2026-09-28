@@ -18,15 +18,21 @@ use crate::sampler::SamplingParams;
 
 pub(crate) const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 
-/// One position as vLLM's logprob tensors lay it out: the scored token, then
-/// all `k` of the vocabulary top-k even when the scored token is among them.
-/// Every row of a payload is therefore `k + 1` wide, which the encoder
-/// requires; vLLM's dictionary keeps one entry per token.
+/// A sampled position: the chosen token, then its top-k without repeating it.
+/// The chat renderer takes the first `k` entries as the alternatives, so a
+/// repeat would push out a real candidate.
 pub(crate) fn to_wire_position_logprobs(
     token_id: u32,
     logprob: Option<TokenLogprob>,
 ) -> Option<PositionLogprobs> {
-    let lp = logprob?;
+    Some(position_logprobs(token_id, logprob?, false))
+}
+
+/// The scored token, then its top-k. A prompt position keeps a repeat of the
+/// scored token (`keep_repeat`): the encoder needs every row of one payload
+/// equally wide, and prompt positions render as per-token maps, where the
+/// repeat collapses.
+fn position_logprobs(token_id: u32, lp: TokenLogprob, keep_repeat: bool) -> PositionLogprobs {
     let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
     entries.push(WireTokenLogprob {
         token_id,
@@ -34,13 +40,16 @@ pub(crate) fn to_wire_position_logprobs(
         rank: lp.rank,
     });
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
+        if !keep_repeat && alt_id == token_id {
+            continue;
+        }
         entries.push(WireTokenLogprob {
             token_id: alt_id,
             logprob: alt_logprob,
             rank: (index + 1) as u32,
         });
     }
-    Some(PositionLogprobs { entries })
+    PositionLogprobs { entries }
 }
 
 /// The engine includes the unscored leading token; vLLM restores it itself.
@@ -70,7 +79,8 @@ pub(crate) fn to_wire_prompt_logprobs(prompt: PromptEcho) -> Result<Option<Maybe
         .enumerate()
         .skip(1)
         .map(|(index, (id, logprob))| {
-            to_wire_position_logprobs(id, logprob)
+            logprob
+                .map(|lp| position_logprobs(id, lp, true))
                 .with_context(|| format!("missing prompt logprob at position {index}"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -398,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn to_wire_logprobs_keeps_the_sampled_token_inside_its_top_k() {
+    fn to_wire_logprobs_emits_sampled_then_alternatives() {
         let lp = TokenLogprob {
             rank: 1,
             logprob: -0.5,
@@ -411,9 +421,13 @@ mod tests {
         };
         assert_eq!(direct.positions.len(), 1);
         let entries = &direct.positions[0].entries;
-        let ids: Vec<_> = entries.iter().map(|e| (e.token_id, e.rank)).collect();
-        assert_eq!(ids, vec![(7, 1), (7, 1), (42, 2)]);
-        assert_logprob_eq(entries[2].logprob, -1.5);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].token_id, 7);
+        assert_logprob_eq(entries[0].logprob, -0.5);
+        assert_eq!(entries[0].rank, 1);
+        assert_eq!(entries[1].token_id, 42);
+        assert_logprob_eq(entries[1].logprob, -1.5);
+        assert_eq!(entries[1].rank, 2);
     }
 
     #[test]
