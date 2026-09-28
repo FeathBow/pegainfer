@@ -18,6 +18,10 @@ use crate::sampler::SamplingParams;
 
 pub(crate) const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 
+/// One position as vLLM's logprob tensors lay it out: the scored token, then
+/// all `k` of the vocabulary top-k even when the scored token is among them.
+/// Every row of a payload is therefore `k + 1` wide, which the encoder
+/// requires; vLLM's dictionary keeps one entry per token.
 pub(crate) fn to_wire_position_logprobs(
     token_id: u32,
     logprob: Option<TokenLogprob>,
@@ -30,9 +34,6 @@ pub(crate) fn to_wire_position_logprobs(
         rank: lp.rank,
     });
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
-        if alt_id == token_id {
-            continue;
-        }
         entries.push(WireTokenLogprob {
             token_id: alt_id,
             logprob: alt_logprob,
@@ -397,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn to_wire_logprobs_emits_sampled_then_alternatives() {
+    fn to_wire_logprobs_keeps_the_sampled_token_inside_its_top_k() {
         let lp = TokenLogprob {
             rank: 1,
             logprob: -0.5,
@@ -410,13 +411,9 @@ mod tests {
         };
         assert_eq!(direct.positions.len(), 1);
         let entries = &direct.positions[0].entries;
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].token_id, 7);
-        assert_logprob_eq(entries[0].logprob, -0.5);
-        assert_eq!(entries[0].rank, 1);
-        assert_eq!(entries[1].token_id, 42);
-        assert_logprob_eq(entries[1].logprob, -1.5);
-        assert_eq!(entries[1].rank, 2);
+        let ids: Vec<_> = entries.iter().map(|e| (e.token_id, e.rank)).collect();
+        assert_eq!(ids, vec![(7, 1), (7, 1), (42, 2)]);
+        assert_logprob_eq(entries[2].logprob, -1.5);
     }
 
     #[test]
@@ -472,6 +469,29 @@ mod tests {
             })
             .collect();
         assert_eq!(scored, vec![8, 7]);
+    }
+
+    #[test]
+    fn prompt_rows_keep_one_width_whether_or_not_the_token_is_in_the_top_k() {
+        let scored = |top: Vec<(u32, f32)>| TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: top,
+        };
+        let prompt = PromptEcho {
+            ids: vec![9, 8, 7],
+            logprobs: vec![
+                None,
+                Some(scored(vec![(8, -0.5), (3, -2.0)])),
+                Some(scored(vec![(4, -0.1), (5, -2.0)])),
+            ],
+        };
+        let Some(MaybeWireLogprobs::Direct(payload)) = to_wire_prompt_logprobs(prompt).unwrap()
+        else {
+            panic!("expected direct prompt logprobs");
+        };
+        let widths: Vec<_> = payload.positions.iter().map(|p| p.entries.len()).collect();
+        assert_eq!(widths, vec![3, 3]);
     }
 
     #[test]
