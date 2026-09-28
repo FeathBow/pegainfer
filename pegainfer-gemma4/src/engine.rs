@@ -763,7 +763,7 @@ struct Walker {
     kv: GemmaKv,
     resumed: Option<u64>,
     offset: usize,
-    first: Option<(u32, Option<TokenLogprob>)>,
+    first: Option<SampledToken>,
     failed: bool,
 }
 
@@ -815,9 +815,7 @@ enum PreparedNewcomer {
     Requeue(QueuedRequest),
 }
 
-/// One row of a step's sampler call. A mid-walk segment's row is sampled and
-/// discarded, so it carries `ignore_eos` whatever its request asked and a
-/// `logprobs` of 0: it never stops and is never scored.
+/// One row of a step's sampler call.
 #[derive(Clone, Copy)]
 struct SampleRow<'a> {
     params: &'a pegainfer_frontend::sampler::SamplingParams,
@@ -826,11 +824,59 @@ struct SampleRow<'a> {
     ignore_eos: bool,
 }
 
+impl<'a> SampleRow<'a> {
+    /// The row that samples `request`'s completion token number `step`.
+    fn of(request: &'a Request, step: u64) -> Self {
+        Self {
+            params: &request.params,
+            step,
+            logprobs: request.logprobs,
+            ignore_eos: request.params.ignore_eos,
+        }
+    }
+
+    /// A mid-walk segment's row, sampled and discarded: it never stops and is
+    /// never scored.
+    fn discarded(request: &'a Request) -> Self {
+        Self {
+            logprobs: None,
+            ignore_eos: true,
+            ..Self::of(request, 0)
+        }
+    }
+}
+
+/// The per-call sampler seed: the engine's base seed mixed with a counter
+/// every sampler call advances, the staged greedy ones that take no seed
+/// included. Seedless sampling variety across requests comes from it; a
+/// request's own `params.seed` replays via (seed, step) regardless of it.
+struct SampleSeed {
+    base: u64,
+    nonce: u64,
+}
+
+impl SampleSeed {
+    fn next_call(&mut self) -> u64 {
+        self.nonce = self.nonce.wrapping_add(1);
+        self.base ^ self.nonce.rotate_left(17)
+    }
+}
+
 /// One sampler call's outcome, row-aligned with the logits it read.
 struct SampledRows {
     picked: Vec<u32>,
     logprobs: Vec<Option<TokenLogprob>>,
     stops: Vec<bool>,
+}
+
+impl SampledRows {
+    fn token(&mut self, row: usize) -> SampledToken {
+        SampledToken {
+            id: self.picked[row],
+            logprob: self.logprobs[row].take(),
+            stop: self.stops[row],
+        }
+    }
 }
 
 /// Suppress, sample and score one step's logits, with the failed stage on the
@@ -842,15 +888,13 @@ fn sample_logits_rows(
     suppress_ids: &ops::SuppressIds,
     policy: &GenerationPolicy,
     scratch: &mut SampleScratch,
-    base_seed: u64,
-    sample_nonce: &mut u64,
+    seed: &mut SampleSeed,
     rows: &[SampleRow<'_>],
     logits: &mut HiddenStates,
 ) -> Result<SampledRows> {
     ops::suppress_logits_bf16_in_place(ctx, logits, suppress_ids).context("suppression")?;
 
-    *sample_nonce = sample_nonce.wrapping_add(1);
-    let call_seed = base_seed ^ sample_nonce.rotate_left(17);
+    let call_seed = seed.next_call();
     let picked = {
         let params: Vec<_> = rows.iter().map(|row| row.params).collect();
         let steps: Vec<u64> = rows.iter().map(|row| row.step).collect();
@@ -947,8 +991,7 @@ fn mixed_head_flow(
     suppress_ids: &ops::SuppressIds,
     policy: &GenerationPolicy,
     scratch: &mut SampleScratch,
-    base_seed: u64,
-    sample_nonce: &mut u64,
+    seed: &mut SampleSeed,
     head: &[SampleRow<'_>],
     active: &mut Vec<Active>,
     logits: &mut HiddenStates,
@@ -961,16 +1004,7 @@ fn mixed_head_flow(
             .copied()
             .chain(active.iter().map(|entry| entry.sample_row(ledger)))
             .collect();
-        sample_logits_rows(
-            ctx,
-            suppress_ids,
-            policy,
-            scratch,
-            base_seed,
-            sample_nonce,
-            &rows,
-            logits,
-        )
+        sample_logits_rows(ctx, suppress_ids, policy, scratch, seed, &rows, logits)
     };
     let mut sampled = match sampled {
         Ok(sampled) => sampled,
@@ -997,22 +1031,22 @@ struct Active {
 
 impl Active {
     fn sample_row(&self, ledger: &RequestLedger) -> SampleRow<'_> {
-        SampleRow {
-            params: &self.request.request.params,
-            step: ledger.completion_tokens(self.request.id) as u64,
-            logprobs: self.request.request.logprobs,
-            ignore_eos: self.request.request.params.ignore_eos,
-        }
+        SampleRow::of(
+            &self.request.request,
+            ledger.completion_tokens(self.request.id) as u64,
+        )
     }
 
+    /// A staged greedy pick never went through [`sample_logits_rows`], so its
+    /// stop is decided here, by the same rule.
     fn settle_staged(&mut self, policy: &GenerationPolicy, token: u32, ledger: &mut RequestLedger) {
         if self.stopping {
             return;
         }
         let stop = policy.stops(token, self.request.request.params.ignore_eos);
-        self.stopping = deliver_decode_row(
+        self.stopping = settle_token(
             self,
-            DecodeToken {
+            SampledToken {
                 id: token,
                 logprob: None,
                 stop,
@@ -1060,11 +1094,7 @@ struct EngineState {
     /// Validated once against the head, then retained on-device for one mask
     /// launch per logits batch.
     suppress_ids: ops::SuppressIds,
-    base_seed: u64,
-    /// Seedless sampling variety across requests comes from this counter
-    /// mixed into the per-call seed; a request's own `params.seed` replays
-    /// via (seed, step) regardless of it.
-    sample_nonce: u64,
+    seed: SampleSeed,
     /// Present only while the active row order is frozen.
     pipeline: Option<PendingDecode>,
     /// Captured suppression, argmax and id-copy chain per decode bucket.
@@ -1451,8 +1481,10 @@ impl EngineState {
             prefix_cache,
             policy,
             suppress_ids,
-            base_seed,
-            sample_nonce: 0,
+            seed: SampleSeed {
+                base: base_seed,
+                nonce: 0,
+            },
             pipeline: None,
             sampler_graphs,
             lane,
@@ -1702,24 +1734,15 @@ impl EngineState {
         echo: Option<PromptEcho>,
         ledger: &mut RequestLedger,
     ) -> Admitted {
-        let sampled = {
-            let rows = [SampleRow {
-                params: &request.request.params,
-                step: 0,
-                logprobs: request.request.logprobs,
-                ignore_eos: request.request.params.ignore_eos,
-            }];
-            sample_logits_rows(
-                &self.ctx,
-                &self.suppress_ids,
-                &self.policy,
-                &mut self.scratch,
-                self.base_seed,
-                &mut self.sample_nonce,
-                &rows,
-                logits,
-            )
-        };
+        let sampled = sample_logits_rows(
+            &self.ctx,
+            &self.suppress_ids,
+            &self.policy,
+            &mut self.scratch,
+            &mut self.seed,
+            &[SampleRow::of(&request.request, 0)],
+            logits,
+        );
         let mut sampled = match sampled {
             Ok(sampled) => sampled,
             Err(err) => {
@@ -1728,15 +1751,7 @@ impl EngineState {
                 return Admitted::Done;
             }
         };
-        match settle_first_token(
-            &self.policy,
-            request,
-            kv,
-            sampled.picked[0],
-            sampled.logprobs[0].take(),
-            echo,
-            ledger,
-        ) {
+        match settle_first_token(request, kv, sampled.token(0), echo, ledger) {
             Some(entry) => Admitted::Active(Box::new(entry)),
             None => Admitted::Done,
         }
@@ -1905,25 +1920,18 @@ impl EngineState {
             }
         };
         walker.offset = walker.request.request.prompt_tokens.len();
-        let head = [SampleRow {
-            params: &walker.request.request.params,
-            step: 0,
-            logprobs: walker.request.request.logprobs,
-            ignore_eos: walker.request.request.params.ignore_eos,
-        }];
         let mut sampled = mixed_head_flow(
             &self.ctx,
             &self.suppress_ids,
             &self.policy,
             &mut self.scratch,
-            self.base_seed,
-            &mut self.sample_nonce,
-            &head,
+            &mut self.seed,
+            &[SampleRow::of(&walker.request.request, 0)],
             active,
             &mut logits,
             ledger,
         )?;
-        walker.first = Some((sampled.picked[0], sampled.logprobs[0].take()));
+        walker.first = Some(sampled.token(0));
         Ok(())
     }
 
@@ -2025,15 +2033,10 @@ impl EngineState {
                     &mut walker.kv,
                     &request.prompt_tokens[walker.offset..walker.offset + take],
                 ));
-                head.push(SampleRow {
-                    params: &request.params,
-                    step: 0,
-                    logprobs: if last { request.logprobs } else { None },
-                    ignore_eos: if last {
-                        request.params.ignore_eos
-                    } else {
-                        true
-                    },
+                head.push(if last {
+                    SampleRow::of(request, 0)
+                } else {
+                    SampleRow::discarded(request)
                 });
             }
             self.mixed_step(&mut prefills, &head, active, ledger)
@@ -2051,10 +2054,7 @@ impl EngineState {
             if let Some((take, last)) = *take {
                 walker.offset += take;
                 if last {
-                    walker.first = Some((
-                        sampled.picked[sampled_index],
-                        sampled.logprobs[sampled_index].take(),
-                    ));
+                    walker.first = Some(sampled.token(sampled_index));
                 }
                 sampled_index += 1;
             }
@@ -2094,7 +2094,7 @@ impl EngineState {
             first,
             ..
         } = w;
-        let (next, logprob) = first.expect("graduation follows a final segment");
+        let token = first.expect("graduation follows a final segment");
         capture_prefix(
             &self.ctx,
             &self.serve,
@@ -2103,9 +2103,7 @@ impl EngineState {
             &request.request.prompt_tokens,
             resumed,
         );
-        if let Some(entry) =
-            settle_first_token(&self.policy, request, kv, next, logprob, None, ledger)
-        {
+        if let Some(entry) = settle_first_token(request, kv, token, None, ledger) {
             active.push(entry);
         }
     }
@@ -2209,14 +2207,14 @@ impl EngineState {
             graph
                 .launch_captured(&self.ctx)
                 .context("launch sampler graph")?;
-            self.sample_nonce = self.sample_nonce.wrapping_add(1);
+            self.seed.next_call();
             pegainfer_sample::greedy_stage_readback(&self.ctx, slot, &mut self.scratch)
                 .context("stage greedy readback")?;
         } else {
             let (logits, ids) = self.arena.logits_and_ids();
             ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
                 .context("suppression")?;
-            self.sample_nonce = self.sample_nonce.wrapping_add(1);
+            self.seed.next_call();
             pegainfer_sample::greedy_stage_resident(
                 &self.ctx,
                 logits,
@@ -2305,8 +2303,7 @@ impl EngineState {
             &self.suppress_ids,
             &self.policy,
             &mut self.scratch,
-            self.base_seed,
-            &mut self.sample_nonce,
+            &mut self.seed,
             head,
             active,
             logits,
@@ -2340,12 +2337,7 @@ impl EngineState {
                 let resume = kv.local.seq_len();
                 let request = &request.request;
                 prefills.push((kv, &request.prompt_tokens[resume..]));
-                head.push(SampleRow {
-                    params: &request.params,
-                    step: 0,
-                    logprobs: request.logprobs,
-                    ignore_eos: request.params.ignore_eos,
-                });
+                head.push(SampleRow::of(request, 0));
             }
             self.mixed_step(&mut prefills, &head, active, ledger)
         };
@@ -2370,15 +2362,7 @@ impl EngineState {
 
         // The newcomers: their first tokens are logits rows `0..k`.
         for (j, (request, kv, _)) in newcomers.into_iter().enumerate() {
-            if let Some(entry) = settle_first_token(
-                &self.policy,
-                request,
-                kv,
-                sampled.picked[j],
-                sampled.logprobs[j].take(),
-                None,
-                ledger,
-            ) {
+            if let Some(entry) = settle_first_token(request, kv, sampled.token(j), None, ledger) {
                 active.push(entry);
             }
         }
@@ -2415,8 +2399,7 @@ impl EngineState {
                 &self.suppress_ids,
                 &self.policy,
                 &mut self.scratch,
-                self.base_seed,
-                &mut self.sample_nonce,
+                &mut self.seed,
                 &rows,
                 logits,
             )
@@ -2570,14 +2553,20 @@ impl Scheduler for Gemma4Scheduler {
     }
 }
 
-/// One decode row's sampled outcome.
-struct DecodeToken {
+/// One sampled pick, with the stop the sampler decided for it.
+struct SampledToken {
     id: u32,
     logprob: Option<TokenLogprob>,
     stop: bool,
 }
 
-fn deliver_decode_row(entry: &mut Active, token: DecodeToken, ledger: &mut RequestLedger) -> bool {
+/// Settle one pick for its request, first token or later: an aborted request
+/// retires with no event, and a stop token retires it without being emitted
+/// (the frontend appends its own sentinel for a terminal Stop and drops the
+/// last id, so an engine that emits EOS costs the client its final visible
+/// token). Any other token is emitted and finishes the request at
+/// `max_tokens`. Returns whether the request is done.
+fn settle_token(entry: &mut Active, token: SampledToken, ledger: &mut RequestLedger) -> bool {
     let id = entry.request.id;
     if ledger.is_aborted(id) {
         ledger.retire(id);
@@ -2596,12 +2585,10 @@ fn deliver_decode_row(entry: &mut Active, token: DecodeToken, ledger: &mut Reque
     false
 }
 
-/// Deliver one decode step's outcome to every active row and retire the
-/// finished ones — the event flow both the pure decode round and the mixed
-/// admission share; `row_base` is the row's offset into the step's logits
-/// (a mixed step's first `row_base` rows are its newcomers). A stop token
-/// retires the request without being emitted; an aborted request retires
-/// with no event.
+/// Settle one decode step's picks for every active row and retire the
+/// finished ones — the flow both the pure decode round and the mixed step
+/// share; `row_base` is the rows' offset into the step's logits (a mixed
+/// step's first `row_base` rows are its prompts).
 fn emit_decode_rows(
     active: &mut Vec<Active>,
     sampled: &mut SampledRows,
@@ -2610,16 +2597,7 @@ fn emit_decode_rows(
 ) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
-        let index = row + row_base;
-        if deliver_decode_row(
-            entry,
-            DecodeToken {
-                id: sampled.picked[index],
-                logprob: sampled.logprobs[index].take(),
-                stop: sampled.stops[index],
-            },
-            ledger,
-        ) {
+        if settle_token(entry, sampled.token(row + row_base), ledger) {
             retire.push(row);
         }
     }
@@ -2628,42 +2606,25 @@ fn emit_decode_rows(
     }
 }
 
-/// Deliver one admission's first token and decide whether the request joins the
-/// decode batch. The stop token retires the request without being emitted: the
-/// frontend appends its own sentinel for a terminal Stop and drops the last id,
-/// so an engine that emits EOS costs the client its final visible token.
+/// Settle one admission's first token, its prompt echo ahead of it; a
+/// request that is not done joins the decode batch.
 fn settle_first_token(
-    policy: &GenerationPolicy,
     request: QueuedRequest,
     kv: GemmaKv,
-    next: u32,
-    logprob: Option<TokenLogprob>,
+    token: SampledToken,
     echo: Option<PromptEcho>,
     ledger: &mut RequestLedger,
 ) -> Option<Active> {
-    let id = request.id;
-    if ledger.is_aborted(id) {
-        ledger.retire(id);
-        return None;
+    if let Some(echo) = echo.filter(|_| !ledger.is_aborted(request.id)) {
+        ledger.echo_prompt(request.id, echo);
     }
-    if let Some(echo) = echo {
-        ledger.echo_prompt(id, echo);
-    }
-    if policy.stops(next, request.request.params.ignore_eos) {
-        ledger.finish(id, FinishReason::Stop);
-        return None;
-    }
-    ledger.push_tokens(id, &[next], &[logprob]);
-    if request.request.max_tokens <= 1 {
-        ledger.finish(id, FinishReason::Length);
-        return None;
-    }
-    Some(Active {
+    let mut entry = Active {
         request,
         kv,
-        next,
+        next: token.id,
         stopping: false,
-    })
+    };
+    (!settle_token(&mut entry, token, ledger)).then_some(entry)
 }
 
 #[cfg(test)]
