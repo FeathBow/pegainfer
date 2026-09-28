@@ -528,9 +528,13 @@ impl Drop for AsyncPrefillLane {
 
 /// The fail-closed request validation every admission path shares; `Err`
 /// carries the typed refusal. Refuse every unsupported capability carried by
-/// the stepped `Request` (echo, LoRA and P/D transfer metadata) rather than
-/// silently ignoring it.
-fn validate_request(request: &Request, max_context: usize) -> Result<usize, RejectReason> {
+/// the stepped `Request` (LoRA and P/D transfer metadata) rather than
+/// silently ignoring it, and a scored prompt longer than `score_ceiling`.
+fn validate_request(
+    request: &Request,
+    max_context: usize,
+    score_ceiling: usize,
+) -> Result<usize, RejectReason> {
     let prompt_tokens = request.prompt_tokens.len();
     if prompt_tokens == 0 {
         return Err(RejectReason::Unsupported {
@@ -557,12 +561,10 @@ fn validate_request(request: &Request, max_context: usize) -> Result<usize, Reje
             feature: "LoRA".into(),
         });
     }
-    // Prompt scores come from one whole-prompt prefill, which the default
-    // ceiling bounds; a raised ceiling is served in chunks.
-    if request.prompt_logprobs.is_some() && prompt_tokens > MAX_CONTEXT {
+    if request.prompt_logprobs.is_some() && prompt_tokens > score_ceiling {
         return Err(RejectReason::EchoPrefillTokens {
             prompt_tokens,
-            limit: MAX_CONTEXT,
+            limit: score_ceiling,
         });
     }
     if request.kv_transfer_params.is_some() {
@@ -1072,6 +1074,10 @@ struct EngineState {
     /// The serving ceiling this process was started with; the pools are
     /// budgeted against it.
     max_context: usize,
+    /// The longest prompt a scored request may carry. It prefills whole, so
+    /// it is held to the default ceiling and to the local pages an idle
+    /// server has.
+    score_ceiling: usize,
     /// The decode-slot count the pools are budgeted for; requests past it
     /// queue.
     slots: usize,
@@ -1232,13 +1238,14 @@ impl EngineState {
             ledger.retire(request.id);
             return PreparedNewcomer::Done;
         }
-        let context_len = match validate_request(&request.request, self.max_context) {
-            Ok(len) => len,
-            Err(reason) => {
-                ledger.reject(request.id, reason);
-                return PreparedNewcomer::Done;
-            }
-        };
+        let context_len =
+            match validate_request(&request.request, self.max_context, self.score_ceiling) {
+                Ok(len) => len,
+                Err(reason) => {
+                    ledger.reject(request.id, reason);
+                    return PreparedNewcomer::Done;
+                }
+            };
         let (mut kv, resumed) = self.resolve_newcomer_kv(&request.request);
         let new_tokens = request.request.prompt_tokens.len() - kv.local.seq_len();
         if options
@@ -1325,7 +1332,8 @@ impl EngineState {
         let sliding_window = weights.config.sliding_window;
         // With the chunk knob set every scan is bounded by window plus
         // segment — except the lane's, which prefills whole and keeps the
-        // full transient.
+        // full transient, and a scored prompt's, which prefills whole and
+        // is refused past what the pool holds.
         let transient_pages = match mix_chunk {
             Some(chunk) if lane_mode.is_none() => {
                 // A round's rows split across walkers, and every walker's
@@ -1349,6 +1357,8 @@ impl EngineState {
                  {slots} slots and {cache_entries} cache entries"
             )
         })?;
+        // Every local page but the padding one, an idle server's whole pool.
+        let score_ceiling = MAX_CONTEXT.min((local_pages - 1) * LOCAL_PAGE_SIZE);
         // The arena pads steps to power-of-two buckets.
         let arena_rows = slots.next_power_of_two();
         // Page ids and mixed-step row metadata are i32 downstream, and the
@@ -1444,6 +1454,7 @@ impl EngineState {
             mix_gather,
             mix_max_prompts,
             max_context,
+            score_ceiling,
             slots,
             admit_coalesce,
         })
