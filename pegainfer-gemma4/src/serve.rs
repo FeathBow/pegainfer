@@ -592,6 +592,14 @@ fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &m
     }
 }
 
+/// Takes a scoring prefill's head logits for a run of prompt rows and the
+/// first row's index.
+pub(crate) type PromptScorer<'a> = &'a mut dyn FnMut(&mut HiddenStates, usize) -> Result<()>;
+
+/// Prompt rows a scoring prefill pushes through the head at once: the
+/// logits of 256 rows over the 262144-token vocabulary are 128 MiB.
+const PROMPT_SCORE_ROWS: usize = 256;
+
 const GLOBAL_SPLIT_CHUNK_TOKENS: usize = 256;
 /// The sliding family's decode chunk: a resident window of a thousand keys
 /// wants many small CTAs rather than the global family's long streams.
@@ -2712,13 +2720,14 @@ impl GemmaServe {
     }
 
     /// The kernel half of a single-request pass, launched after the overlap-safe
-    /// form has fenced.
+    /// form has fenced. Returns the tower slot holding every row's final
+    /// hidden state.
     fn run_single_tower(
         &self,
         ctx: &DeviceContext,
         pass: &mut SinglePass,
         seq_len: usize,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let src = self.run_tower(
             ctx,
             &mut pass.tower,
@@ -2740,7 +2749,8 @@ impl GemmaServe {
             &mut pass.last,
             0,
             1,
-        )
+        )?;
+        Ok(src)
     }
 
     pub(crate) fn step(
@@ -2748,6 +2758,19 @@ impl GemmaServe {
         ctx: &DeviceContext,
         kv: &mut GemmaKv,
         tokens: &[u32],
+    ) -> Result<HiddenStates> {
+        self.step_scoring(ctx, kv, tokens, None)
+    }
+
+    /// [`GemmaServe::step`] that also hands `score` the head's logits for
+    /// every row but the last, `PROMPT_SCORE_ROWS` rows at a time with the
+    /// first row's index: row `r` predicts token `r + 1`.
+    pub(crate) fn step_scoring(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut GemmaKv,
+        tokens: &[u32],
+        score: Option<PromptScorer<'_>>,
     ) -> Result<HiddenStates> {
         let seq_len = tokens.len();
         let mut pass = self.prepare_single(ctx, kv, tokens, "step")?;
@@ -2757,7 +2780,37 @@ impl GemmaServe {
             kv.local.held_pages(),
             kv.global.held_pages()
         );
-        self.run_single_tower(ctx, &mut pass, seq_len)?;
+        let src = self.run_single_tower(ctx, &mut pass, seq_len)?;
+        if let Some(score) = score
+            && seq_len > 1
+        {
+            let rows = PROMPT_SCORE_ROWS.min(seq_len - 1);
+            let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+            let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+            let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, rows)?;
+            for start in (0..seq_len - 1).step_by(rows) {
+                let n = rows.min(seq_len - 1 - start);
+                hidden.seq_len = n;
+                ops::copy_hidden_token_range_into(
+                    ctx,
+                    &pass.tower.hidden[src],
+                    start,
+                    &mut hidden,
+                    0,
+                    n,
+                )?;
+                logits_tail_into(
+                    ctx,
+                    &self.weights,
+                    &hidden,
+                    self.local_geom.rms_norm_eps,
+                    self.final_logit_softcapping,
+                    &mut normed,
+                    &mut logits,
+                )?;
+                score(&mut logits, start)?;
+            }
+        }
         let logits = logits_tail(
             ctx,
             &self.weights,

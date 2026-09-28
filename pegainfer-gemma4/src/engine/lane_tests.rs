@@ -44,6 +44,18 @@ impl Harness {
     }
 
     pub(super) fn submit(&self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestControl {
+        self.submit_scored(prompt_tokens, max_tokens, None, None)
+    }
+
+    /// A greedy request that asks for its sampled tokens' and its prompt's
+    /// logprobs, each with its own top-k.
+    pub(super) fn submit_scored(
+        &self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        logprobs: Option<usize>,
+        prompt_logprobs: Option<usize>,
+    ) -> RequestControl {
         self.scheduler
             .as_ref()
             .expect("live scheduler")
@@ -58,8 +70,8 @@ impl Harness {
                 max_tokens,
                 lora_adapter: None,
                 kv_transfer_params: None,
-                logprobs: None,
-                prompt_logprobs: None,
+                logprobs,
+                prompt_logprobs,
                 trace_parent: None,
                 client_label: None,
             })
