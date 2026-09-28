@@ -1095,8 +1095,8 @@ struct EngineState {
 /// The scheduler thread is not the thread that loaded the engine: the
 /// primary context must be made current there and the thread-local cuBLAS
 /// handles created, or the first eager GEMM fails with an invalid handle.
-/// Same three steps the Qwen3 model thread takes; the returned guard tears
-/// the handles down when the scheduler drops on that thread.
+/// The returned guard tears the handles down when the scheduler drops on
+/// that thread.
 fn bind_engine_thread(ctx: &DeviceContext) -> Result<CublasThreadGuard> {
     let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
     anyhow::ensure!(
@@ -1226,7 +1226,7 @@ impl EngineState {
             Some((entry, t)) => match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
                 Ok(kv) => (kv, Some(entry.id)),
                 Err(err) => {
-                    log::warn!("gemma4 prefix-cache restore failed (falling back): {err:#}");
+                    log::warn!("prefix-cache restore failed (falling back): {err:#}");
                     (self.serve.alloc_kv(), None)
                 }
             },
@@ -1271,7 +1271,7 @@ impl EngineState {
                 return PreparedNewcomer::Requeue(request);
             }
             ReservationDecision::Refused(message) => {
-                log::warn!("gemma4 KV admission refused {}: {message}", request.id);
+                log::warn!("KV admission refused {}: {message}", request.id);
                 ledger.reject(
                     request.id,
                     RejectReason::KvBudget {
@@ -1406,7 +1406,7 @@ impl EngineState {
             let pages = serve.global_pool.capacity_pages();
             let page_bytes = layout.page_stride * layout.storage.elem_bytes();
             log::info!(
-                "gemma4 global KV pool: {pages} pages x {page_bytes} B ({:?}, {} columns per \
+                "global KV pool: {pages} pages x {page_bytes} B ({:?}, {} columns per \
                  head) = {:.2} GiB",
                 layout.format,
                 layout.format.row_width(layout.head_dim),
@@ -1676,7 +1676,7 @@ impl EngineState {
             Err(err) => {
                 // This prompt's prefill failed; its pages return with `kv`
                 // and the engine keeps serving.
-                log::error!("gemma4 solo prefill failed: {err:#}");
+                log::error!("solo prefill failed: {err:#}");
                 ledger.fail(request.id, format!("prefill failed: {err:#}"));
                 return Ok(Admitted::Done);
             }
@@ -1723,7 +1723,7 @@ impl EngineState {
         let mut sampled = match sampled {
             Ok(sampled) => sampled,
             Err(err) => {
-                log::error!("gemma4 first-token sampling failed: {err:#}");
+                log::error!("first-token sampling failed: {err:#}");
                 ledger.fail(request.id, format!("first-token sampling failed: {err:#}"));
                 return Admitted::Done;
             }
@@ -1787,7 +1787,7 @@ impl EngineState {
                 // This prompt's launch failed. Drain the lane so no stale
                 // kernel can write the pages `kv` returns, fail the request,
                 // keep serving; only a failed drain is engine-fatal.
-                log::error!("gemma4 async prefill launch failed: {err:#}");
+                log::error!("async prefill launch failed: {err:#}");
                 lane.drain()?;
                 ledger.fail(request.id, format!("prefill failed: {err:#}"));
                 Ok(Admitted::Done)
@@ -1839,7 +1839,7 @@ impl EngineState {
             return Ok(());
         }
         if let Err(err) = self.serve.release_prefill_window(&mut kv) {
-            log::error!("gemma4 async prefill window release failed: {err:#}");
+            log::error!("async prefill window release failed: {err:#}");
             ledger.fail(request.id, format!("prefill failed: {err:#}"));
             return Ok(());
         }

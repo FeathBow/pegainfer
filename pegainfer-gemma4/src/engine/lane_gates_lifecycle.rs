@@ -24,10 +24,8 @@ fn the_raise_reaches_the_frontend() {
 }
 
 #[test]
-#[ignore = "requires the pinned 12B checkpoint's config"]
 fn the_raise_refuses_without_its_prerequisites() {
-    let dir = crate::testkit::model_path();
-    let config = crate::config::Gemma4Config::from_file(&dir).expect("config");
+    let config = crate::manifest::schema::sample_config();
     let load =
         |overrides: &[(&str, &str)]| super::ServingKnobs::resolve(&knob_table(overrides), &config);
     let error = load(&[(super::MAX_CONTEXT_ENV, "32768")])
@@ -173,6 +171,10 @@ fn the_gathered_lifecycle_completes() {
 #[test]
 fn the_knob_is_refused_for_a_geometry_the_build_does_not_carry() {
     if !pegainfer_kernels::ops::gemma4_hd512_prefill_is_built() {
+        assert!(
+            std::env::var("PEGAINFER_REQUIRE_GPU").as_deref() != Ok("1"),
+            "PEGAINFER_REQUIRE_GPU=1 but this build carries the stub"
+        );
         eprintln!("skipping: this build carries the stub, which has no geometry to refuse");
         return;
     }

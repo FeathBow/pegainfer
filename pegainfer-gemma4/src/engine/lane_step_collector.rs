@@ -12,7 +12,6 @@ use pegainfer_frontend::engine::TokenLogprob;
 pub(super) struct Drained {
     pub(super) tokens: usize,
     pub(super) cached: usize,
-    pub(super) scheduled: usize,
     pub(super) finish: FinishReason,
     pub(super) ids: Vec<u32>,
     pub(super) logprobs: Vec<Option<TokenLogprob>>,
@@ -147,15 +146,11 @@ impl StepCollector {
     pub(super) fn drain(&mut self, id: RequestId, name: &str) -> Drained {
         let mut tokens = 0;
         let mut cached = 0;
-        let mut scheduled = 0;
         let mut ids = Vec::new();
         let mut logprobs = Vec::new();
         let mut prompt_echo = None;
         loop {
             let update = self.next_for(id);
-            if update.scheduled.is_some() {
-                scheduled += 1;
-            }
             cached = update.cached_tokens.unwrap_or(cached);
             tokens += update.tokens.len();
             ids.extend(update.tokens);
@@ -169,7 +164,6 @@ impl StepCollector {
                     return Drained {
                         tokens,
                         cached,
-                        scheduled,
                         finish: reason,
                         ids,
                         logprobs,

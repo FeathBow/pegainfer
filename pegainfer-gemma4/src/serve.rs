@@ -1,5 +1,5 @@
-//! KV-backed serving forward: two KV families, prefill and decode, and
-//! atomic dual-pool admission.
+//! KV-backed serving forward over two KV families: prefill, decode, and the
+//! mixed step that carries both.
 //!
 //! The layer forwards take the step's plans and prep metadata and the
 //! pools this module owns, never a request's state. Both coordinate systems
@@ -8,9 +8,10 @@
 //! sliding window; past it the local family releases its front, and
 //! `origin_pages` is what converts between the two.
 //!
-//! Batched decode reads the local family through the windowed prefill
-//! entry at seq_len 1 and the global family through its native split-KV
-//! decode entry. Attention reads are read-only (the prep kernels own the
+//! Batched decode reads the global family through a split-KV decode entry
+//! and the local family through the windowed prefill entry at seq_len 1, or,
+//! with the generated kernels on a bf16 pool, through their windowed
+//! split-KV decode. Attention reads are read-only (the prep kernels own the
 //! pool writes) with sm_scale 1.0 — Gemma 4 runs unscaled attention.
 
 use anyhow::Context as AnyhowContext;
@@ -624,7 +625,6 @@ struct SteadyDecode {
     rows: Vec<SteadyRow>,
 }
 
-#[derive(Eq, PartialEq)]
 struct SteadyRow {
     kv: u64,
     kv_len: usize,
@@ -1371,7 +1371,7 @@ impl GemmaServe {
             )
         });
         if let Err(err) = copy {
-            log::warn!("gemma4 prefix-cache capture failed: {err:#}");
+            log::warn!("prefix-cache capture failed: {err:#}");
             return None;
         }
         Some(crate::prefix_cache::CachedKv::new(
@@ -2802,7 +2802,7 @@ impl GemmaServe {
         let seq_len = tokens.len();
         let mut pass = self.prepare_single(ctx, kv, tokens, "step")?;
         log::debug!(
-            "gemma4 step: start_pos {} seq_len {seq_len} pages local {} global {}",
+            "step: start_pos {} seq_len {seq_len} pages local {} global {}",
             kv.local.seq_len(),
             kv.local.held_pages(),
             kv.global.held_pages()

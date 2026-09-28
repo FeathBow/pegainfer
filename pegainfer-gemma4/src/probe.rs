@@ -233,7 +233,6 @@ mod tests {
         tc["num_experts"] = serde_json::json!(128);
         tc["top_k_experts"] = serde_json::json!(8);
         tc["moe_intermediate_size"] = serde_json::json!(704);
-        tc["intermediate_size"] = serde_json::json!(2112);
         cfg
     }
 
@@ -316,11 +315,16 @@ mod tests {
     }
 
     #[test]
-    fn cross_family_mismatch_bails() {
+    fn a_mismatched_family_bails() {
         let mut cfg = good_12b_config();
         cfg["architectures"] = serde_json::json!(["Gemma4ForConditionalGeneration"]);
         let err = probe_config_json(&cfg).unwrap_err().to_string();
         assert!(err.contains("architectures"), "{err}");
+
+        let mut cfg = good_12b_config();
+        cfg["text_config"]["model_type"] = serde_json::json!("gemma4_text");
+        let err = probe_config_json(&cfg).unwrap_err().to_string();
+        assert!(err.contains("cross-family mismatch"), "{err}");
     }
 
     #[test]

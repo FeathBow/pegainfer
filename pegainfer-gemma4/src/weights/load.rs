@@ -167,7 +167,7 @@ fn classify_checkpoint(manifest: &Manifest, shards: &[SafeTensors]) -> Result<us
     report.check()?;
     let skipped = report.skipped_modality.len();
     info!(
-        "Gemma 4 manifest: {} text tensors, {skipped} modality tensors skipped",
+        "manifest: {} text tensors, {skipped} modality tensors skipped",
         observed.len() - skipped
     );
     Ok(skipped)
@@ -687,8 +687,7 @@ impl Gemma4Weights {
         drop(shards);
         // A few hundred ms at this size. Qwen3 backgrounds it to protect its
         // ready time; kept synchronous here so the unmap's host cost lands
-        // inside the reported submission total. Lift that spawn into core
-        // once an executor wants it too.
+        // inside the reported submission total.
         drop(mmaps);
 
         // The expert kernels ran on this stream while the unmap paid its host cost.
@@ -707,7 +706,7 @@ impl Gemma4Weights {
             skipped_modality_tensors,
         };
         info!(
-            "Gemma 4 weights resident: {:.2} GiB manifest, {:.2} GiB device, {:.2} GiB free, \
+            "weights resident: {:.2} GiB manifest, {:.2} GiB device, {:.2} GiB free, \
              {} modality tensors skipped; \
              {:.0} ms submission total, of which {:.0} validate, {:.0} record-api, \
              {:.0} execute-and-drain (expert kernels drained)",

@@ -35,9 +35,8 @@ pub fn gemma4_moe_router_topk_into(
          128 experts and 1..=32 picks, got {experts} experts and top {top_k}"
     );
     ensure!(
-        rows > 0 && top_k > 0 && top_k <= experts,
-        "gemma4_moe_router_topk_into: {rows} rows and top {top_k} of {experts} experts is not \
-         a routing problem"
+        rows > 0,
+        "gemma4_moe_router_topk_into: zero rows is not a routing problem"
     );
     // `DeviceVec::len` and `HiddenStates` dims are labels; the kernel reads
     // the allocations, so the allocations are what is checked.

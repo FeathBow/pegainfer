@@ -518,11 +518,6 @@ pub fn gemma4_hd256_decode_window_into(
         "{WHAT} reads split K|V rows; the layout is {:?}",
         layout.format
     );
-    anyhow::ensure!(
-        layout.storage == crate::paged_kv::KvStorage::Bf16,
-        "{WHAT} loads two-byte rows; the pool stores {:?}",
-        layout.storage
-    );
     let args = split_decode_args(
         WHAT,
         q,

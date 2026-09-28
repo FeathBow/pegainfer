@@ -1,19 +1,23 @@
 # Gemma 4 TileLang kernels
 
-**TL;DR**: `generate.py` AOT-compiles the hd512 global-attention prefill in
-`tilelang_defs.py` into one CUDA file that `pegainfer-kernels/build.rs` hands
-to nvcc under the `gemma4` feature — three tiers (generate, pre-generated,
-stub), and the generated CUDA is a Cargo `OUT_DIR` artifact that is never
-checked in. Unlike the K3 families this one lowers to TMA, so the launcher
-builds the descriptors itself from parameters recovered out of the lowered
-host stub.
+**TL;DR**: two TileLang families that `pegainfer-kernels/build.rs` generates
+under the `gemma4` feature and hands to nvcc, each through three tiers
+(generate, pre-generated, stub); the generated CUDA is a Cargo `OUT_DIR`
+artifact that is never checked in. `generate.py` emits the attention family:
+the global prefill, the global split-KV decode, and the sliding window's
+prefill and decode. Unlike the K3 families it lowers to TMA, so the launchers
+build the descriptors themselves from parameters recovered out of the lowered
+host stub. `w4a16_generate.py` emits the W4A16 decode GEMMs, compiled for one
+SM count.
 
 ## What lives here
 
 | File | Role |
 | --- | --- |
-| `tilelang_defs.py` | The kernel, authored here. Upstream has nothing for this head dim on SM90. |
-| `generate.py` | Lowers it, recovers the launch geometry and the TMA descriptor parameters, emits the `.cu` with a hand-written launcher. |
+| `tilelang_defs.py` | The attention kernels, authored here. Upstream has nothing for these head dims on SM90. |
+| `generate.py` | Lowers them, recovers the launch geometry and the TMA descriptor parameters, emits the `.cu` with its hand-written launchers. |
+| `w4a16_defs.py` | The W4A16 decode GEMMs: stream-K over persistent CTAs, one kernel per linear shape and row bucket. |
+| `w4a16_generate.py` | Lowers them through `generate.py`'s rendering behind one dispatching launcher, and states the CTA count the crate checks the device against. |
 
 ## Why one instantiation is enough
 
@@ -45,8 +49,11 @@ count, and a warp-specialized kernel accepts neither.
 
 ## Gates
 
-The kernel's numerics are gated against the serving path's own reference, not
-against random tensors: paged output is bit-identical to the contiguous form
-over scattered pages and partial final pages, and a ragged batch matches an
-fp32 reference per request while leaving every row past the batch untouched —
-those rows are the decode rows sharing a mixed step's output buffer.
+The attention kernels' numerics are gated against the serving path's own
+reference, not against random tensors: paged output is bit-identical to the
+contiguous form over scattered pages and partial final pages, and a ragged
+batch matches an fp32 reference per request while leaving every row past the
+batch untouched — those rows are the decode rows sharing a mixed step's output
+buffer. The W4A16 GEMMs are gated against their definition on every 31B shape
+(`pegainfer-kernels/tests/gemma4_w4a16_gemm.rs`): a row's bits are the same in
+every bucket.

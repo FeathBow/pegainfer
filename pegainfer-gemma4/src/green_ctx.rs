@@ -53,7 +53,7 @@ impl PrefillLaneStream {
             },
             "cuStreamCreate (prefill lane)",
         )?;
-        log::info!("gemma4 async prefill: shared-SM lane stream");
+        log::info!("async prefill: shared-SM lane stream");
         Ok(Self {
             stream,
             green: None,
@@ -158,7 +158,7 @@ impl PrefillLaneStream {
         }
 
         log::info!(
-            "gemma4 async prefill: green-ctx lane pinned to {sm_prefill}/{total_sm} SMs \
+            "async prefill: green-ctx lane pinned to {sm_prefill}/{total_sm} SMs \
              (decode keeps the primary context)"
         );
         Ok(Self {

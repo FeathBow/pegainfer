@@ -9,7 +9,7 @@ use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::kv_pool::KvReservation;
 use pegainfer_core::kv_pool::KvState;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct ReleaseState {
     frontier: usize,
     origin_pages: usize,
@@ -23,7 +23,7 @@ struct ReleaseStep {
     page_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct ReleasePlan {
     frontier: usize,
     origin_pages: usize,
