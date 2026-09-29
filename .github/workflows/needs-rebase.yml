@@ -1,9 +1,10 @@
-name: Label pull requests that need a rebase
+# SECURITY: pull_request_target gives fork PRs a write token, so never check out or run PR code.
+
+name: Needs rebase
 
 on:
   push:
     branches: [main]
-  # Gives fork PRs a label-writing token; no PR code is checked out.
   pull_request_target:
     types: [opened, reopened, synchronize]
 
@@ -13,7 +14,7 @@ permissions:
 
 jobs:
   label:
-    name: Mark conflicting pull requests
+    name: Label conflicting PRs
     runs-on: ubuntu-latest
 
     steps:
