@@ -6,6 +6,10 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -27,15 +31,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          case "$PR_TITLE" in
+          title=$(gh pr view "$PR_NUMBER" -R "$REPO" --json title --jq .title)
+          labels=$(gh pr view "$PR_NUMBER" -R "$REPO" --json labels --jq '.labels[].name')
+          case "$title" in
             fix\(*|fix:*|fix!*) add=bug remove=enhancement ;;
             feat\(*|feat:*|feat!*) add=enhancement remove=bug ;;
             *) exit 0 ;;
           esac
           args=(--add-label "$add")
-          if [[ $(gh pr view "$PR_NUMBER" -R "$REPO" --json labels --jq "any(.labels[]; .name == \"$remove\")") == true ]]; then
+          if grep -qx "$remove" <<<"$labels"; then
             args+=(--remove-label "$remove")
           fi
           gh pr edit "$PR_NUMBER" -R "$REPO" "${args[@]}"

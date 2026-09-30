@@ -1,6 +1,6 @@
 documentation:
   - changed-files:
-      - any-glob-to-all-files: ['docs/**', '*.md']
+      - any-glob-to-all-files: '{docs/**,*.md}'
 
 qwen3:
   - changed-files:
