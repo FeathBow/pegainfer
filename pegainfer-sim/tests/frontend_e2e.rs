@@ -1,5 +1,8 @@
 use std::fs;
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -9,7 +12,9 @@ use anyhow::anyhow;
 use anyhow::bail;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
+use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
@@ -26,6 +31,7 @@ use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -823,26 +829,99 @@ impl Scheduler for FatalScheduler {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn frontend_shuts_down_when_its_scheduler_fails() -> Result<()> {
-    assert_server_stops_when_scheduler_exits(FatalScheduler::default()).await
+/// Keeps every request it admits running until the request is aborted.
+struct HoldScheduler {
+    queued: Vec<RequestId>,
+    running: Vec<RequestId>,
+    admitted: Arc<AtomicBool>,
+}
+
+impl Scheduler for HoldScheduler {
+    fn submit(&mut self, request: QueuedRequest) {
+        self.queued.push(request.id);
+    }
+
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        for id in self.queued.drain(..) {
+            ledger.admit(id);
+            self.running.push(id);
+            self.admitted.store(true, Ordering::Release);
+        }
+        self.running.retain(|&id| {
+            if ledger.is_aborted(id) {
+                ledger.retire(id);
+                false
+            } else {
+                true
+            }
+        });
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            num_running_reqs: self.running.len() as u64,
+            num_waiting_reqs: self.queued.len() as u64,
+            ..SchedulerMetrics::default()
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frontend_shuts_down_when_its_scheduler_panics() -> Result<()> {
-    assert_server_stops_when_scheduler_exits(FatalScheduler {
+    let scheduler = FatalScheduler {
         panics: true,
         ..FatalScheduler::default()
-    })
-    .await
+    };
+    let (base_url, server, _model_dir) =
+        serve_schedulers(vec![spawn_scheduler("panic", scheduler)]).await?;
+    expect_error_response(&test_client()?, &base_url, 0).await?;
+    expect_scheduler_exit(server).await
 }
 
-async fn assert_server_stops_when_scheduler_exits(scheduler: FatalScheduler) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_scheduler_answers_and_stops_the_other_engines() -> Result<()> {
+    let admitted = Arc::new(AtomicBool::new(false));
+    let hold = HoldScheduler {
+        queued: Vec::new(),
+        running: Vec::new(),
+        admitted: Arc::clone(&admitted),
+    };
+    let (base_url, server, _model_dir) = serve_schedulers(vec![
+        spawn_scheduler("hold", hold),
+        spawn_scheduler("fatal", FatalScheduler::default()),
+    ])
+    .await?;
+    let client = test_client()?;
+    let held = tokio::spawn({
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move { expect_error_response(&client, &base_url, 0).await }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !admitted.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            bail!("engine 0 never admitted the held request");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    expect_error_response(&client, &base_url, 1).await?;
+    held.await.context("held request task panicked")??;
+    expect_scheduler_exit(server).await
+}
+
+/// Serves one engine per scheduler and waits until the server is healthy. The
+/// server runs on its own thread and runtime, so one that never stops fails the
+/// test instead of blocking the test runtime's shutdown on a scheduler join.
+async fn serve_schedulers(
+    schedulers: Vec<LiveScheduler>,
+) -> Result<(String, oneshot::Receiver<Result<()>>, TempDir)> {
     let model_dir = model_dir_with_minimal_metadata()?;
     let port = reserve_loopback_port()?;
-    let base_url = format!("http://127.0.0.1:{port}");
+    let engine_count = schedulers.len();
     let engine = Engine {
-        schedulers: vec![spawn_scheduler("fatal-scheduler", scheduler)],
+        schedulers,
         info: EngineInfo {
             kv_capacity: None,
             servable_len: None,
@@ -850,39 +929,52 @@ async fn assert_server_stops_when_scheduler_exits(scheduler: FatalScheduler) -> 
         lora: None,
     };
     let model_path = model_dir.path().to_path_buf();
-    let mut server = tokio::spawn(async move {
-        pegainfer_frontend::vllm::serve_with_engine_count(
-            std::future::ready(Ok(engine.into())),
-            &model_path,
-            vec![MODEL_NAME.to_string()],
-            pegainfer_frontend::vllm::ParserSelection::Auto,
-            port,
-            Some(128),
-            1,
-            CancellationToken::new(),
-        )
-        .await
+    let (done_tx, done) = oneshot::channel();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Runtime::new()
+            .context("failed to build the server runtime")
+            .and_then(|runtime| {
+                runtime.block_on(pegainfer_frontend::vllm::serve_with_engine_count(
+                    std::future::ready(Ok(engine.into())),
+                    &model_path,
+                    vec![MODEL_NAME.to_string()],
+                    pegainfer_frontend::vllm::ParserSelection::Auto,
+                    port,
+                    Some(128),
+                    engine_count,
+                    CancellationToken::new(),
+                ))
+            });
+        let _ = done_tx.send(result);
     });
-    let client = test_client()?;
-    wait_for_health(&client, &base_url).await?;
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_for_health(&test_client()?, &base_url).await?;
+    Ok((base_url, done, model_dir))
+}
 
+/// Sends one completion to `engine` and requires the server to answer it with an error.
+async fn expect_error_response(client: &Client, base_url: &str, engine: u32) -> Result<()> {
     let response = client
         .post(format!("{base_url}/v1/completions"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("X-data-parallel-rank", engine.to_string())
         .body(completion_body(MODEL_NAME, false).to_string())
         .send()
         .await
-        .context("the request in flight when the scheduler failed got no response")?;
+        .with_context(|| format!("the request to engine {engine} got no response"))?;
     let status = response.status();
     let body = response.text().await?;
     if status.is_success() {
-        bail!("a request served by a fatal scheduler succeeded: {body}");
+        bail!("the request to engine {engine} succeeded: {body}");
     }
+    Ok(())
+}
 
-    let result = tokio::time::timeout(Duration::from_secs(10), &mut server)
+async fn expect_scheduler_exit(server: oneshot::Receiver<Result<()>>) -> Result<()> {
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .context("server kept running after its scheduler exited")?
-        .context("server task panicked")?;
+        .context("server thread ended without a result")?;
     let error = result.expect_err("a server whose scheduler exited must stop with an error");
     if !format!("{error:#}").contains("scheduler exited") {
         bail!("unexpected shutdown error: {error:#}");

@@ -347,7 +347,7 @@ where
             if bridge_error.is_some() {
                 server_shutdown.cancel();
                 bridge_shutdown.cancel();
-                bridges.abort_all();
+                // Let the other bridges abort their requests and flush their output.
                 while bridges.join_next().await.is_some() {}
             }
             // The bridges are gone, and with them the partition handles:

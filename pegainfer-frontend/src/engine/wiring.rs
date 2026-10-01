@@ -109,8 +109,8 @@ impl SchedulerHandle {
         *self.metrics.lock().expect("metrics cell poisoned")
     }
 
-    /// Resolves once the driver has returned (fatal step or drained shutdown)
-    /// or its thread has unwound; nothing submitted afterwards is ever stepped.
+    /// Resolves once the driver has returned, after a fatal step or a drained
+    /// shutdown, or its thread has unwound.
     pub fn exited(&self) -> WaitForCancellationFuture<'_> {
         self.exited.cancelled()
     }
