@@ -7,6 +7,13 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use pegainfer_frontend::engine::Engine;
+use pegainfer_frontend::engine::EngineInfo;
+use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RequestLedger;
+use pegainfer_frontend::engine::Scheduler;
+use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::LoadedEngineProfile;
@@ -784,6 +791,101 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
         .contains("declared 2 engines but the launched engine exposes 1 schedulers")
     {
         bail!("unexpected partition-mismatch error: {error:#}");
+    }
+    Ok(())
+}
+
+/// Fails, or panics, on the first step that has a request to work on.
+#[derive(Default)]
+struct FatalScheduler {
+    queued: u64,
+    panics: bool,
+}
+
+impl Scheduler for FatalScheduler {
+    fn submit(&mut self, _request: QueuedRequest) {
+        self.queued += 1;
+    }
+
+    fn step(&mut self, _ledger: &mut RequestLedger) -> Result<()> {
+        if self.queued > 0 {
+            assert!(!self.panics, "injected panic");
+            bail!("injected fatal");
+        }
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            num_waiting_reqs: self.queued,
+            ..SchedulerMetrics::default()
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_shuts_down_when_its_scheduler_fails() -> Result<()> {
+    assert_server_stops_when_scheduler_exits(FatalScheduler::default()).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_shuts_down_when_its_scheduler_panics() -> Result<()> {
+    assert_server_stops_when_scheduler_exits(FatalScheduler {
+        panics: true,
+        ..FatalScheduler::default()
+    })
+    .await
+}
+
+async fn assert_server_stops_when_scheduler_exits(scheduler: FatalScheduler) -> Result<()> {
+    let model_dir = model_dir_with_minimal_metadata()?;
+    let port = reserve_loopback_port()?;
+    let base_url = format!("http://127.0.0.1:{port}");
+    let engine = Engine {
+        schedulers: vec![spawn_scheduler("fatal-scheduler", scheduler)],
+        info: EngineInfo {
+            kv_capacity: None,
+            servable_len: None,
+        },
+        lora: None,
+    };
+    let model_path = model_dir.path().to_path_buf();
+    let mut server = tokio::spawn(async move {
+        pegainfer_frontend::vllm::serve_with_engine_count(
+            std::future::ready(Ok(engine.into())),
+            &model_path,
+            vec![MODEL_NAME.to_string()],
+            pegainfer_frontend::vllm::ParserSelection::Auto,
+            port,
+            Some(128),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+    });
+    let client = test_client()?;
+    wait_for_health(&client, &base_url).await?;
+
+    let response = client
+        .post(format!("{base_url}/v1/completions"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(completion_body(MODEL_NAME, false).to_string())
+        .send()
+        .await
+        .context("the request in flight when the scheduler failed got no response")?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        bail!("a request served by a fatal scheduler succeeded: {body}");
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut server)
+        .await
+        .context("server kept running after its scheduler exited")?
+        .context("server task panicked")?;
+    let error = result.expect_err("a server whose scheduler exited must stop with an error");
+    if !format!("{error:#}").contains("scheduler exited") {
+        bail!("unexpected shutdown error: {error:#}");
     }
     Ok(())
 }

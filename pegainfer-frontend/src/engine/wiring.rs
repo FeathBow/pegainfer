@@ -23,6 +23,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use tokio_util::sync::CancellationToken;
+use tokio_util::sync::DropGuard;
+use tokio_util::sync::WaitForCancellationFuture;
+
 use super::control::LoraClient;
 use super::kv::KvCapacity;
 use super::ledger::RequestLedger;
@@ -40,6 +44,8 @@ pub struct SchedulerBackend {
     pub(crate) submissions: crossbeam_channel::Receiver<RequestEnvelope>,
     pub(crate) ledger: RequestLedger,
     pub(crate) metrics: MetricsPublisher,
+    /// Resolves [`SchedulerHandle::exited`] when dropped.
+    pub(crate) exit_guard: DropGuard,
 }
 
 /// Sole writer of a scheduler's metrics cell; the driver publishes once per
@@ -69,6 +75,7 @@ pub struct SchedulerHandle {
     /// Kept so requests minted after the scheduler thread exits still get
     /// their drop-bomb terminal delivered (the envelope needs a live sender).
     step_tx: super::request_lifecycle::StepSender,
+    exited: CancellationToken,
 }
 
 impl SchedulerHandle {
@@ -101,6 +108,12 @@ impl SchedulerHandle {
     pub fn metrics(&self) -> SchedulerMetrics {
         *self.metrics.lock().expect("metrics cell poisoned")
     }
+
+    /// Resolves once the driver has returned (fatal step or drained shutdown)
+    /// or its thread has unwound; nothing submitted afterwards is ever stepped.
+    pub fn exited(&self) -> WaitForCancellationFuture<'_> {
+        self.exited.cancelled()
+    }
 }
 
 /// Mint both ends of one scheduler's wiring.
@@ -109,6 +122,7 @@ pub fn scheduler_pair() -> (SchedulerHandle, SchedulerBackend) {
     let (submit_tx, submit_rx) = crossbeam_channel::unbounded();
     let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
     let metrics = Arc::new(Mutex::new(SchedulerMetrics::default()));
+    let exited = CancellationToken::new();
     (
         SchedulerHandle {
             submit_tx,
@@ -116,11 +130,13 @@ pub fn scheduler_pair() -> (SchedulerHandle, SchedulerBackend) {
             metrics: Arc::clone(&metrics),
             next_id: AtomicU64::new(0),
             step_tx: step_tx.clone(),
+            exited: exited.clone(),
         },
         SchedulerBackend {
             submissions: submit_rx,
             ledger: RequestLedger::new(step_tx),
             metrics: MetricsPublisher(metrics),
+            exit_guard: exited.drop_guard(),
         },
     )
 }

@@ -2,7 +2,7 @@
 
 **TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + `RequestLedger` lifecycle + a contract-owned polling driver — Qwen3, Gemma 4 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite still launch through it). The vLLM Rust dependency revision is recorded in `Cargo.toml` and `Cargo.lock`. **Next step: migrate glm52, then delete the legacy contract.**
 
-Last touched: 2026-09
+Last touched: 2026-10
 
 ## The boundary, in one sentence
 
@@ -40,6 +40,7 @@ Design decisions worth knowing before touching it:
 - **Abort is a flag, not channel teardown.** `SchedulerHandle::submit` returns a `RequestControl`; the frontend flips its boolean abort flag and the scheduler retires the request silently on its next touch (no terminal — the frontend already dropped its state for that id).
 - **Channels:** the submit channel is crossbeam (sync consumer on the scheduler thread), steps are tokio mpsc (async consumer in the bridge); load is a shared cell read via `SchedulerHandle::load()` — pull-only by design, "notify me on load change" is deliberately unrepresentable (the driver busy-polls, so a subscription edge would fire per spin). All channels unbounded on purpose — admission control is the scheduler's job, expressed as `Rejected`, never as backpressure on submit.
 - **Control plane lives outside the contract.** `Scheduler` has no control method and the contract carries no control channel. A capability like LoRA is a private channel the model crate mints *before* `spawn_scheduler` — the scheduler closes over the receiver, the `LoraClient` sender surfaces as `Engine.lora: Option<LoraClient>`, and the `Option` *is* the capability (no `bool` flag, no registry until a second capability exists). The vocabulary (`LoraControl`, `LoraClient`) is still defined in the frontend crate because the frontend must speak it without holding model structs; only the wiring is the model's business.
+- **A scheduler that exits stops the server.** Once the driver returns or its thread unwinds, `SchedulerHandle::exited` resolves. The stepped bridge forwards what is already on the step stream, fails every request still open (an unwinding scheduler can drop its last terminals after the signal), waits up to a second for its output sender to deliver, and then fails, which shuts the server down so it can be restarted instead of failing every later request.
 
 ### Onboarding checklist for a new model line
 

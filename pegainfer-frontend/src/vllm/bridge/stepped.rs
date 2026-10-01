@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -65,6 +66,8 @@ use crate::vllm::wire::requested_logprobs;
 use crate::vllm::wire::requested_prompt_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
 use crate::vllm::wire::to_wire_prompt_logprobs;
+
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct SteppedEngineBridge {
     pub(crate) input_address: String,
@@ -154,6 +157,19 @@ impl SteppedEngineBridge {
                         break Err(error).context("failed to dispatch local engine step");
                     }
                 }
+                () = self.scheduler.exited() => {
+                    // Dispatch what is already queued. A scheduler that unwinds can
+                    // drop its last terminals after this fires, so fail what is still open.
+                    if !steps.is_empty() {
+                        continue;
+                    }
+                    if let Err(error) =
+                        self.fail_open_streams(&mut streams, &mut names, &output_tx)
+                    {
+                        break Err(error);
+                    }
+                    break Err(anyhow::anyhow!("scheduler exited"));
+                }
                 recv = input.recv() => {
                     let message = match recv.context("failed to receive local engine request") {
                         Ok(message) => message,
@@ -178,10 +194,50 @@ impl SteppedEngineBridge {
             state.control.abort();
         }
         drop(output_tx);
+        // Deliver what is already queued, such as the terminals sent after the
+        // scheduler exited, before stopping the link.
+        if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+            while child_tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            warn!(
+                "local engine {} output did not drain in time",
+                self.engine_index
+            );
+        }
         child_tasks.abort_all();
         while child_tasks.join_next().await.is_some() {}
 
         run_result
+    }
+
+    /// Fail every request still open once the scheduler is gone, since nothing
+    /// else will answer it.
+    fn fail_open_streams(
+        &self,
+        streams: &mut HashMap<RequestId, SteppedStream>,
+        names: &mut HashMap<String, RequestId>,
+        output_tx: &tokio::sync::mpsc::UnboundedSender<
+            vllm_engine_core_client::protocol::output::EngineCoreOutputs,
+        >,
+    ) -> Result<()> {
+        names.clear();
+        for (_, mut state) in streams.drain() {
+            let events = state.first_token_events.take();
+            let prefill_stats = state.take_prefill_stats();
+            send_terminal_output(
+                self.engine_index,
+                output_tx,
+                state.request_id,
+                EngineCoreFinishReason::Error,
+                Some(StopReason::Text("scheduler exited".to_string())),
+                events,
+                prefill_stats,
+            )?;
+        }
+        Ok(())
     }
 
     /// Stats for an outgoing batch; the spec delta runs from the last batch

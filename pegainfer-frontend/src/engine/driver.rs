@@ -61,6 +61,7 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
         submissions,
         mut ledger,
         metrics,
+        exit_guard: _exit_guard,
     } = backend;
     let mut submissions_open = true;
     loop {
