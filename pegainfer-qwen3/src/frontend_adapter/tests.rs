@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -16,6 +17,7 @@ use pegainfer_frontend::engine::LoadLoraAdapterRequest;
 use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::LoraControlError;
 use pegainfer_frontend::engine::RejectReason;
+use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StepReceiver;
@@ -24,6 +26,7 @@ use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 
 use super::start_with_executor;
 use crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS;
+use crate::scheduler::test_support::AsyncPrefillGate;
 use crate::scheduler::test_support::FakeExecutor;
 use crate::scheduler::test_support::request;
 use crate::scheduler::test_support::request_with_lora;
@@ -442,4 +445,90 @@ fn lora_control_waits_until_scheduler_idle() {
         .expect("join load thread")
         .expect_err("adapter load should be a stub error");
     assert!(matches!(error, LoraControlError::Failed(_)));
+}
+
+/// `first` prefills alone, then decodes beside `launched`, whose prefill stays
+/// parked on the overlap stream while `arrivals` are admitted. Every request
+/// must finish once that prefill lands.
+fn assert_arrivals_during_inflight_prefill_finish(
+    executor: FakeExecutor,
+    first: Request,
+    launched: Request,
+    arrivals: Vec<Request>,
+) {
+    let gate = Arc::new(AsyncPrefillGate::default());
+    gate.hold_prefill.store(true, Ordering::SeqCst);
+    let executor = executor.with_async_prefill(Arc::clone(&gate));
+    // A 16-token step budget keeps `launched` out of `first`'s prefill step.
+    let mut engine = start_with_executor(executor, 42, 16, false);
+    let mut scheduler = engine.schedulers.remove(0);
+    let mut steps = StepCollector::new(
+        scheduler
+            .handle
+            .take_steps()
+            .expect("a fresh scheduler yields its step stream once"),
+    );
+
+    let mut controls = vec![
+        scheduler.handle.submit(first),
+        scheduler.handle.submit(launched),
+    ];
+    gate.hold_prefill.store(false, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(5), || gate
+            .launches
+            .load(Ordering::SeqCst)
+            == 1),
+        "the second request's prefill never ran beside a decode"
+    );
+    controls.extend(arrivals.into_iter().map(|req| scheduler.handle.submit(req)));
+    // Only steps with a prefill in flight poll; the third one starts after a
+    // step that drained the arrivals has finished admitting them.
+    let polls = gate.polls.load(Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(5), || gate.polls.load(Ordering::SeqCst)
+            >= polls + 3),
+        "the scheduler stopped stepping while the prefill was in flight"
+    );
+    gate.open.store(true, Ordering::SeqCst);
+
+    for (index, control) in controls.iter().enumerate() {
+        let (_, terminal) = steps.collect_terminal(control.id());
+        assert!(
+            matches!(
+                terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Length,
+                    ..
+                }
+            ),
+            "request {index} did not finish: {terminal:?}"
+        );
+    }
+}
+
+#[test]
+fn arrivals_during_inflight_prefill_leave_its_decode_slot() {
+    // Two slots: the in-flight request owns one, so the second arrival waits.
+    let executor =
+        FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_max_decode_batch_size(2);
+    assert_arrivals_during_inflight_prefill_finish(
+        executor,
+        request(16, 2),
+        request(16, 4),
+        vec![request(16, 4), request(16, 4)],
+    );
+}
+
+#[test]
+fn arrivals_during_inflight_prefill_leave_its_kv_tail() {
+    // Five blocks: the in-flight request holds one and is owed two more, so an
+    // arrival needing three waits for it to finish.
+    let executor = FakeExecutor::new(5, Arc::new(Mutex::new(Vec::new())));
+    assert_arrivals_during_inflight_prefill_finish(
+        executor,
+        request(16, 2),
+        request(16, 32),
+        vec![request(16, 32)],
+    );
 }

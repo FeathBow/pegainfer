@@ -270,6 +270,10 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         }
     }
 
+    fn inflight_prefills(&self) -> &[PendingRequest] {
+        self.inflight_prefill_pending.as_deref().unwrap_or_default()
+    }
+
     fn idle(&self) -> bool {
         self.active.is_empty()
             && self.deferred.is_empty()
@@ -595,7 +599,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         // prefetch. Control commands gate generation, so only offer once no
         // control is pending (a prefetch must not race ahead of an adapter
         // load it depends on).
-        let reserve_floor = admitted_future_blocks(&self.executor, &self.active, &self.prefilling);
+        let reserve_floor = admitted_future_blocks(
+            &self.executor,
+            &self.active,
+            &self.prefilling,
+            self.inflight_prefills(),
+        );
         reclaim_ready_prefetch(
             &mut self.executor,
             &mut self.deferred,
@@ -625,8 +634,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         // driver.
         if self.idle() {
             if !self.loading.is_empty() {
-                let reserve_floor =
-                    admitted_future_blocks(&self.executor, &self.active, &self.prefilling);
+                let reserve_floor = admitted_future_blocks(
+                    &self.executor,
+                    &self.active,
+                    &self.prefilling,
+                    self.inflight_prefills(),
+                );
                 block_on_loading(
                     &mut self.executor,
                     &mut self.deferred,
@@ -654,6 +667,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             lora_validation.accepted,
             &self.active,
             &self.prefilling,
+            self.inflight_prefills(),
             self.executor.block_size(),
             self.executor.available_blocks(),
             self.executor.max_request_blocks(),
