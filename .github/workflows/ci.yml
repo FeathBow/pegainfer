@@ -223,6 +223,81 @@ jobs:
       - name: Run simulated frontend E2E tests
         run: cargo test --release --locked -p pegainfer-sim --test frontend_e2e
 
+  # Temporary #975 measurement, removed before review.
+  cpu-layout-eval:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    name: Eval CPU (${{ matrix.cell }})
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cell: separate build, build: true }
+          - { cell: separate frontend, protobuf: true, frontend: true }
+          - { cell: separate sim, protobuf: true, sim: true }
+          - { cell: separate kvbm, kvbm: true }
+          - { cell: merged unit tests, protobuf: true, build: true, frontend: true, sim: true, kvbm: true }
+          - { cell: clippy, protobuf: true, clippy: true }
+          - { cell: e2e, protobuf: true, e2e: true }
+          - { cell: fused tests and e2e, protobuf: true, build: true, frontend: true, sim: true, kvbm: true, e2e: true }
+          - { cell: fused all, protobuf: true, clippy: true, build: true, frontend: true, sim: true, kvbm: true, e2e: true }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
+
+      - name: Setup sccache
+        id: sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Install protobuf compiler
+        if: matrix.protobuf
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Run CPU Clippy
+        if: ${{ matrix.clippy && !cancelled() && steps.sccache.outcome == 'success' }}
+        run: >-
+          cargo clippy --release --locked
+          -p pegainfer-build
+          -p pegainfer-frontend
+          -p pegainfer-sim
+          -p kvbm-logical
+          --all-targets -- -D warnings
+
+      - name: Run pegainfer-build unit tests
+        if: ${{ matrix.build && !cancelled() && steps.sccache.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-build --lib
+
+      - name: Run pegainfer-frontend unit tests
+        if: ${{ matrix.frontend && !cancelled() && steps.sccache.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-frontend --lib
+
+      - name: Run pegainfer-sim unit tests
+        if: ${{ matrix.sim && !cancelled() && steps.sccache.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-sim --lib
+
+      - name: Run kvbm-logical unit tests
+        if: ${{ matrix.kvbm && !cancelled() && steps.sccache.outcome == 'success' }}
+        run: cargo test --release --locked -p kvbm-logical --lib
+
+      - name: Run simulated frontend E2E tests
+        if: ${{ matrix.e2e && !cancelled() && steps.sccache.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-sim --test frontend_e2e
+
   feature-model-cuda:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: ${{ matrix.model_name }} CUDA Clippy (sm_80)
