@@ -112,23 +112,11 @@ jobs:
 
   cpu-unit-tests:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
-    name: CPU unit tests (${{ matrix.package }})
+    name: CPU unit tests
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - package: pegainfer-build
-            needs_protobuf: false
-          - package: pegainfer-frontend
-            needs_protobuf: true
-          - package: pegainfer-sim
-            needs_protobuf: true
-          - package: kvbm-logical
-            needs_protobuf: false
 
     steps:
       - name: Checkout
@@ -148,11 +136,24 @@ jobs:
           version: "v0.16.0"
 
       - name: Install protobuf compiler
-        if: matrix.needs_protobuf
+        id: deps
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Run unit tests
-        run: cargo test --release --locked -p ${{ matrix.package }} --lib
+      - name: Run pegainfer-build unit tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-build --lib
+
+      - name: Run pegainfer-frontend unit tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-frontend --lib
+
+      - name: Run pegainfer-sim unit tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-sim --lib
+
+      - name: Run kvbm-logical unit tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: cargo test --release --locked -p kvbm-logical --lib
 
   cpu-clippy:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
