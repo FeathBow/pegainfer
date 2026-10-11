@@ -135,6 +135,12 @@ jobs:
         with:
           version: "v0.16.0"
 
+      - name: Start sccache server with debug logging
+        run: sccache --start-server
+        env:
+          SCCACHE_LOG: debug
+          SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache.log
+
       - name: Install protobuf compiler
         id: deps
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -154,6 +160,14 @@ jobs:
       - name: Run kvbm-logical unit tests
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: cargo test --release --locked -p kvbm-logical --lib
+
+      - name: Upload sccache log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-log-cpu-unit-tests
+          path: ${{ github.workspace }}/sccache.log
+          retention-days: 7
 
   cpu-clippy:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
@@ -180,6 +194,12 @@ jobs:
         with:
           version: "v0.16.0"
 
+      - name: Start sccache server with debug logging
+        run: sccache --start-server
+        env:
+          SCCACHE_LOG: debug
+          SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache.log
+
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
@@ -191,6 +211,14 @@ jobs:
           -p pegainfer-sim
           -p kvbm-logical
           --all-targets -- -D warnings
+
+      - name: Upload sccache log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-log-cpu-clippy
+          path: ${{ github.workspace }}/sccache.log
+          retention-days: 7
 
   simulated-frontend-e2e:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
