@@ -79,11 +79,11 @@ pub(crate) struct LocalEngineBridge {
 
 impl LocalEngineBridge {
     pub(crate) async fn run(self, shutdown: CancellationToken) -> Result<()> {
-        let BridgeLink {
+        let Some(BridgeLink {
             mut input,
             output_tx,
             mut child_tasks,
-        } = connect_link(
+        }) = connect_link(
             &self.input_address,
             &self.output_address,
             self.engine_index,
@@ -94,7 +94,10 @@ impl LocalEngineBridge {
             None,
             &shutdown,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
 
         // One shared channel carries every request's token events, tagged by
         // request id; this loop is the sole consumer. Per-request state lives
@@ -707,18 +710,12 @@ async fn connect_link(
     metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
     engine_dead: Option<CancellationToken>,
     shutdown: &CancellationToken,
-) -> Result<BridgeLink> {
+) -> Result<Option<BridgeLink>> {
     let engine_id = EngineId::from_engine_index(
         u16::try_from(engine_index).context("engine_index exceeds u16 EngineId")?,
     );
     let mut socket_options = SocketOptions::default();
     socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
-
-    let mut input = DealerSocket::with_options(socket_options);
-    input
-        .connect(input_address)
-        .await
-        .with_context(|| format!("failed to connect local engine input {input_address}"))?;
 
     let (num_gpu_blocks, block_size, kv_cache_size_tokens, kv_cache_max_concurrency) =
         match kv_capacity {
@@ -767,16 +764,29 @@ async fn connect_link(
          kv_cache_size_tokens={kv_cache_size_tokens:?} \
          kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
     );
-    input
-        .send(ZmqMessage::from(encode_msgpack(&ready)?))
-        .await
-        .context("failed to send local engine ready response")?;
-
+    let mut input = DealerSocket::with_options(socket_options);
     let mut output = PushSocket::new();
-    output
-        .connect(output_address)
-        .await
-        .with_context(|| format!("failed to connect local engine output {output_address}"))?;
+    let handshake = async {
+        input
+            .connect(input_address)
+            .await
+            .with_context(|| format!("failed to connect local engine input {input_address}"))?;
+        input
+            .send(ZmqMessage::from(encode_msgpack(&ready)?))
+            .await
+            .context("failed to send local engine ready response")?;
+        output
+            .connect(output_address)
+            .await
+            .with_context(|| format!("failed to connect local engine output {output_address}"))
+    };
+    // zeromq retries a refused connect for 30 s, which outlives a server that
+    // failed its own startup and closed the listeners.
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(None),
+        handshake = handshake => handshake?,
+    }
 
     let (output_tx, output_rx) = mpsc::unbounded_channel();
     let mut child_tasks = tokio::task::JoinSet::new();
@@ -804,11 +814,11 @@ async fn connect_link(
         });
     }
 
-    Ok(BridgeLink {
+    Ok(Some(BridgeLink {
         input,
         output_tx,
         child_tasks,
-    })
+    }))
 }
 
 async fn output_loop(

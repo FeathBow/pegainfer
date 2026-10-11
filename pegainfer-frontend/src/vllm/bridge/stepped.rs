@@ -88,11 +88,11 @@ impl SteppedEngineBridge {
             .take_steps()
             .context("partition step stream already taken")?;
         let mut spec = SpecDecodeTracker::default();
-        let BridgeLink {
+        let Some(BridgeLink {
             mut input,
             output_tx,
             mut child_tasks,
-        } = connect_link(
+        }) = connect_link(
             &self.input_address,
             &self.output_address,
             self.engine_index,
@@ -103,7 +103,10 @@ impl SteppedEngineBridge {
             Some(engine_dead.clone()),
             &shutdown,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
         send_outputs(
             &output_tx,
             RequestBatchOutputs {

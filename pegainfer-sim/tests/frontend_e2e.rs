@@ -1408,7 +1408,13 @@ async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     let server = SimServer::spawn_with_model_dir(model_dir).await?;
     server.shutdown().await?;
 
-    let error = match SimServer::spawn_with_model_dir(empty_model_dir()?).await {
+    let failed = tokio::time::timeout(
+        HTTP_TIMEOUT,
+        SimServer::spawn_with_model_dir(empty_model_dir()?),
+    )
+    .await
+    .context("a frontend that cannot load its tokenizer must fail fast")?;
+    let error = match failed {
         Ok(server) => {
             server.shutdown().await?;
             bail!("empty local model metadata directory should fail frontend startup");
