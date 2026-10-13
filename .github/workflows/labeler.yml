@@ -44,3 +44,16 @@ jobs:
             args+=(--remove-label "$remove")
           fi
           gh pr edit "$PR_NUMBER" -R "$REPO" "${args[@]}"
+
+  needs-rebase:
+    name: Sync the needs-rebase label
+    needs: label
+    # After the labeler, which writes back the whole label set it read and would
+    # undo a needs-rebase change made in between.
+    if: ${{ !cancelled() && needs.label.result != 'skipped' }}
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/needs-rebase.yml
+    with:
+      pr: ${{ github.event.pull_request.number }}
