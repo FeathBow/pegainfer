@@ -54,6 +54,7 @@ use crate::Qwen3OffloadOptions;
 use crate::executor::ModelExecutor;
 use crate::executor::Qwen3Executor;
 use crate::executor::RequestId;
+use crate::executor::WorkerLost;
 use crate::scheduler::ActiveRequestState;
 use crate::scheduler::PendingRequest;
 use crate::scheduler::RejectReason as AdmissionReject;
@@ -333,6 +334,23 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             }
         }
         self.active.clear();
+    }
+
+    /// Absorb a step execution error by failing the batch it touched. A lost
+    /// rank worker leaves nothing to serve with, so that error is returned and
+    /// the driver winds the engine down.
+    fn absorb_step_failure(
+        &mut self,
+        targets: Vec<RequestId>,
+        error: anyhow::Error,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
+        if WorkerLost::caused(&error) {
+            return Err(error);
+        }
+        warn!("Execution step failed: {error}");
+        self.fail_touched_requests(targets, &error.to_string(), ledger);
+        Ok(())
     }
 
     /// Translate one step's pure effects into ledger writes, executor
@@ -737,11 +755,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 &mut self.rng,
             ) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), ledger);
-                    return Ok(());
-                }
+                Err(e) => return self.absorb_step_failure(targets, e, ledger),
             };
             // Only decode effects come out of the unified result (its prefill
             // request list is empty until the poll resolves).
@@ -752,16 +766,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         }
 
         // 8. Execute, resolve, apply. A step failure kills the touched batch
-        // but not the engine.
+        // but not the engine, unless a rank worker is gone.
         let targets = failure_target_ids(&self.active, &plan);
         let artifacts =
             match execute_plan(&mut self.executor, &mut self.active, plan, &mut self.rng) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), ledger);
-                    return Ok(());
-                }
+                Err(e) => return self.absorb_step_failure(targets, e, ledger),
             };
         let effects = resolve_step(&self.executor, &self.active, artifacts);
         self.apply_effects(effects, ledger);

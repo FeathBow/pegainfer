@@ -2077,7 +2077,7 @@ impl Qwen3Executor {
         for recv in pending {
             match recv
                 .recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??
+                .map_err(|_| worker_lost(format!("tensor-parallel {op_name} worker dropped")))??
             {
                 WorkerStepOutcome::Ack => {}
                 other => {
@@ -2099,7 +2099,7 @@ impl Qwen3Executor {
         }
         let primary_result = primary
             .recv()
-            .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
+            .map_err(|_| worker_lost("primary worker dropped step response"))??;
         Self::wait_for_step_ack(pending, step.kind())?;
         Ok(primary_result)
     }
@@ -2793,7 +2793,7 @@ impl ModelExecutor for Qwen3Executor {
                     }
                     let rx = self.primary.resolve_prefill()?;
                     rx.recv().map_err(|_| {
-                        anyhow::anyhow!("worker dropped resolve_prefill on decode-error path")
+                        worker_lost("worker dropped resolve_prefill on decode-error path")
                     })??;
                     return Err(e);
                 }
@@ -4020,6 +4020,29 @@ impl WorkerStepOutcome {
     }
 }
 
+/// A rank's worker thread is gone (it panicked or exited), so the executor can
+/// never run another step. The scheduler reports it as fatal.
+#[derive(Debug)]
+pub(crate) struct WorkerLost(String);
+
+impl WorkerLost {
+    pub(crate) fn caused(error: &anyhow::Error) -> bool {
+        error.chain().any(<dyn std::error::Error>::is::<Self>)
+    }
+}
+
+impl std::fmt::Display for WorkerLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkerLost {}
+
+pub(crate) fn worker_lost(what: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(WorkerLost(what.into()))
+}
+
 struct RankWorker {
     tx: channel::Sender<WorkerCommand>,
     handle: Option<thread::JoinHandle<()>>,
@@ -4121,7 +4144,7 @@ impl RankWorker {
                 collect_result,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
+            .map_err(|_| worker_lost("tensor-parallel worker step channel closed"))?;
         Ok(resp_rx)
     }
 
@@ -4156,7 +4179,7 @@ impl RankWorker {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::ResolvePrefill { resp: resp_tx })
-            .map_err(|_| anyhow::anyhow!("worker channel closed on resolve_prefill"))?;
+            .map_err(|_| worker_lost("worker channel closed on resolve_prefill"))?;
         Ok(resp_rx)
     }
 

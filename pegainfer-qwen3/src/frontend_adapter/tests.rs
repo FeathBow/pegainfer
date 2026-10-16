@@ -275,6 +275,26 @@ fn decode_error_fails_the_request_and_scheduler_recovers() {
 }
 
 #[test]
+fn lost_worker_ends_the_scheduler() {
+    let executor = FakeExecutor::new(4, Arc::new(Mutex::new(Vec::new()))).with_worker_lost();
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let doomed = partition.handle.submit(request(16, 2));
+    let (_, terminal) = steps.collect_terminal(doomed.id());
+    match terminal {
+        Terminal::Failed { message, .. } => assert!(
+            message.contains("engine fatal") && message.contains("fake rank worker exited"),
+            "a lost worker should fail requests as fatal, got {message}"
+        ),
+        other => panic!("a lost worker should surface as Terminal::Failed, got {other:?}"),
+    }
+    assert!(
+        wait_until(Duration::from_secs(1), || partition.join.is_finished()),
+        "the scheduler must stop once a rank worker is gone"
+    );
+}
+
+#[test]
 fn same_step_finishes_all_reach_their_terminals() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(8, Arc::clone(&dropped));

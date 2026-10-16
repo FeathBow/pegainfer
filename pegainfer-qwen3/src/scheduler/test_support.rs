@@ -51,6 +51,7 @@ pub(crate) struct FakeExecutor {
     // executor's kv_position so multi-chunk scheduling is exercised).
     prefill_positions: HashMap<RequestId, usize>,
     fail_decode_once: bool,
+    worker_lost: bool,
     decode_delay: Duration,
     loaded_lora_adapters: HashSet<String>,
     pub(crate) dropped: Arc<Mutex<Vec<u64>>>,
@@ -72,6 +73,7 @@ impl FakeExecutor {
             held_tokens: HashMap::new(),
             prefill_positions: HashMap::new(),
             fail_decode_once: false,
+            worker_lost: false,
             decode_delay: Duration::ZERO,
             loaded_lora_adapters: HashSet::new(),
             dropped,
@@ -105,6 +107,12 @@ impl FakeExecutor {
 
     pub(crate) fn with_decode_failure(mut self) -> Self {
         self.fail_decode_once = true;
+        self
+    }
+
+    /// Decode fails the way the real executor does once a rank worker is gone.
+    pub(crate) fn with_worker_lost(mut self) -> Self {
+        self.worker_lost = true;
         self
     }
 
@@ -272,6 +280,9 @@ impl ModelExecutor for FakeExecutor {
         if self.fail_decode_once {
             self.fail_decode_once = false;
             anyhow::bail!("fake decode KV capacity exhausted");
+        }
+        if self.worker_lost {
+            return Err(crate::executor::worker_lost("fake rank worker exited"));
         }
         self.check_decode_batch(plan.requests.len())?;
 
