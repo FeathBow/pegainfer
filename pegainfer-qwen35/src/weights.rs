@@ -580,7 +580,7 @@ impl Qwen35Model {
     }
 
     pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
-        token_id == self.config.eos_token_id
+        self.config.eos_token_ids.contains(&token_id)
     }
 }
 
